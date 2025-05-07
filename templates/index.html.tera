@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }}</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="player">
+        <h1>Rust MP3 Web Radio</h1>
+        
+        <div class="now-playing">
+            <div class="track-title" id="current-title">-</div>
+            <div class="track-artist" id="current-artist">-</div>
+            <div class="track-album" id="current-album">-</div>
+            <div class="duration" id="current-duration">-</div>
+            <div class="listeners" id="listener-count">Listeners: 0</div>
+        </div>
+        
+        <div class="controls">
+            <button id="start-btn">Start Listening</button>
+            <button id="mute-btn">Mute</button>
+            <button id="next-btn">Next</button>
+            <div class="volume-control">
+                <span>Volume:</span>
+                <input type="range" id="volume" min="0" max="1" step="0.01" value="0.7">
+            </div>
+        </div>
+        
+        <div class="status-message" id="status-message" style="display: none;"></div>
+        
+        <!-- Add direct audio element for testing -->
+        <div class="audio-player">
+            <h3>Direct Audio Stream (for testing)</h3>
+            <audio id="direct-audio" controls>
+                <source src="/stream.mp3" type="audio/mpeg">
+                Your browser does not support the audio element.
+            </audio>
+        </div>
+        
+        <div class="playlist">
+            <div class="playlist-header">
+                <h2>Playlist</h2>
+                <div>
+                    <button id="scan-btn">Scan for MP3s</button>
+                    <button id="shuffle-btn">Shuffle</button>
+                </div>
+            </div>
+            <div class="track-list" id="playlist-container">
+                <!-- Tracks will be loaded here dynamically -->
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/player.js"></script>
+</body>
+</html>

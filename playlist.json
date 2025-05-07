@@ -1,0 +1,19 @@
+{
+  "current_track": 0,
+  "tracks": [
+    {
+      "path": "Capillaris concentration.mp3",
+      "title": "Capillaris concentration",
+      "artist": "seagull_sparrow",
+      "album": "Unknown",
+      "duration": 169
+    },
+    {
+      "path": "Seagull and Sparrow (Remastered) (Cover).mp3",
+      "title": "Seagull and Sparrow (Remastered) (Cover)",
+      "artist": "seagull_sparrow",
+      "album": "Unknown",
+      "duration": 288
+    }
+  ]
+}

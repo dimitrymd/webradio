@@ -1,0 +1,160 @@
+body {
+    font-family: Arial, sans-serif;
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 20px;
+    background-color: #f5f5f5;
+}
+
+.player {
+    background: white;
+    border-radius: 10px;
+    padding: 20px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+}
+
+.controls {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    margin: 20px 0;
+}
+
+button {
+    background: #4a90e2;
+    border: none;
+    color: white;
+    padding: 10px 15px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 16px;
+}
+
+button:hover {
+    background: #3a80d2;
+}
+
+button:disabled {
+    background-color: #95a5a6;
+    cursor: not-allowed;
+}
+
+#start-btn {
+    background-color: #2ecc71;
+}
+
+#start-btn:hover {
+    background-color: #27ae60;
+}
+
+#start-btn:disabled {
+    background-color: #95a5a6;
+    cursor: not-allowed;
+}
+
+#mute-btn {
+    background-color: #3498db;
+}
+
+#mute-btn:hover {
+    background-color: #2980b9;
+}
+
+.volume-control {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.now-playing {
+    margin: 20px 0;
+    padding: 15px;
+    background: #f0f0f0;
+    border-radius: 5px;
+}
+
+.track-title {
+    font-size: 18px;
+    font-weight: bold;
+}
+
+.track-artist {
+    font-size: 16px;
+    color: #666;
+}
+
+.track-album {
+    font-size: 14px;
+    color: #888;
+}
+
+.playlist {
+    margin-top: 30px;
+}
+
+.playlist-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.track-list {
+    margin-top: 10px;
+    max-height: 300px;
+    overflow-y: auto;
+    border: 1px solid #eee;
+    border-radius: 5px;
+}
+
+.track {
+    padding: 10px;
+    border-bottom: 1px solid #eee;
+    cursor: pointer;
+}
+
+.track:hover {
+    background: #f5f5f5;
+}
+
+.track.active {
+    background: #e6f2ff;
+}
+
+.duration {
+    color: #888;
+    font-size: 14px;
+}
+
+.status-message {
+    background: #f8f8f8;
+    border-left: 4px solid #4a90e2;
+    padding: 10px;
+    margin: 10px 0;
+    color: #333;
+}
+
+.listeners {
+    margin-top: 5px;
+    font-size: 14px;
+    color: #888;
+    font-style: italic;
+}
+
+.audio-player {
+    margin: 20px 0;
+    padding: 15px;
+    background: #f9f9f9;
+    border-radius: 5px;
+    border: 1px solid #ddd;
+}
+
+.audio-player h3 {
+    margin-top: 0;
+    margin-bottom: 10px;
+    font-size: 16px;
+    color: #666;
+}
+
+.audio-player audio {
+    width: 100%;
+}
