@@ -113,28 +113,40 @@ impl StreamManager {
         chunk_size: usize
     ) {
         let file_path = music_folder.join(track_path);
+        let start_time = std::time::Instant::now();
+        
+        println!("Starting to buffer track: {}", file_path.display());
         
         if !file_path.exists() {
-            error!("File not found: {}", file_path.display());
+            println!("ERROR: File not found: {}", file_path.display());
             let mut inner = inner.lock();
             inner.streaming = false;
             return;
         }
         
-        debug!("Opening file for streaming: {}", file_path.display());
+        println!("Opening file for streaming: {}", file_path.display());
         let mut file = match File::open(&file_path) {
             Ok(f) => f,
             Err(e) => {
-                error!("Error opening file {}: {}", file_path.display(), e);
+                println!("ERROR: Error opening file {}: {}", file_path.display(), e);
                 let mut inner = inner.lock();
                 inner.streaming = false;
                 return;
             }
         };
         
+        // Get file size for logging
+        let file_size = match file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(_) => 0,
+        };
+        
+        println!("Starting to stream file: {}, size: {} bytes", file_path.display(), file_size);
+        
         let mut buffer = vec![0; chunk_size];
         let mut total_bytes_read = 0;
         let mut chunks_buffered = 0;
+        let mut last_progress_log = std::time::Instant::now();
         
         loop {
             // Check if we should continue streaming
@@ -144,8 +156,18 @@ impl StreamManager {
             };
             
             if !should_continue {
-                debug!("Stopping stream thread as requested");
+                println!("Stopping stream thread as requested after {} seconds", start_time.elapsed().as_secs());
                 break;
+            }
+            
+            // Log progress every 5 seconds
+            if last_progress_log.elapsed().as_secs() >= 5 {
+                println!("BUFFER STATUS: Streaming \"{}\" - {} bytes read ({:.2}% of file) over {} seconds", 
+                       track_path, 
+                       total_bytes_read,
+                       if file_size > 0 { (total_bytes_read as f64 / file_size as f64) * 100.0 } else { 0.0 },
+                       start_time.elapsed().as_secs());
+                last_progress_log = std::time::Instant::now();
             }
             
             // Check if buffer needs more data
@@ -158,26 +180,31 @@ impl StreamManager {
                 match file.read(&mut buffer) {
                     Ok(0) => {
                         // End of file reached
-                        info!("End of track reached: {}", track_path);
-                        info!("Total bytes read: {}, chunks buffered: {}", total_bytes_read, chunks_buffered);
+                        let elapsed = start_time.elapsed().as_secs();
+                        println!("End of track reached: {} after {} seconds", track_path, elapsed);
+                        println!("Total bytes read: {}, chunks buffered: {}, time taken: {}s", 
+                               total_bytes_read, chunks_buffered, elapsed);
                         
-                        // Try to loop the track by seeking to the beginning
-                        if let Err(e) = file.seek(SeekFrom::Start(0)) {
-                            error!("Error seeking to start of file: {}", e);
-                            let mut inner = inner.lock();
-                            inner.streaming = false;
-                            break;
+                        if file_size > 0 {
+                            println!("File read complete: {}% of file processed", 
+                                   (total_bytes_read as f64 / file_size as f64) * 100.0);
                         }
                         
-                        debug!("Looping track: {}", track_path);
-                        continue;
+                        // CRITICAL FIX: Set streaming to false when track is complete
+                        let mut inner_lock = inner.lock();
+                        inner_lock.streaming = false;
+                        println!("Set streaming to false as track has completed after {} seconds", elapsed);
+                        break;
                     },
                     Ok(n) => {
                         total_bytes_read += n;
                         chunks_buffered += 1;
                         
                         if chunks_buffered % 100 == 0 {
-                            debug!("Buffered {} chunks, {} bytes", chunks_buffered, total_bytes_read);
+                            println!("Buffered {} chunks, {} bytes ({:.2}% of file) in {} seconds", 
+                                   chunks_buffered, total_bytes_read,
+                                   if file_size > 0 { (total_bytes_read as f64 / file_size as f64) * 100.0 } else { 0.0 },
+                                   start_time.elapsed().as_secs());
                         }
                         
                         let chunk = buffer[..n].to_vec();
@@ -186,7 +213,8 @@ impl StreamManager {
                         inner.chunk_times.push_back(Instant::now());
                     },
                     Err(e) => {
-                        error!("Error reading file {}: {}", file_path.display(), e);
+                        println!("ERROR: Error reading file {}: {} after {} seconds", 
+                               file_path.display(), e, start_time.elapsed().as_secs());
                         let mut inner = inner.lock();
                         inner.streaming = false;
                         break;
@@ -207,7 +235,8 @@ impl StreamManager {
                     let mut inner = inner.lock();
                     inner.buffer.pop_front();
                     inner.chunk_times.pop_front();
-                    debug!("Removed oldest chunk from buffer due to cache time");
+                    println!("Removed oldest chunk from buffer due to cache time, elapsed: {} seconds", 
+                           start_time.elapsed().as_secs());
                     continue;
                 }
                 
@@ -215,6 +244,12 @@ impl StreamManager {
                 thread::sleep(Duration::from_millis(100));
             }
         }
+    }
+
+    pub fn force_stop_streaming(&self) {
+        let mut inner = self.inner.lock();
+        inner.streaming = false;
+        println!("Force stopped streaming by setting streaming flag to false");
     }
     
     pub fn get_stream_generator(&self) -> impl Iterator<Item = Vec<u8>> + '_ {

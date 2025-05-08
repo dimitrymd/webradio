@@ -2,13 +2,11 @@ use rocket::http::{ContentType, Status};
 use rocket::State;
 use rocket::serde::json::Json;
 use rocket::fs::NamedFile;
-use rocket::{get, post, catch};
+use rocket::{get, catch};
 use rocket_dyn_templates::{Template, context};
 use rocket_ws as ws;
 use rocket::futures::SinkExt; // For WebSocket streaming
 use std::path::{Path, PathBuf};
-use std::io::Cursor;
-use rocket::response::Response;
 
 use crate::models::playlist::Playlist;
 use crate::services::playlist;
@@ -45,73 +43,6 @@ pub async fn now_playing(stream_manager: &State<StreamManager>) -> Json<serde_js
     }
 }
 
-#[get("/api/playlist")]
-pub async fn get_playlist() -> Json<Playlist> {
-    let playlist = playlist::get_playlist(&config::PLAYLIST_FILE);
-    Json(playlist)
-}
-
-#[post("/api/playlist/scan")]
-pub async fn scan_music() -> Json<serde_json::Value> {
-    let playlist = playlist::scan_music_folder(&config::MUSIC_FOLDER, &config::PLAYLIST_FILE);
-    
-    Json(serde_json::json!({
-        "message": format!("Found {} tracks", playlist.tracks.len()),
-        "tracks": playlist.tracks.len()
-    }))
-}
-
-#[post("/api/playlist/shuffle")]
-pub async fn shuffle_playlist() -> Json<serde_json::Value> {
-    let playlist = playlist::shuffle_playlist(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER);
-    
-    Json(serde_json::json!({
-        "message": "Playlist shuffled",
-        "tracks": playlist.tracks.len()
-    }))
-}
-
-#[post("/api/playlist/play/<index>")]
-pub async fn play_track(index: usize, stream_manager: &State<StreamManager>) -> Json<serde_json::Value> {
-    let mut playlist = playlist::get_playlist(&config::PLAYLIST_FILE);
-    
-    if playlist.tracks.is_empty() {
-        return Json(serde_json::json!({
-            "error": "No tracks available"
-        }));
-    }
-    
-    if index >= playlist.tracks.len() {
-        return Json(serde_json::json!({
-            "error": "Invalid track index"
-        }));
-    }
-    
-    playlist.current_track = index;
-    playlist::save_playlist(&playlist, &config::PLAYLIST_FILE);
-    
-    // Start streaming new track
-    let track = &playlist.tracks[index];
-    stream_manager.start_streaming(&track.path);
-    
-    Json(serde_json::json!({
-        "status": "ok"
-    }))
-}
-
-#[post("/api/next")]
-pub async fn next_track(stream_manager: &State<StreamManager>) -> Json<serde_json::Value> {
-    let track = playlist::advance_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER);
-    
-    if let Some(track) = track {
-        stream_manager.start_streaming(&track.path);
-    }
-    
-    Json(serde_json::json!({
-        "status": "ok"
-    }))
-}
-
 #[get("/api/stats")]
 pub async fn get_stats(stream_manager: &State<StreamManager>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
@@ -123,12 +54,12 @@ pub async fn get_stats(stream_manager: &State<StreamManager>) -> Json<serde_json
 // WebSocket handler for streaming audio
 #[get("/stream")]
 pub fn stream_ws(ws: ws::WebSocket, stream_manager: &State<StreamManager>) -> ws::Channel<'static> {
-    log::info!("WebSocket connection request received");
+    println!("WebSocket connection request received");
     
     // Check if max concurrent users limit is reached
     if stream_manager.get_active_listeners() >= config::MAX_CONCURRENT_USERS {
         // Return an error message and close the connection
-        log::warn!("Max concurrent users limit reached");
+        println!("Max concurrent users limit reached");
         return ws.channel(move |mut stream| Box::pin(async move {
             let _ = stream.send(ws::Message::Text("Server at capacity, try again later".into())).await;
             Ok(())
@@ -138,16 +69,12 @@ pub fn stream_ws(ws: ws::WebSocket, stream_manager: &State<StreamManager>) -> ws
     let track = playlist::get_current_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER);
     if track.is_none() {
         // Return an error message and close the connection
-        log::warn!("No tracks available");
+        println!("No tracks available");
         return ws.channel(move |mut stream| Box::pin(async move {
             let _ = stream.send(ws::Message::Text("No tracks available".into())).await;
             Ok(())
         }));
     }
-    
-    // We don't need to start streaming here anymore since it's already running
-    // from the server startup. Just get the current track details.
-    log::info!("Creating WebSocket channel for client");
     
     // Clone the stream manager for use in the closure
     let stream_manager = stream_manager.inner().clone();
@@ -157,8 +84,11 @@ pub fn stream_ws(ws: ws::WebSocket, stream_manager: &State<StreamManager>) -> ws
         // Send track info first
         if let Some(track) = playlist::get_current_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER) {
             let track_info = serde_json::to_string(&track).unwrap_or_default();
-            log::info!("Sending track info: {}", track_info);
-            let _ = stream.send(ws::Message::Text(track_info)).await;
+            println!("Sending track info to client: {}", track_info);
+            if let Err(e) = stream.send(ws::Message::Text(track_info)).await {
+                println!("Error sending track info: {:?}", e);
+                return Ok(());
+            }
         }
         
         // Get stream generator and start sending audio chunks
@@ -166,51 +96,68 @@ pub fn stream_ws(ws: ws::WebSocket, stream_manager: &State<StreamManager>) -> ws
         
         // Increment active listener count
         stream_manager.increment_listener_count();
+        println!("Listener connected. Active listeners: {}", stream_manager.get_active_listeners());
         
         // Send audio chunks over WebSocket
         let mut chunk_count = 0;
+        let mut error_count = 0;
+        
         while let Some(chunk) = audio_stream.next() {
             chunk_count += 1;
-            if chunk_count % 10 == 0 {
-                log::info!("Sent {} audio chunks", chunk_count);
+            if chunk_count % 100 == 0 {
+                println!("Sent {} audio chunks to client", chunk_count);
             }
             
             // Send binary data
-            let result = stream.send(ws::Message::Binary(chunk.clone())).await;
-            
-            // If sending fails, break the loop
-            if result.is_err() {
-                log::error!("Error sending audio chunk: {:?}", result.err());
-                break;
+            match stream.send(ws::Message::Binary(chunk.clone())).await {
+                Ok(_) => {
+                    // Successfully sent chunk, reset error count
+                    error_count = 0;
+                },
+                Err(e) => {
+                    // Error sending chunk
+                    error_count += 1;
+                    println!("Error sending audio chunk: {:?}", e);
+                    
+                    if error_count >= 5 {
+                        println!("Too many errors, closing WebSocket connection");
+                        break;
+                    }
+                    
+                    // Brief pause before trying again
+                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                }
             }
             
             // Sleep a bit to control streaming rate
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            // Using a shorter sleep time for better responsiveness
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
         }
         
-        log::info!("WebSocket stream ended after sending {} chunks", chunk_count);
+        println!("WebSocket stream ended after sending {} chunks", chunk_count);
         
         // Decrement active listener count when done
         stream_manager.decrement_listener_count();
+        println!("Listener disconnected. Active listeners: {}", stream_manager.get_active_listeners());
         
         Ok(())
     }))
 }
 
-// HTTP streaming endpoint for standard audio players
-#[get("/stream.mp3")]
-pub async fn stream_http(stream_manager: &State<StreamManager>) -> Result<Response<'static>, Status> {
-    log::info!("HTTP stream request received");
+// Direct streaming endpoint - serves the current MP3 file
+#[get("/direct-stream")]
+pub async fn direct_stream(stream_manager: &State<StreamManager>) -> Result<(ContentType, Vec<u8>), Status> {
+    println!("Direct stream request received");
     
     // Check if max concurrent users limit is reached
     if stream_manager.get_active_listeners() >= config::MAX_CONCURRENT_USERS {
-        log::warn!("Max concurrent users limit reached");
+        println!("Max concurrent users limit reached");
         return Err(Status::ServiceUnavailable);
     }
     
     let track = playlist::get_current_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER);
     if track.is_none() {
-        log::warn!("No tracks available");
+        println!("No tracks available for direct streaming");
         return Err(Status::NotFound);
     }
     
@@ -220,33 +167,25 @@ pub async fn stream_http(stream_manager: &State<StreamManager>) -> Result<Respon
     // Stream the file directly if it exists
     if let Some(track) = track {
         let file_path = config::MUSIC_FOLDER.join(&track.path);
+        println!("Direct stream request for track: \"{}\" by \"{}\"", track.title, track.artist);
         
         // Read the file
         match tokio::fs::read(&file_path).await {
             Ok(data) => {
-                log::info!("Started HTTP streaming of file: {}", file_path.display());
+                println!("Started direct streaming of file: {} ({} bytes)", file_path.display(), data.len());
                 
-                // Create a cursor that implements AsyncRead
-                let cursor = Cursor::new(data);
-                
-                // Build the response with MP3 content type
-                let mut response = Response::build()
-                    .header(ContentType::MP3)
-                    .finalize();
-                
-                // We're using the standard method for setting sized bodies in Rocket 0.5
-                response.set_streamed_body(cursor);
-                
-                Ok(response)
+                // Return the MP3 data with the correct content type
+                Ok((ContentType::MP3, data))
             },
             Err(e) => {
-                log::error!("Failed to read file {}: {}", file_path.display(), e);
+                println!("Failed to read file {}: {}", file_path.display(), e);
                 stream_manager.decrement_listener_count();
                 Err(Status::InternalServerError)
             }
         }
     } else {
         stream_manager.decrement_listener_count();
+        println!("Failed to get track for direct streaming");
         Err(Status::NotFound)
     }
 }

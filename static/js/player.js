@@ -1,14 +1,9 @@
 // Elements
 const startBtn = document.getElementById('start-btn');
 const muteBtn = document.getElementById('mute-btn');
-const nextBtn = document.getElementById('next-btn');
 const volumeControl = document.getElementById('volume');
-const scanBtn = document.getElementById('scan-btn');
-const shuffleBtn = document.getElementById('shuffle-btn');
-const playlistContainer = document.getElementById('playlist-container');
 const statusMessage = document.getElementById('status-message');
 const listenerCount = document.getElementById('listener-count');
-const directAudio = document.getElementById('direct-audio');
 
 // Current track display elements
 const currentTitle = document.getElementById('current-title');
@@ -16,14 +11,12 @@ const currentArtist = document.getElementById('current-artist');
 const currentAlbum = document.getElementById('current-album');
 const currentDuration = document.getElementById('current-duration');
 
-// WebSocket connection
+// WebSocket and audio context
 let ws = null;
-let audioElement = null;
+let audioContext = null;
+let gainNode = null;
+let isPlaying = false;
 let isMuted = false;
-let previousVolume = 0.7; // Default volume
-
-// Debug flag - set to true for console logging
-const DEBUG = true;
 
 // Format time (seconds to MM:SS)
 function formatTime(seconds) {
@@ -45,26 +38,21 @@ function showStatus(message, isError = false) {
     }, 3000);
 }
 
-// Debug logging
-function debugLog(message) {
-    if (DEBUG) {
-        console.log(`[DEBUG] ${message}`);
-    }
-}
-
 // Update now playing information
 async function updateNowPlaying() {
     try {
+        console.log("Fetching now playing info...");
         const response = await fetch('/api/now-playing');
         if (!response.ok) {
-            throw new Error('Failed to fetch now playing info');
+            throw new Error(`Failed to fetch now playing info: ${response.status}`);
         }
         
         const data = await response.json();
+        console.log("Received now playing info:", data);
         
         if (data.error) {
             currentTitle.textContent = 'No tracks available';
-            currentArtist.textContent = 'Please scan for MP3 files';
+            currentArtist.textContent = 'Please add MP3 files to the server';
             currentAlbum.textContent = '';
             currentDuration.textContent = '';
         } else {
@@ -78,17 +66,6 @@ async function updateNowPlaying() {
                 listenerCount.textContent = `Listeners: ${data.active_listeners}`;
             }
             
-            // Update active track in playlist
-            const tracks = document.querySelectorAll('.track');
-            tracks.forEach(track => {
-                track.classList.remove('active');
-                if (track.dataset.path === data.path) {
-                    track.classList.add('active');
-                    // Scroll to current track
-                    track.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-                }
-            });
-            
             // Update page title
             document.title = `${data.title} - ${data.artist} | Rust Web Radio`;
         }
@@ -98,102 +75,94 @@ async function updateNowPlaying() {
     }
 }
 
-// Load playlist
-async function loadPlaylist() {
+// Initialize audio
+function initAudio() {
+    if (audioContext) {
+        return true; // Already initialized
+    }
+    
     try {
-        const response = await fetch('/api/playlist');
-        if (!response.ok) {
-            throw new Error('Failed to fetch playlist');
-        }
+        // Create AudioContext
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
         
-        const data = await response.json();
+        // Create gain node for volume control
+        gainNode = audioContext.createGain();
+        gainNode.gain.value = volumeControl.value;
+        gainNode.connect(audioContext.destination);
         
-        playlistContainer.innerHTML = '';
-        
-        if (data.tracks.length === 0) {
-            playlistContainer.innerHTML = '<div class="status-message">No tracks found. Click "Scan for MP3s" to find music files.</div>';
-            return;
-        }
-        
-        data.tracks.forEach((track, index) => {
-            const trackElement = document.createElement('div');
-            trackElement.className = 'track';
-            if (index === data.current_track) {
-                trackElement.classList.add('active');
-            }
-            trackElement.dataset.path = track.path;
-            trackElement.dataset.index = index;
-            
-            trackElement.innerHTML = `
-                <div class="track-title">${track.title || 'Unknown Title'}</div>
-                <div class="track-artist">${track.artist || 'Unknown Artist'}</div>
-                <div class="duration">${formatTime(track.duration)}</div>
-            `;
-            
-            trackElement.addEventListener('click', () => {
-                playSongAt(index);
-            });
-            
-            playlistContainer.appendChild(trackElement);
-        });
-    } catch (error) {
-        console.error('Error loading playlist:', error);
-        showStatus('Error loading playlist', true);
+        console.log("AudioContext initialized");
+        return true;
+    } catch (e) {
+        console.error('Failed to create AudioContext:', e);
+        showStatus('Your browser does not support Web Audio API', true);
+        return false;
     }
 }
 
-// Connect to WebSocket and start streaming
-function connectWebSocket() {
-    // Close any existing connection
-    if (ws) {
-        ws.close();
+// Start audio streaming
+function startAudio() {
+    console.log('Starting audio playback');
+    startBtn.disabled = true;
+    
+    // Initialize audio if needed
+    if (!initAudio()) {
+        startBtn.disabled = false;
+        return;
     }
     
-    // Create audio element if it doesn't exist
-    if (!audioElement) {
-        audioElement = new Audio('/stream.mp3');
-        audioElement.volume = volumeControl.value;
-        
-        // Add event listeners for debugging
-        audioElement.addEventListener('playing', () => debugLog('Audio started playing'));
-        audioElement.addEventListener('pause', () => debugLog('Audio paused'));
-        audioElement.addEventListener('error', (e) => console.error('Audio error:', e));
-        audioElement.addEventListener('stalled', () => debugLog('Audio stalled'));
-        audioElement.addEventListener('waiting', () => debugLog('Audio waiting'));
-    }
-    
-    // Create a new WebSocket connection
-    const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/stream`;
-    debugLog(`Connecting to WebSocket at ${wsUrl}`);
+    // Connect to WebSocket
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/stream`;
+    console.log(`Connecting to WebSocket: ${wsUrl}`);
     
     ws = new WebSocket(wsUrl);
     
-    // Handle WebSocket events
     ws.onopen = () => {
-        debugLog('WebSocket connection established');
+        console.log('WebSocket connection established');
         showStatus('Connected to audio stream');
-        
-        // Update button state
-        startBtn.disabled = true;
-        startBtn.textContent = 'Connected';
-        
-        // Start playing the audio
-        audioElement.play()
-            .then(() => debugLog('Audio playback started'))
-            .catch(err => {
-                console.error('Audio playback failed:', err);
-                showStatus('Failed to start audio playback. Try the direct player below.', true);
-            });
+        startBtn.textContent = 'Disconnect';
+        startBtn.disabled = false;
+        startBtn.dataset.connected = 'true';
+        isPlaying = true;
     };
     
-    ws.onmessage = (event) => {
+    ws.onmessage = async (event) => {
+        // Handle binary audio data
         if (event.data instanceof Blob) {
-            debugLog(`Received binary data of size: ${event.data.size} bytes`);
-        } else {
-            // Text data - track info
-            debugLog(`Received text message: ${event.data}`);
+            if (!isPlaying) return;
+            
             try {
+                // Get ArrayBuffer from Blob
+                const arrayBuffer = await event.data.arrayBuffer();
+                
+                // Decode audio data
+                audioContext.decodeAudioData(arrayBuffer, (buffer) => {
+                    if (!isPlaying) return;
+                    
+                    // Create buffer source
+                    const source = audioContext.createBufferSource();
+                    source.buffer = buffer;
+                    
+                    // Connect to gain node
+                    source.connect(gainNode);
+                    
+                    // Start playback
+                    source.start(0);
+                    
+                }, (error) => {
+                    console.error('Error decoding audio:', error);
+                });
+            } catch (error) {
+                console.error('Error processing audio chunk:', error);
+            }
+        } 
+        // Handle text message (track info)
+        else {
+            try {
+                console.log('Received track info:', event.data);
                 const trackInfo = JSON.parse(event.data);
+                
+                // Update track info
                 currentTitle.textContent = trackInfo.title || 'Unknown Title';
                 currentArtist.textContent = trackInfo.artist || 'Unknown Artist';
                 currentAlbum.textContent = trackInfo.album || 'Unknown Album';
@@ -201,262 +170,146 @@ function connectWebSocket() {
                 
                 // Update page title
                 document.title = `${trackInfo.title} - ${trackInfo.artist} | Rust Web Radio`;
-                
-                // Reload audio to get the new track
-                audioElement.load();
-                audioElement.play()
-                    .then(() => debugLog('Track changed, playback resumed'))
-                    .catch(err => console.error('Error resuming after track change:', err));
             } catch (error) {
                 console.error('Error parsing track info:', error);
             }
         }
     };
     
-    ws.onclose = () => {
-        debugLog('WebSocket connection closed');
+    ws.onclose = (event) => {
+        console.log(`WebSocket connection closed: Code ${event.code}`);
         
-        // Pause audio
-        if (audioElement) {
-            audioElement.pause();
+        isPlaying = false;
+        
+        // Only show disconnection message if it wasn't requested by the user
+        if (startBtn.dataset.connected === 'true') {
+            showStatus('Disconnected from audio stream', true);
+            
+            // Try to reconnect automatically
+            setTimeout(() => {
+                if (startBtn.dataset.connected === 'true') {
+                    console.log('Attempting to reconnect...');
+                    startAudio();
+                }
+            }, 2000);
         }
         
-        // Update button state
+        startBtn.textContent = 'Connect';
         startBtn.disabled = false;
-        startBtn.textContent = 'Start Listening';
-        showStatus('Connection closed. Click Start to reconnect.', true);
+        startBtn.dataset.connected = 'false';
     };
     
     ws.onerror = (error) => {
         console.error('WebSocket error:', error);
-        debugLog(`WebSocket error: ${error}`);
         showStatus('Error connecting to audio stream', true);
+        startBtn.textContent = 'Connect';
+        startBtn.disabled = false;
+        startBtn.dataset.connected = 'false';
     };
 }
 
-// Initialize audio and start streaming
-function startAudio() {
-    debugLog('Starting audio playback');
-    connectWebSocket();
+// Stop audio streaming
+function stopAudio() {
+    console.log('Stopping audio playback');
+    
+    isPlaying = false;
+    
+    // Close WebSocket
+    if (ws) {
+        ws.close();
+        ws = null;
+    }
+    
+    showStatus('Disconnected from audio stream');
+    startBtn.textContent = 'Connect';
+    startBtn.disabled = false;
+    startBtn.dataset.connected = 'false';
+}
+
+// Toggle connection
+function toggleConnection() {
+    const isConnected = startBtn.dataset.connected === 'true';
+    
+    if (isConnected) {
+        stopAudio();
+    } else {
+        startAudio();
+    }
 }
 
 // Toggle mute/unmute
 function toggleMute() {
-    if (audioElement) {
-        if (isMuted) {
-            // Unmute
-            audioElement.volume = previousVolume;
-            volumeControl.value = previousVolume;
-            muteBtn.textContent = 'Mute';
-            isMuted = false;
-            debugLog('Unmuted audio');
-        } else {
-            // Mute
-            previousVolume = audioElement.volume;
-            audioElement.volume = 0;
-            volumeControl.value = 0;
-            muteBtn.textContent = 'Unmute';
-            isMuted = true;
-            debugLog('Muted audio');
-        }
-    }
+    if (!gainNode) return;
     
-    // Also mute/unmute the direct audio player
-    if (directAudio) {
-        directAudio.volume = isMuted ? 0 : previousVolume;
+    isMuted = !isMuted;
+    
+    if (isMuted) {
+        gainNode.gain.value = 0;
+        muteBtn.textContent = 'Unmute';
+    } else {
+        gainNode.gain.value = volumeControl.value;
+        muteBtn.textContent = 'Mute';
     }
 }
 
-// Play song at specific index
-async function playSongAt(index) {
-    try {
-        debugLog(`Switching to track at index ${index}`);
-        const response = await fetch(`/api/playlist/play/${index}`, {
-            method: 'POST'
-        });
-        
-        if (!response.ok) {
-            throw new Error('Failed to set track');
-        }
-        
-        // Reload audio to get the new track
-        if (audioElement) {
-            audioElement.load();
-            audioElement.play()
-                .catch(err => console.error('Error playing after track change:', err));
-        }
-        
-        // Also reload the direct audio player
-        if (directAudio) {
-            directAudio.load();
-        }
-        
-        // Update now playing info
-        await updateNowPlaying();
-    } catch (error) {
-        console.error('Error setting track:', error);
-        showStatus('Error changing track', true);
-    }
-}
-
-// Next track
-async function nextTrack() {
-    try {
-        debugLog('Switching to next track');
-        nextBtn.disabled = true;
-        
-        const response = await fetch('/api/next', {
-            method: 'POST'
-        });
-        
-        if (!response.ok) {
-            throw new Error('Failed to advance track');
-        }
-        
-        // Reload audio to get the new track
-        if (audioElement) {
-            audioElement.load();
-            audioElement.play()
-                .catch(err => console.error('Error playing after next track:', err));
-        }
-        
-        // Also reload the direct audio player
-        if (directAudio) {
-            directAudio.load();
-        }
-        
-        // Update now playing info
-        await updateNowPlaying();
-    } catch (error) {
-        console.error('Error advancing track:', error);
-        showStatus('Error changing track', true);
-    } finally {
-        nextBtn.disabled = false;
-    }
-}
-
-// Scan for MP3 files
-async function scanMusic() {
-    try {
-        scanBtn.disabled = true;
-        scanBtn.textContent = 'Scanning...';
-        
-        const response = await fetch('/api/playlist/scan', {
-            method: 'POST'
-        });
-        
-        if (!response.ok) {
-            throw new Error('Scan failed');
-        }
-        
-        const data = await response.json();
-        
-        showStatus(data.message);
-        
-        // Reload playlist
-        await loadPlaylist();
-        
-        // Update now playing
-        await updateNowPlaying();
-    } catch (error) {
-        console.error('Error scanning music:', error);
-        showStatus('Error scanning for music files', true);
-    } finally {
-        scanBtn.disabled = false;
-        scanBtn.textContent = 'Scan for MP3s';
-    }
-}
-
-// Shuffle playlist
-async function shufflePlaylist() {
-    try {
-        shuffleBtn.disabled = true;
-        
-        const response = await fetch('/api/playlist/shuffle', {
-            method: 'POST'
-        });
-        
-        if (!response.ok) {
-            throw new Error('Shuffle failed');
-        }
-        
-        // Reload playlist
-        await loadPlaylist();
-        
-        showStatus('Playlist shuffled');
-    } catch (error) {
-        console.error('Error shuffling playlist:', error);
-        showStatus('Error shuffling playlist', true);
-    } finally {
-        shuffleBtn.disabled = false;
-    }
-}
-
-// Update stats every 10 seconds
+// Update stats
 async function updateStats() {
     try {
         const response = await fetch('/api/stats');
         const data = await response.json();
-        listenerCount.textContent = `Listeners: ${data.active_listeners} / ${data.max_concurrent_users}`;
+        listenerCount.textContent = `Listeners: ${data.active_listeners}`;
     } catch (error) {
         console.error('Error fetching stats:', error);
     }
 }
 
 // Event listeners
-startBtn.addEventListener('click', startAudio);
+startBtn.addEventListener('click', toggleConnection);
 muteBtn.addEventListener('click', toggleMute);
-nextBtn.addEventListener('click', nextTrack);
 volumeControl.addEventListener('input', () => {
-    if (audioElement) {
-        audioElement.volume = volumeControl.value;
+    if (gainNode && !isMuted) {
+        gainNode.gain.value = volumeControl.value;
     }
     
-    // Also update direct audio player
-    if (directAudio) {
-        directAudio.volume = volumeControl.value;
-    }
-    
-    // Update mute state
-    if (volumeControl.value > 0) {
-        isMuted = false;
-        muteBtn.textContent = 'Mute';
-    } else {
-        isMuted = true;
-        muteBtn.textContent = 'Unmute';
-    }
-    
-    // Save volume preference in local storage
     localStorage.setItem('radioVolume', volumeControl.value);
 });
 
-scanBtn.addEventListener('click', scanMusic);
-shuffleBtn.addEventListener('click', shufflePlaylist);
+// Handle page visibility
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+        console.log('Page is now visible');
+        
+        // Update now playing
+        updateNowPlaying();
+        
+        // Reconnect if needed
+        if (startBtn.dataset.connected === 'true' && (!ws || ws.readyState !== WebSocket.OPEN)) {
+            console.log('Reconnecting after page became visible');
+            startAudio();
+        }
+    }
+});
 
 // Initialize
 document.addEventListener('DOMContentLoaded', async () => {
-    debugLog('Page loaded, initializing...');
+    console.log('Page loaded, initializing...');
     
-    // Set initial volume (from local storage if available)
+    // Set initial button state
+    startBtn.textContent = 'Connect';
+    startBtn.dataset.connected = 'false';
+    
+    // Set initial volume
     const savedVolume = localStorage.getItem('radioVolume');
     if (savedVolume !== null) {
         volumeControl.value = savedVolume;
-        if (directAudio) {
-            directAudio.volume = savedVolume;
-        }
     }
-    
-    // Load playlist
-    await loadPlaylist();
     
     // Update now playing
     await updateNowPlaying();
     
-    // Auto-update now playing every 10 seconds
-    setInterval(updateNowPlaying, 10000);
-    
-    // Auto-update stats every 10 seconds
+    // Auto-update
+    setInterval(updateNowPlaying, 5000);
     setInterval(updateStats, 10000);
     
-    debugLog('Initialization complete');
+    console.log('Initialization complete');
 });

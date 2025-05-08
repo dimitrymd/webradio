@@ -1,7 +1,5 @@
-#[macro_use]
 extern crate rocket;
 
-use rocket::fs::relative;
 use rocket_dyn_templates::Template;
 use rocket::{launch, routes, catchers};
 use std::thread;
@@ -13,11 +11,14 @@ mod services;
 mod utils;
 
 use crate::services::streamer::StreamManager;
+use crate::services::playlist;
 
 #[launch]
 fn rocket() -> rocket::Rocket<rocket::Build> {
-    // Initialize logging
-    env_logger::init();
+    println!("============================================================");
+    println!("Starting Rust MP3 Web Radio in broadcast mode");
+    println!("Music folder: {}", config::MUSIC_FOLDER.display());
+    println!("============================================================");
 
     // Initialize the stream manager
     let stream_manager = StreamManager::new(
@@ -27,32 +28,32 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         config::STREAM_CACHE_TIME,
     );
 
+    // Start the first track immediately
+    println!("Starting initial playback...");
+    if let Some(track) = playlist::get_current_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER) {
+        println!("Starting initial track: {}", track.title);
+        stream_manager.start_streaming(&track.path);
+    } else {
+        println!("WARNING: No tracks available for initial playback");
+    }
+
     // Start track switcher in a background thread
     let stream_manager_clone = stream_manager.clone();
     thread::spawn(move || {
         crate::services::playlist::track_switcher(stream_manager_clone);
     });
     
-    // Start streaming the first track automatically
-    if let Some(track) = crate::services::playlist::get_current_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER) {
-        log::info!("Starting automatic streaming with track: {}", track.title);
-        stream_manager.start_streaming(&track.path);
-    }
-
+    println!("Server initialization complete, starting web server...");
+    
     // Build and launch the Rocket instance
     rocket::build()
         .manage(stream_manager)
         .mount("/", routes![
             handlers::index,
             handlers::now_playing,
-            handlers::get_playlist,
-            handlers::scan_music,
-            handlers::shuffle_playlist,
-            handlers::play_track,
-            handlers::next_track,
             handlers::get_stats,
-            handlers::stream_ws,   // WebSocket endpoint
-            handlers::stream_http, // HTTP stream endpoint
+            handlers::stream_ws,      // WebSocket endpoint for real-time streaming
+            handlers::direct_stream,  // Direct streaming endpoint
             handlers::static_files,
         ])
         .register("/", catchers![
