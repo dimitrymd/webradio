@@ -12,6 +12,13 @@ use crate::models::playlist::{Track, Playlist};
 use crate::services::streamer::StreamManager;
 use crate::utils::mp3_scanner;
 
+// Constants to fine-tune track switching behavior
+const MIN_TRACK_PLAYBACK_TIME: u64 = 5; // Minimum seconds a track must play before switching
+const TRACK_SWITCH_DELAY_MS: u64 = 200; // Delay between track switch operations
+const MAX_WAIT_BEFORE_SWITCH: u64 = 5; // Maximum seconds to wait before switching tracks
+const HEALTH_CHECK_INTERVAL_SECS: u64 = 3; // Interval for checking stream health
+const TRACK_SWITCH_TIMEOUT_SECS: u64 = 30; // Maximum time allowed for track switching
+
 pub fn get_playlist(playlist_file: &Path) -> Playlist {
     if playlist_file.exists() {
         match fs::read_to_string(playlist_file) {
@@ -46,14 +53,16 @@ pub fn save_playlist(playlist: &Playlist, playlist_file: &Path) {
         String::new()
     });
     
-    let mut file = File::create(playlist_file).unwrap_or_else(|e| {
-        log::error!("Error creating playlist file: {}", e);
-        panic!("Failed to create playlist file");
-    });
-    
-    file.write_all(json.as_bytes()).unwrap_or_else(|e| {
-        log::error!("Error writing playlist file: {}", e);
-    });
+    match File::create(playlist_file) {
+        Ok(mut file) => {
+            if let Err(e) = file.write_all(json.as_bytes()) {
+                log::error!("Error writing playlist file: {}", e);
+            }
+        },
+        Err(e) => {
+            log::error!("Error creating playlist file: {}", e);
+        }
+    }
 }
 
 pub fn get_current_track(playlist_file: &Path, music_folder: &Path) -> Option<Track> {
@@ -249,7 +258,7 @@ pub fn rescan_and_update_durations(playlist_file: &Path, music_folder: &Path) {
     println!("Playlist updated and saved");
 }
 
-// Track switcher that manages broadcast playback
+// Non-blocking track switcher with improved error handling
 pub fn track_switcher(stream_manager: StreamManager) {
     // First, verify track durations to identify potential issues
     verify_track_durations(&crate::config::PLAYLIST_FILE, &crate::config::MUSIC_FOLDER);
@@ -257,11 +266,12 @@ pub fn track_switcher(stream_manager: StreamManager) {
     let mut prev_track_path = String::new();
     let mut playback_start_time = std::time::Instant::now();
     let mut last_health_check = std::time::Instant::now();
+    let mut last_track_ended_time = Instant::now();
     
     // Track if we're currently switching tracks (to avoid race conditions)
     let is_switching = Arc::new(AtomicBool::new(false));
     
-    println!("Track switcher thread started - broadcast mode");
+    println!("Track switcher thread started - broadcast mode with non-blocking improvements");
     
     // We'll skip the initial track start here since it's already started in main.rs
     // Just get the current track for tracking
@@ -275,77 +285,134 @@ pub fn track_switcher(stream_manager: StreamManager) {
     let mut last_log_time = std::time::Instant::now();
     let mut first_run = true;  // Flag for first iteration of the loop
     
+    // Continue running until program exits
     loop {
         // Small delay at the start of each iteration to avoid tight loop
         thread::sleep(Duration::from_millis(200));
         
-        // Get current track path
-        let track = get_current_track(&crate::config::PLAYLIST_FILE, &crate::config::MUSIC_FOLDER);
-        
-        // Skip if no tracks available
-        if track.is_none() {
-            println!("WARNING: No tracks available for playback");
-            thread::sleep(Duration::from_secs(1));
-            
-            // Try to scan music folder for new tracks
-            println!("Scanning music folder for new tracks...");
-            scan_music_folder(&crate::config::MUSIC_FOLDER, &crate::config::PLAYLIST_FILE);
-            
-            continue;
+        // Quick check if server is shutting down
+        if thread::panicking() {
+            println!("Detected panic - track switcher shutting down");
+            break;
         }
         
-        let current_track = track.unwrap();
+        // Get current track
+        let track = match get_current_track(&crate::config::PLAYLIST_FILE, &crate::config::MUSIC_FOLDER) {
+            Some(track) => track,
+            None => {
+                println!("WARNING: No tracks available for playback");
+                thread::sleep(Duration::from_secs(1));
+                
+                // Try to scan music folder for new tracks
+                println!("Scanning music folder for new tracks...");
+                scan_music_folder(&crate::config::MUSIC_FOLDER, &crate::config::PLAYLIST_FILE);
+                
+                continue;
+            }
+        };
+        
+        // Check if we've been stuck in track ended state for too long
+        if stream_manager.track_ended() && 
+           !is_switching.load(Ordering::SeqCst) {
+            
+            // Track when we first entered the track_ended state
+            if !last_track_ended_time.elapsed().as_secs() > TRACK_SWITCH_TIMEOUT_SECS {
+                println!("WARNING: Stuck in track_ended state for too long, forcing track switch");
+                
+                // Try to initiate track switching
+                if is_switching.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                    println!("Forcing track switch after timeout");
+                    
+                    // Reset track ended time
+                    last_track_ended_time = Instant::now();
+                    
+                    // Force track switch
+                    match advance_track(&crate::config::PLAYLIST_FILE, &crate::config::MUSIC_FOLDER) {
+                        Some(next_track) => {
+                            println!("Force starting next track: \"{}\"", next_track.title);
+                            stream_manager.start_streaming(&next_track.path);
+                            prev_track_path = next_track.path.clone();
+                            playback_start_time = std::time::Instant::now();
+                            last_log_time = std::time::Instant::now();
+                        },
+                        None => {
+                            println!("CRITICAL: No next track available during force switch");
+                            // Try emergency recovery
+                            scan_music_folder(&crate::config::MUSIC_FOLDER, &crate::config::PLAYLIST_FILE);
+                            
+                            if let Some(track) = get_current_track(&crate::config::PLAYLIST_FILE, &crate::config::MUSIC_FOLDER) {
+                                println!("Emergency recovery successful");
+                                stream_manager.start_streaming(&track.path);
+                                prev_track_path = track.path.clone();
+                                playback_start_time = std::time::Instant::now();
+                                last_log_time = std::time::Instant::now();
+                            } else {
+                                println!("FATAL: Emergency recovery failed - no tracks available");
+                            }
+                        }
+                    }
+                    
+                    // Always clear the switching flag
+                    is_switching.store(false, Ordering::SeqCst);
+                }
+            }
+        }
         
         // For the first run of the loop, just set up tracking without taking any action
         if first_run {
-            prev_track_path = current_track.path.clone();
+            prev_track_path = track.path.clone();
             playback_start_time = std::time::Instant::now();
             last_log_time = std::time::Instant::now();
             first_run = false;
             
             println!("Initial track monitoring set up: \"{}\" by \"{}\"", 
-                   current_track.title, current_track.artist);
+                   track.title, track.artist);
                    
             continue;
         }
         
         // Check if track has changed (this shouldn't normally happen except through the track switcher itself)
-        if current_track.path != prev_track_path {
-            // Set the switching flag to prevent concurrent track changes
-            is_switching.store(true, Ordering::SeqCst);
-            
-            println!("Track change detected: \"{}\" by \"{}\" (duration: {} seconds)", 
-                   current_track.title, current_track.artist, current_track.duration);
-            
-            // Reset track ended flag
-            stream_manager.reset_track_ended_flag();
-            
-            // Start streaming (broadcasting) the current track
-            stream_manager.start_streaming(&current_track.path);
-            
-            // Remember current track and reset timer
-            prev_track_path = current_track.path.clone();
-            playback_start_time = std::time::Instant::now();
-            last_log_time = std::time::Instant::now();
-            
-            println!("Started broadcasting new track at {}", 
-                   chrono::Local::now().format("%H:%M:%S%.3f"));
-                   
-            // Clear the switching flag
-            is_switching.store(false, Ordering::SeqCst);
+        if track.path != prev_track_path {
+            // Try to set the switching flag - if another thread is already switching, we'll skip
+            if is_switching.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                println!("Track change detected: \"{}\" by \"{}\" (duration: {} seconds)", 
+                       track.title, track.artist, track.duration);
+                
+                // Reset track ended flag
+                stream_manager.reset_track_ended_flag();
+                
+                // Start streaming (broadcasting) the current track
+                stream_manager.start_streaming(&track.path);
+                
+                // Remember current track and reset timer
+                prev_track_path = track.path.clone();
+                playback_start_time = std::time::Instant::now();
+                last_log_time = std::time::Instant::now();
+                
+                println!("Started broadcasting new track at {}", 
+                       chrono::Local::now().format("%H:%M:%S%.3f"));
+                       
+                // Clear the switching flag
+                is_switching.store(false, Ordering::SeqCst);
+            } else {
+                println!("Track change detected but another thread is already handling switching");
+            }
         }
         
-        // Check stream health every 3 seconds
-        if last_health_check.elapsed().as_secs() >= 3 {
+        // Check stream health periodically
+        if last_health_check.elapsed().as_secs() >= HEALTH_CHECK_INTERVAL_SECS {
             // Check if stream is stalled
-            if stream_manager.is_stream_stalled() && !is_switching.load(Ordering::SeqCst) {
-                println!("WARNING: Stream appears to be stalled. Restarting broadcast.");
+            if stream_manager.is_stream_stalled() && 
+               !is_switching.load(Ordering::SeqCst) &&
+               is_switching.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                 
-                // Set the switching flag to prevent concurrent track changes
-                is_switching.store(true, Ordering::SeqCst);
+                println!("WARNING: Stream appears to be stalled. Restarting broadcast.");
                 
                 // Force stop current stream
                 stream_manager.force_stop_streaming();
+                
+                // Brief pause to allow cleanup
+                thread::sleep(Duration::from_millis(100));
                 
                 // Restart the same track (without advancing)
                 if let Some(track) = get_current_track(&crate::config::PLAYLIST_FILE, &crate::config::MUSIC_FOLDER) {
@@ -369,84 +436,90 @@ pub fn track_switcher(stream_manager: StreamManager) {
         // Calculate how long we've been playing this track
         let elapsed_time = playback_start_time.elapsed().as_secs();
         
-        // Get current playback position from the stream manager
-        let current_position = stream_manager.get_playback_position();
-        
-        // Log playback progress every 5 seconds
+        // Log playback progress periodically
         if last_log_time.elapsed().as_secs() >= 5 {
-            // Check streaming status
+            // Check streaming status - use fast atomic operations
             let is_streaming = stream_manager.is_streaming();
             let track_ended = stream_manager.track_ended();
             let receiver_count = stream_manager.get_receiver_count();
+            let active_listeners = stream_manager.get_active_listeners();
             
             println!("BROADCAST STATUS: Playing \"{}\" for {} seconds (of {} total), streaming={}, track_ended={}, listeners={}", 
-                   current_track.title, elapsed_time, current_track.duration, is_streaming, track_ended, receiver_count);
+                   track.title, elapsed_time, track.duration, is_streaming, track_ended, active_listeners);
             
             last_log_time = std::time::Instant::now();
         }
         
-        // CHECK 1: Ensure we've been playing for at least a minimum time before considering track switches
-        if elapsed_time < 5 {
-            continue;  // Skip the rest of the loop if we just started playing
+        // Ensure we've been playing for at least a minimum time before considering track switches
+        if elapsed_time < MIN_TRACK_PLAYBACK_TIME {
+            continue;
         }
         
-        // CHECK 2: Track has a defined duration and we've exceeded it by a margin
-        let duration_check = current_track.duration > 10 && elapsed_time >= current_track.duration + 2;
+        // Track ending conditions (using atomic flags for faster checks)
+        let duration_check = track.duration > 10 && elapsed_time >= track.duration + 2;
+        let end_flag_check = stream_manager.track_ended() && elapsed_time >= track.duration / 2;
         
-        // CHECK 3: Stream has explicitly signaled track end and we're at least reasonably close to expected duration
-        let end_flag_check = stream_manager.track_ended() && elapsed_time >= current_track.duration / 2;
-        
-        // CHECK 4: Stream is no longer active but was previously (and not due to a recent switch)
-        let streaming_check = !stream_manager.is_streaming() && elapsed_time > current_track.duration / 2;
-        
-        if (duration_check || end_flag_check || streaming_check) && !is_switching.load(Ordering::SeqCst) {
-            println!("Track complete: \"{}\" (duration check: {}, end flag: {}, streaming check: {}). Advancing to next track.", 
-                   current_track.title, duration_check, end_flag_check, streaming_check);
-            println!("Elapsed time: {}s, Track duration: {}s", elapsed_time, current_track.duration);
+        // Check if we need to switch tracks and no other thread is already switching
+        if (duration_check || end_flag_check) && 
+            !is_switching.load(Ordering::SeqCst) &&
+            is_switching.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
             
-            // Set the switching flag to prevent concurrent track changes
-            is_switching.store(true, Ordering::SeqCst);
+            println!("Track switch starting for track: \"{}\"", track.title);
             
-            // Sleep a moment to ensure full track playback
-            // This adds a safety margin to ensure we don't switch tracks too early
-            if elapsed_time < current_track.duration {
-                let wait_time = current_track.duration - elapsed_time + 1;
-                if wait_time > 0 && wait_time < 30 { // Don't wait more than 30 seconds as a safeguard
-                    println!("Waiting additional {} seconds before advancing track", wait_time);
-                    thread::sleep(Duration::from_secs(wait_time));
+            // Track the start time for timeout detection
+            let switch_start_time = Instant::now();
+            last_track_ended_time = Instant::now();
+            
+            // Prepare the stream manager for track switch - this sets track_ended
+            // but keeps is_streaming true
+            stream_manager.prepare_for_track_switch();
+            
+            // Small delay to ensure all clients receive the end-of-track signal
+            thread::sleep(Duration::from_millis(TRACK_SWITCH_DELAY_MS));
+            
+            // Try switching with better error handling
+            match advance_track(&crate::config::PLAYLIST_FILE, &crate::config::MUSIC_FOLDER) {
+                Some(next_track) => {
+                    println!("Successfully advanced to next track: \"{}\" by \"{}\"", 
+                            next_track.title, next_track.artist);
+                    
+                    // Start streaming the next track - this will reset flags properly
+                    stream_manager.start_streaming(&next_track.path);
+                    prev_track_path = next_track.path.clone();
+                    playback_start_time = std::time::Instant::now();
+                    last_log_time = std::time::Instant::now();
+                },
+                None => {
+                    println!("CRITICAL: Failed to get next track. Attempting recovery...");
+                    
+                    // Recovery attempt - scan music folder for new tracks
+                    scan_music_folder(&crate::config::MUSIC_FOLDER, &crate::config::PLAYLIST_FILE);
+                    
+                    // Try again with the freshly scanned playlist
+                    if let Some(recovered_track) = get_current_track(&crate::config::PLAYLIST_FILE, &crate::config::MUSIC_FOLDER) {
+                        println!("Recovery successful - starting track: \"{}\"", recovered_track.title);
+                        stream_manager.start_streaming(&recovered_track.path);
+                        prev_track_path = recovered_track.path.clone();
+                        playback_start_time = std::time::Instant::now();
+                        last_log_time = std::time::Instant::now();
+                    } else {
+                        println!("FATAL: No tracks available after recovery attempt");
+                        // Force stream_manager into a valid state to avoid deadlock
+                        stream_manager.force_stop_streaming();
+                    }
                 }
             }
             
-            // Force stop the current stream if it's still running
-            if stream_manager.is_streaming() {
-                println!("Forcing stream to stop before switching tracks");
-                stream_manager.force_stop_streaming();
-            }
-            
-            // Sleep a moment to ensure cleanup is done
-            thread::sleep(Duration::from_secs(1));
-            
-            // Advance to next track
-            let next_track = advance_track(&crate::config::PLAYLIST_FILE, &crate::config::MUSIC_FOLDER);
-            
-            if let Some(track) = next_track {
-                println!("Starting next track: \"{}\" by \"{}\" (duration: {} seconds)", 
-                       track.title, track.artist, track.duration);
-                       
-                // Start streaming the next track
-                stream_manager.start_streaming(&track.path);
-                prev_track_path = track.path.clone();
-                playback_start_time = std::time::Instant::now();
-                last_log_time = std::time::Instant::now();
-            } else {
-                println!("WARNING: Failed to get next track");
-            }
-            
-            // Clear the switching flag
+            // CRITICAL: Always clear the switching flag, even if an error occurred
             is_switching.store(false, Ordering::SeqCst);
             
-            // Sleep briefly to avoid tight loops
-            thread::sleep(Duration::from_millis(500));
+            // Check if switch took too long
+            if switch_start_time.elapsed().as_secs() > TRACK_SWITCH_TIMEOUT_SECS {
+                println!("WARNING: Track switch took longer than expected: {:?}", 
+                       switch_start_time.elapsed());
+            } else {
+                println!("Track switch completed in {:?}", switch_start_time.elapsed());
+            }
         }
     }
 }

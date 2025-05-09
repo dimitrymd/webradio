@@ -11,6 +11,7 @@ const currentArtist = document.getElementById('current-artist');
 const currentAlbum = document.getElementById('current-album');
 const currentDuration = document.getElementById('current-duration');
 const currentPosition = document.getElementById('current-position');
+const progressBar = document.getElementById('progress-bar');
 
 // WebSocket and audio context
 let ws = null;
@@ -23,7 +24,6 @@ let isMuted = false;
 let reconnectAttempts = 0;
 let maxReconnectAttempts = 5;
 let connectionTimeout = null;
-let directAudio = null;
 let checkNowPlayingInterval = null;
 let audioLastUpdateTime = Date.now();
 let isProcessingQueue = false;
@@ -398,7 +398,7 @@ function checkBrowserSupport() {
             logDebug(`${supported ? '✓' : '✗'} Format ${format} ${supported ? 'is' : 'is NOT'} supported`, 'general');
         });
     } else {
-        logDebug('✗ MediaSource API is NOT supported - will use fallback streaming', 'general', true);
+        logDebug('✗ MediaSource API is NOT supported', 'general', true);
     }
     
     // Check WebSocket support
@@ -436,29 +436,6 @@ function checkBrowserSupport() {
     // Log current connection info
     logDebug(`Current protocol: ${window.location.protocol}`, 'general');
     logDebug(`Current host: ${window.location.host}`, 'general');
-    
-    // Log network information if available
-    if ('connection' in navigator) {
-        const conn = navigator.connection;
-        logDebug(`Network type: ${conn.effectiveType || 'unknown'}`, 'general');
-        logDebug(`Downlink: ${conn.downlink || 'unknown'} Mbps`, 'general');
-    }
-}
-
-// Helper function to get audio error messages
-function getAudioErrorMessage(errorCode) {
-    switch(errorCode) {
-        case 1:
-            return "MEDIA_ERR_ABORTED - Fetching process aborted by user";
-        case 2: 
-            return "MEDIA_ERR_NETWORK - Network error while loading media";
-        case 3:
-            return "MEDIA_ERR_DECODE - Media decoding error (corrupt or unsupported format)";
-        case 4:
-            return "MEDIA_ERR_SRC_NOT_SUPPORTED - Media format not supported";
-        default:
-            return "Unknown error";
-    }
 }
 
 // Format time (seconds to MM:SS)
@@ -471,7 +448,6 @@ function formatTime(seconds) {
 
 // Update the progress bar
 function updateProgressBar(position, duration) {
-    const progressBar = document.getElementById('progress-bar');
     if (progressBar && duration > 0) {
         const percent = (position / duration) * 100;
         progressBar.style.width = `${percent}%`;
@@ -573,7 +549,7 @@ async function updateStats() {
     }
 }
 
-// Start audio streaming
+// Start WebSocket streaming
 function startAudio() {
     logDebug('Starting audio playback - user initiated', 'audio');
     startBtn.disabled = true;
@@ -581,153 +557,29 @@ function startAudio() {
     // Reset reconnect attempts
     reconnectAttempts = 0;
     
-    // Clean up any existing audio elements
-    if (directAudio) {
-        logDebug('Cleaning up existing audio element', 'audio');
-        directAudio.pause();
-        directAudio.src = '';
-        directAudio.load();
-        if (directAudio.parentNode) {
-            directAudio.parentNode.removeChild(directAudio);
-        }
-        directAudio = null;
+    // Check if WebSocket API is supported
+    if (!('WebSocket' in window)) {
+        logDebug('WebSocket API not supported by this browser', 'audio', true);
+        showStatus('Your browser does not support WebSockets. Please try a different browser.', true);
+        startBtn.disabled = false;
+        return;
     }
     
-    // Determine best streaming method based on browser capabilities
-    const mediaSourceSupported = 'MediaSource' in window && MediaSource.isTypeSupported('audio/mpeg');
-    logDebug(`Streaming method: ${mediaSourceSupported ? 'MediaSource API' : 'Direct HTTP streaming'}`, 'audio');
-    
-    if (mediaSourceSupported) {
-        logDebug('Using MediaSource API for streaming', 'audio');
-        startMSEStreaming();
-    } else {
-        logDebug('Using direct HTTP streaming', 'audio');
-        startDirectStreaming();
+    // Check if MediaSource API is supported
+    if (!('MediaSource' in window) || !MediaSource.isTypeSupported('audio/mpeg')) {
+        logDebug('MediaSource API not supported for MP3 by this browser', 'audio', true);
+        showStatus('Your browser does not fully support MediaSource for MP3. Audio may not play correctly.', true);
+        // We'll still try to connect, but warn the user
     }
+    
+    logDebug('Connecting to WebSocket stream...', 'audio');
+    connectWebSocket();
     
     // Start frequent checks of now playing info
     if (checkNowPlayingInterval) {
         clearInterval(checkNowPlayingInterval);
     }
     checkNowPlayingInterval = setInterval(updateNowPlaying, 2000);
-}
-
-// WebSocket streaming with MediaSource API
-function startMSEStreaming() {
-    logDebug('Starting MSE streaming setup', 'audio');
-    
-    // Create a new audio element
-    logDebug('Creating new audio element for MSE', 'audio');
-    directAudio = document.createElement('audio');
-    directAudio.autoplay = true;  // Safe now since user has interacted
-    directAudio.controls = false;
-    directAudio.style.display = 'none';
-    document.body.appendChild(directAudio);
-    
-    // Set initial volume
-    directAudio.volume = volumeControl.value;
-    
-    // Add event listeners for debugging
-    directAudio.addEventListener('playing', () => {
-        logDebug('Audio element started playing', 'audio');
-    });
-    
-    directAudio.addEventListener('waiting', () => {
-        logDebug('Audio buffering - waiting for more data', 'audio');
-    });
-    
-    directAudio.addEventListener('stalled', () => {
-        logDebug('Audio playback stalled', 'audio', true);
-    });
-    
-    // Create Media Source
-    logDebug('Creating MediaSource object', 'audio');
-    mediaSource = new MediaSource();
-    directAudio.src = URL.createObjectURL(mediaSource);
-    
-    // Handle Media Source open event
-    mediaSource.addEventListener('sourceopen', function() {
-        logDebug(`MediaSource opened, readyState: ${mediaSource.readyState}`, 'audio');
-        
-        // Create source buffer
-        try {
-            logDebug('Adding SourceBuffer for audio/mpeg', 'audio');
-            sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
-            
-            // Handle update end events
-            sourceBuffer.addEventListener('updateend', function() {
-                // Process the next item in the queue if available
-                processQueue();
-            });
-            
-            // Handle errors
-            sourceBuffer.addEventListener('error', function(e) {
-                logDebug(`SourceBuffer error: ${e.message || 'Unknown error'}`, 'audio', true);
-            });
-            
-            // Connect to WebSocket
-            connectWebSocket();
-        } catch (e) {
-            logDebug(`Error setting up MSE: ${e.message}`, 'audio', true);
-            logDebug(`Stack trace: ${e.stack}`, 'audio', true);
-            // Fall back to direct streaming if MSE fails
-            startDirectStreaming();
-        }
-    });
-    
-    mediaSource.addEventListener('sourceclose', function() {
-        logDebug('MediaSource closed', 'audio');
-    });
-    
-    mediaSource.addEventListener('sourceended', function() {
-        logDebug('MediaSource ended', 'audio');
-    });
-    
-    mediaSource.addEventListener('error', function(e) {
-        logDebug(`MediaSource error: ${e.message || 'Unknown error'}`, 'audio', true);
-    });
-    
-    // Set up timeout for initial connection
-    connectionTimeout = setTimeout(function() {
-        logDebug('Connection timeout for MSE - falling back to direct streaming', 'audio', true);
-        // Fall back to direct streaming if MSE times out
-        startDirectStreaming();
-    }, 5000);
-}
-
-// Process the audio queue
-function processQueue() {
-    if (audioQueue.length > 0 && !isProcessingQueue && sourceBuffer && !sourceBuffer.updating) {
-        isProcessingQueue = true;
-        const data = audioQueue.shift();
-        
-        try {
-            sourceBuffer.appendBuffer(data);
-            
-            // Log progress occasionally
-            if (audioQueue.length % 50 === 0 && audioQueue.length > 0) {
-                logDebug(`Queue status: ${audioQueue.length} chunks pending`, 'audio');
-            }
-        } catch (e) {
-            logDebug(`Error appending buffer: ${e.name} - ${e.message}`, 'audio', true);
-            
-            // If we hit a quota exceeded error, clear the buffer and try again
-            if (e.name === 'QuotaExceededError') {
-                logDebug('Buffer full, removing old data', 'audio');
-                // Remove 10 seconds from the beginning
-                if (sourceBuffer.buffered.length > 0) {
-                    const start = sourceBuffer.buffered.start(0);
-                    const end = start + 10;
-                    logDebug(`Removing buffer from ${start}s to ${end}s`, 'audio');
-                    sourceBuffer.remove(start, end);
-                }
-                // Put the data back in the queue
-                audioQueue.unshift(data);
-            }
-        }
-        
-        isProcessingQueue = false;
-    }
 }
 
 // Connect to WebSocket for streaming
@@ -739,248 +591,271 @@ function connectWebSocket() {
         ws = null;
     }
     
-    // Determine the WebSocket URL
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/stream`;
-    logDebug(`Connecting to WebSocket: ${wsUrl}`, 'ws');
-    
-    // Create new WebSocket
-    ws = new WebSocket(wsUrl);
-    
-    // Set up event handlers
-    ws.onopen = function() {
-        logDebug('WebSocket connection established', 'ws');
-        showStatus('Connected to audio stream');
-        startBtn.textContent = 'Disconnect';
-        startBtn.disabled = false;
-        startBtn.dataset.connected = 'true';
-        isPlaying = true;
-        
-        // Clear connection timeout if set
-        if (connectionTimeout) {
-            clearTimeout(connectionTimeout);
-            connectionTimeout = null;
-        }
-    };
-    
-    ws.onmessage = function(event) {
-        // Clear connection timeout if set
-        if (connectionTimeout) {
-            clearTimeout(connectionTimeout);
-            connectionTimeout = null;
-        }
-        
-        // Reset the audioLastUpdateTime
-        audioLastUpdateTime = Date.now();
-        
-        // Process the received data
-        if (event.data instanceof Blob) {
-            // Log bin message size occasionally
-            if (Math.random() < 0.01) { // Log roughly 1% of binary messages
-                logDebug(`Received binary data: ${event.data.size} bytes`, 'ws');
-            }
-            
-            // Handle binary audio data
-            event.data.arrayBuffer().then(buffer => {
-                if (sourceBuffer && mediaSource.readyState === 'open') {
-                    // Add to queue
-                    audioQueue.push(buffer);
-                    
-                    // Process queue if not already processing
-                    if (!isProcessingQueue && !sourceBuffer.updating) {
-                        processQueue();
-                    }
-                } else {
-                    if (mediaSource) {
-                        logDebug(`Cannot process audio chunk - MediaSource state: ${mediaSource.readyState}`, 'audio', true);
-                    } else {
-                        logDebug('Cannot process audio chunk - MediaSource not available', 'audio', true);
-                    }
-                }
-            }).catch(e => {
-                logDebug(`Error processing audio data: ${e.message}`, 'audio', true);
-            });
-        } else {
-            // Handle text data (track info)
+    // Clean up any existing MediaSource
+    if (mediaSource) {
+        if (mediaSource.readyState === 'open') {
             try {
-                logDebug(`Received text message: ${event.data}`, 'ws');
-                const info = JSON.parse(event.data);
-                logDebug(`Parsed track info: ${JSON.stringify(info)}`, 'track');
-                
-                // Update display
-                currentTitle.textContent = info.title || 'Unknown Title';
-                currentArtist.textContent = info.artist || 'Unknown Artist';
-                currentAlbum.textContent = info.album || 'Unknown Album';
-                currentDuration.textContent = formatTime(info.duration);
-                
-                // Store track ID
-                currentTitle.dataset.trackId = info.path;
-                
-                // Update page title
-                document.title = `${info.title} - ${info.artist} | Rust Web Radio`;
+                mediaSource.endOfStream();
             } catch (e) {
-                logDebug(`Error parsing track info: ${e.message}`, 'track', true);
+                logDebug(`Error ending MediaSource stream: ${e.message}`, 'audio', true);
             }
         }
-    };
+        mediaSource = null;
+    }
     
-    ws.onclose = function(event) {
-        logDebug(`WebSocket connection closed: Code ${event.code}`, 'ws');
-        
-        // Only attempt reconnect if it wasn't requested by the user
-        if (startBtn.dataset.connected === 'true' && isPlaying) {
-            handleStreamError('Connection lost. Attempting to reconnect...');
+    // Clean up any existing audio element
+    if (audioContext) {
+        try {
+            audioContext.close();
+        } catch (e) {
+            logDebug(`Error closing AudioContext: ${e.message}`, 'audio', true);
         }
-    };
+        audioContext = null;
+    }
     
-    ws.onerror = function(error) {
-        logDebug('WebSocket error occurred', 'ws', true);
-        handleStreamError('Error connecting to audio stream');
-    };
-}
-
-// Direct HTTP streaming
-function startDirectStreaming() {
-    logDebug('Starting direct HTTP streaming', 'audio');
-    
-    // Create a new audio element
-    logDebug('Creating new audio element for direct streaming', 'audio');
-    directAudio = document.createElement('audio');
-    directAudio.autoplay = true;  // Safe now since user has interacted
-    directAudio.controls = false;
-    directAudio.style.display = 'none';
-    document.body.appendChild(directAudio);
-    
-    // Handle events
-    directAudio.addEventListener('playing', () => {
-        logDebug('Direct streaming started successfully', 'audio');
-        showStatus('Connected to audio stream');
-        startBtn.textContent = 'Disconnect';
+    // Create audio context
+    try {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        logDebug(`Created AudioContext, sample rate: ${audioContext.sampleRate}Hz`, 'audio');
+    } catch (e) {
+        logDebug(`Error creating AudioContext: ${e.message}`, 'audio', true);
+        showStatus('Error initializing audio. Please try again.', true);
         startBtn.disabled = false;
-        startBtn.dataset.connected = 'true';
-        isPlaying = true;
+        return;
+    }
+    
+    // Create a new MediaSource
+    try {
+        mediaSource = new MediaSource();
+        logDebug(`Created MediaSource object, readyState: ${mediaSource.readyState}`, 'audio');
+    } catch (e) {
+        logDebug(`Error creating MediaSource: ${e.message}`, 'audio', true);
+        showStatus('Error initializing media. Please try again.', true);
+        startBtn.disabled = false;
+        return;
+    }
+    
+    // Set up MediaSource open handler
+    mediaSource.addEventListener('sourceopen', function() {
+        logDebug(`MediaSource opened, readyState: ${mediaSource.readyState}`, 'audio');
         
-        // Clear timeout if any
-        if (connectionTimeout) {
-            clearTimeout(connectionTimeout);
-            connectionTimeout = null;
+        try {
+            // Create source buffer
+            sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
+            logDebug('SourceBuffer created for audio/mpeg', 'audio');
+            
+            sourceBuffer.addEventListener('updateend', function() {
+                // Process the queue when source buffer is ready
+                processQueue();
+            });
+            
+            sourceBuffer.addEventListener('error', function(e) {
+                logDebug(`SourceBuffer error: ${e.message || 'Unknown error'}`, 'audio', true);
+            });
+            
+            // Reset audio queue
+            audioQueue = [];
+            isProcessingQueue = false;
+            
+            // Determine the WebSocket URL
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/stream`;
+            logDebug(`Connecting to WebSocket at ${wsUrl}`, 'ws');
+            
+            // Create WebSocket connection
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = function() {
+                logDebug('WebSocket connection established', 'ws');
+                showStatus('Connected to audio stream');
+                startBtn.textContent = 'Disconnect';
+                startBtn.disabled = false;
+                startBtn.dataset.connected = 'true';
+                isPlaying = true;
+                
+                // Clear connection timeout if set
+                if (connectionTimeout) {
+                    clearTimeout(connectionTimeout);
+                    connectionTimeout = null;
+                }
+            };
+            
+            ws.onclose = function(event) {
+                logDebug(`WebSocket connection closed: Code ${event.code}`, 'ws');
+                
+                // Only attempt reconnect if it wasn't requested by the user
+                if (startBtn.dataset.connected === 'true' && isPlaying) {
+                    handleStreamError('Connection lost. Attempting to reconnect...');
+                }
+            };
+            
+            ws.onerror = function(error) {
+                logDebug('WebSocket error occurred', 'ws', true);
+                handleStreamError('Error connecting to audio stream');
+            };
+            
+            ws.onmessage = handleWebSocketMessage;
+        } catch (e) {
+            logDebug(`Error setting up streaming: ${e.message}`, 'audio', true);
+            showStatus(`Error setting up stream: ${e.message}`, true);
+            startBtn.disabled = false;
         }
-        
-        // Reset the audioLastUpdateTime
-        audioLastUpdateTime = Date.now();
     });
     
-    directAudio.addEventListener('error', (e) => {
-        const errorCode = e.target.error ? e.target.error.code : 'unknown';
-        const errorMessage = getAudioErrorMessage(errorCode);
-        logDebug(`Audio streaming error (code ${errorCode}): ${errorMessage}`, 'audio', true);
-        handleStreamError(`Error connecting to audio stream: ${errorMessage}`);
+    mediaSource.addEventListener('sourceclose', function() {
+        logDebug('MediaSource closed', 'audio');
     });
     
-    directAudio.addEventListener('ended', () => {
-        logDebug('Stream ended', 'audio', true);
-        handleStreamEnd();
+    mediaSource.addEventListener('sourceended', function() {
+        logDebug('MediaSource ended', 'audio');
     });
     
-    // Add stalled and waiting events
-    directAudio.addEventListener('stalled', () => {
+    // Create audio element and connect it to the media source
+    const audioElement = document.createElement('audio');
+    audioElement.id = 'audio-stream';
+    audioElement.style.display = 'none';
+    document.body.appendChild(audioElement);
+    
+    // Set volume
+    audioElement.volume = volumeControl.value;
+    
+    // Create object URL from media source
+    const mediaSourceUrl = URL.createObjectURL(mediaSource);
+    audioElement.src = mediaSourceUrl;
+    
+    // Add event listeners
+    audioElement.addEventListener('playing', function() {
+        logDebug('Audio playback started', 'audio');
+    });
+    
+    audioElement.addEventListener('waiting', function() {
+        logDebug('Audio buffering - waiting for more data', 'audio');
+    });
+    
+    audioElement.addEventListener('stalled', function() {
         logDebug('Audio playback stalled', 'audio', true);
     });
     
-    directAudio.addEventListener('waiting', () => {
-        logDebug('Audio playback waiting for more data', 'audio');
+    audioElement.addEventListener('error', function(e) {
+        const errorCode = e.target.error ? e.target.error.code : 'unknown';
+        logDebug(`Audio error (code ${errorCode})`, 'audio', true);
     });
-    
-    // Add canplay event
-    directAudio.addEventListener('canplay', () => {
-        logDebug('Audio can play - enough data is available', 'audio');
-    });
-    
-    // Add timeupdate event to monitor playback
-    directAudio.addEventListener('timeupdate', () => {
-        if (directAudio.currentTime % 10 < 0.1) { // Log every ~10 seconds
-            logDebug(`Audio playback time: ${Math.floor(directAudio.currentTime)}s`, 'audio');
-        }
-    });
-    
-    // Add a unique timestamp parameter to prevent caching
-    const timestamp = new Date().getTime();
-    const streamUrl = `/direct-stream?t=${timestamp}`;
-    logDebug(`Setting audio source to: ${streamUrl}`, 'audio');
-    directAudio.src = streamUrl;
-    
-    // Set volume
-    directAudio.volume = volumeControl.value;
     
     // Start playback
-    logDebug('Attempting to start audio playback', 'audio');
-    directAudio.load();
-    directAudio.play().catch(e => {
+    audioElement.play().catch(function(e) {
         logDebug(`Error starting playback: ${e.message}`, 'audio', true);
-        handleStreamError('Failed to start playback. Please try again.');
+        showStatus('Error starting playback. Please try again.', true);
+        startBtn.disabled = false;
     });
     
-    // Set timeout for connection
-    logDebug('Setting 10-second connection timeout', 'audio');
-    connectionTimeout = setTimeout(() => {
-        logDebug('Connection timeout for direct streaming', 'audio', true);
-        handleStreamError('Connection timeout');
-    }, 10000); // 10 seconds timeout
-    
-    // Set up stall detection
-    setupStallDetection();
+    // Set timeout for initial connection
+    connectionTimeout = setTimeout(function() {
+        logDebug('Connection timeout - no audio data received', 'audio', true);
+        handleStreamError('Connection timeout. Please try again.');
+    }, 10000);
 }
 
-// Set up stall detection to recover from audio stalls
-function setupStallDetection() {
-    logDebug('Setting up stall detection', 'audio');
-    
-    if (window.stallDetectionInterval) {
-        clearInterval(window.stallDetectionInterval);
+// Handle WebSocket messages
+function handleWebSocketMessage(event) {
+    // Clear connection timeout if set
+    if (connectionTimeout) {
+        clearTimeout(connectionTimeout);
+        connectionTimeout = null;
     }
     
-    let lastPlaybackTime = 0;
-    let stallCounter = 0;
+    // Reset the audioLastUpdateTime
+    audioLastUpdateTime = Date.now();
     
-    window.stallDetectionInterval = setInterval(() => {
-        // Check if audio is playing but stalled
-        if (directAudio && !directAudio.paused && directAudio.readyState > 0) {
-            // If current time hasn't advanced in 5 seconds, it might be stalled
-            if (directAudio.currentTime === lastPlaybackTime) {
-                stallCounter++;
-                
-                if (stallCounter >= 3) { // ~15 seconds of no progress
-                    logDebug('Stream appears to be stalled, attempting recovery', 'audio', true);
-                    
-                    // Attempt recovery: restart the stream
-                    handleStreamError('Audio stream stalled. Reconnecting...');
-                    stallCounter = 0;
-                } else {
-                    logDebug(`Possible stall detected (${stallCounter}/3): Playback time not advancing`, 'audio');
-                }
-            } else {
-                // Reset counter if playback is advancing
-                if (stallCounter > 0) {
-                    logDebug('Playback time advancing again, stall resolved', 'audio');
-                    stallCounter = 0;
-                }
-            }
-            
-            lastPlaybackTime = directAudio.currentTime;
+    // Process binary audio data
+    if (event.data instanceof Blob) {
+        // Log bin message size occasionally
+        if (Math.random() < 0.01) { // Log roughly 1% of binary messages
+            logDebug(`Received binary data: ${event.data.size} bytes`, 'ws');
         }
         
-        // Also check for too much time since last data
-        if (Date.now() - audioLastUpdateTime > 10000 && isPlaying) {
-            logDebug('No audio data received for 10+ seconds, possible network issue', 'audio', true);
-            stallCounter++;
+        // Convert blob to array buffer
+        event.data.arrayBuffer().then(buffer => {
+            if (sourceBuffer && mediaSource && mediaSource.readyState === 'open') {
+                // Add to queue
+                audioQueue.push(buffer);
+                
+                // Process queue if not already processing
+                if (!isProcessingQueue && !sourceBuffer.updating) {
+                    processQueue();
+                }
+            } else {
+                logDebug('Cannot process audio data - MediaSource not ready', 'audio');
+            }
+        }).catch(e => {
+            logDebug(`Error processing audio data: ${e.message}`, 'audio', true);
+        });
+    } else {
+        // Process text data (likely track info)
+        try {
+            logDebug(`Received text message: ${event.data}`, 'ws');
+            const info = JSON.parse(event.data);
+            logDebug(`Parsed track info: ${JSON.stringify(info)}`, 'track');
             
-            if (stallCounter >= 3) {
-                logDebug('Long period with no data, attempting recovery', 'audio', true);
-                handleStreamError('No data received. Reconnecting...');
-                stallCounter = 0;
+            // Update display
+            currentTitle.textContent = info.title || 'Unknown Title';
+            currentArtist.textContent = info.artist || 'Unknown Artist';
+            currentAlbum.textContent = info.album || 'Unknown Album';
+            currentDuration.textContent = formatTime(info.duration);
+            
+            // Store track ID
+            currentTitle.dataset.trackId = info.path;
+            
+            // Update page title
+            document.title = `${info.title} - ${info.artist} | Rust Web Radio`;
+        } catch (e) {
+            logDebug(`Error parsing text message: ${event.data}`, 'track', true);
+        }
+    }
+}
+
+// Process the audio queue
+function processQueue() {
+    if (audioQueue.length > 0 && !isProcessingQueue && sourceBuffer && !sourceBuffer.updating) {
+        isProcessingQueue = true;
+        const data = audioQueue.shift();
+        
+        try {
+            sourceBuffer.appendBuffer(data);
+            
+            // Log queue status periodically
+            if (audioQueue.length % 50 === 0 && audioQueue.length > 0) {
+                logDebug(`Queue status: ${audioQueue.length} chunks pending`, 'audio');
+            }
+        } catch (e) {
+            logDebug(`Error appending buffer: ${e.name} - ${e.message}`, 'audio', true);
+            
+            // If we hit a quota exceeded error, clear part of the buffer
+            if (e.name === 'QuotaExceededError') {
+                logDebug('Buffer full, removing old data', 'audio');
+                
+                if (sourceBuffer.buffered.length > 0) {
+                    try {
+                        // Remove first 10 seconds of buffered data
+                        const start = sourceBuffer.buffered.start(0);
+                        const end = Math.min(sourceBuffer.buffered.end(0), start + 10);
+                        sourceBuffer.remove(start, end);
+                    } catch (removeError) {
+                        logDebug(`Error removing buffer: ${removeError.message}`, 'audio', true);
+                    }
+                }
+                
+                // Put the data back in the queue
+                audioQueue.unshift(data);
             }
         }
-    }, 5000);
+        
+        isProcessingQueue = false;
+        
+        // Continue processing if there are more items and the buffer is not updating
+        if (audioQueue.length > 0 && !sourceBuffer.updating) {
+            processQueue();
+        }
+    }
 }
 
 // Handle stream errors
@@ -1016,15 +891,6 @@ function handleStreamError(message) {
     }
 }
 
-// Handle stream end
-function handleStreamEnd() {
-    logDebug('Stream ended', 'audio');
-    
-    // Since our server handles track switching internally, 
-    // an ended event likely means a problem occurred
-    handleStreamError('Stream ended unexpectedly');
-}
-
 // Stop audio streaming
 function stopAudio(isError = false) {
     logDebug(`Stopping audio playback${isError ? ' due to error' : ' by user request'}`, 'audio');
@@ -1037,18 +903,13 @@ function stopAudio(isError = false) {
         checkNowPlayingInterval = null;
     }
     
-    if (window.stallDetectionInterval) {
-        clearInterval(window.stallDetectionInterval);
-        window.stallDetectionInterval = null;
-    }
-    
     // Close WebSocket if open
     if (ws) {
         ws.close();
         ws = null;
     }
     
-    // Clear media source
+    // Clean up media source
     if (mediaSource && mediaSource.readyState === 'open') {
         try {
             mediaSource.endOfStream();
@@ -1057,21 +918,27 @@ function stopAudio(isError = false) {
         }
     }
     
+    // Clear audio context
+    if (audioContext) {
+        try {
+            audioContext.close();
+        } catch (e) {
+            logDebug(`Error closing audio context: ${e.message}`, 'audio', true);
+        }
+        audioContext = null;
+    }
+    
     // Clear queued data
     audioQueue = [];
     isProcessingQueue = false;
     
-    // Clean up audio element
-    if (directAudio) {
-        directAudio.pause();
-        directAudio.src = '';
-        directAudio.load(); // Important: forces the element to reset
-        
-        // Remove from DOM
-        if (directAudio.parentNode) {
-            directAudio.parentNode.removeChild(directAudio);
-        }
-        directAudio = null;
+    // Remove audio element
+    const audioElement = document.getElementById('audio-stream');
+    if (audioElement) {
+        audioElement.pause();
+        audioElement.src = '';
+        audioElement.load(); // Important to release resources
+        audioElement.remove();
     }
     
     // Clear any pending timeout
@@ -1098,34 +965,7 @@ function toggleConnection() {
         stopAudio();
     } else {
         logDebug('User requested connect - starting audio now', 'general');
-        startAudio();  // This creates and starts the audio only after button click
-    }
-}
-
-// Monitor WebSocket state and report issues
-function monitorWebSocketHealth() {
-    if (!ws) {
-        logDebug('No active WebSocket connection to monitor', 'ws');
-        return;
-    }
-    
-    const states = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'];
-    logDebug(`WebSocket state: ${states[ws.readyState]} (${ws.readyState})`, 'ws');
-    
-    if (ws.readyState === WebSocket.OPEN) {
-        logDebug('WebSocket connection is healthy', 'ws');
-        
-        // Send a ping to verify connection
-        try {
-            // Use a timestamp as ping data
-            const pingData = new Date().getTime().toString();
-            ws.send(pingData);
-            logDebug('WebSocket ping sent', 'ws');
-        } catch (e) {
-            logDebug(`WebSocket ping failed: ${e.message}`, 'ws', true);
-        }
-    } else if (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
-        logDebug('WebSocket connection is closed or closing', 'ws', true);
+        startAudio();
     }
 }
 
@@ -1133,8 +973,9 @@ function monitorWebSocketHealth() {
 startBtn.addEventListener('click', toggleConnection);
 
 volumeControl.addEventListener('input', () => {
-    if (directAudio) {
-        directAudio.volume = volumeControl.value;
+    const audioElement = document.getElementById('audio-stream');
+    if (audioElement) {
+        audioElement.volume = volumeControl.value;
         logDebug(`Volume set to ${volumeControl.value}`, 'audio');
     }
     
@@ -1142,10 +983,11 @@ volumeControl.addEventListener('input', () => {
 });
 
 muteBtn.addEventListener('click', () => {
-    if (directAudio) {
-        directAudio.muted = !directAudio.muted;
-        muteBtn.textContent = directAudio.muted ? 'Unmute' : 'Mute';
-        logDebug(`Audio ${directAudio.muted ? 'muted' : 'unmuted'}`, 'audio');
+    const audioElement = document.getElementById('audio-stream');
+    if (audioElement) {
+        audioElement.muted = !audioElement.muted;
+        muteBtn.textContent = audioElement.muted ? 'Unmute' : 'Mute';
+        logDebug(`Audio ${audioElement.muted ? 'muted' : 'unmuted'}`, 'audio');
     }
 });
 
@@ -1158,7 +1000,7 @@ document.addEventListener('visibilitychange', () => {
         updateNowPlaying();
         
         // Reconnect if needed and if the user was previously connected
-        if (startBtn.dataset.connected === 'true' && (!directAudio || directAudio.paused || directAudio.ended)) {
+        if (startBtn.dataset.connected === 'true' && (!ws || ws.readyState !== WebSocket.OPEN)) {
             logDebug('Reconnecting after page became visible', 'audio');
             // Add a short delay to allow the browser to stabilize after becoming visible
             setTimeout(() => {
@@ -1175,13 +1017,12 @@ window.addEventListener('beforeunload', () => {
     // Properly clean up resources
     logDebug('Page unloading, cleaning up resources', 'general');
     
-    if (directAudio) {
-        directAudio.pause();
-        directAudio.src = '';
-    }
-    
     if (ws) {
         ws.close();
+    }
+    
+    if (audioContext) {
+        audioContext.close();
     }
 });
 

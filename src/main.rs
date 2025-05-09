@@ -16,11 +16,11 @@ use crate::services::playlist;
 #[launch]
 fn rocket() -> rocket::Rocket<rocket::Build> {
     println!("============================================================");
-    println!("Starting Rust MP3 Web Radio in broadcast mode");
+    println!("Starting Rust MP3 Web Radio (WebSocket Only Mode)");
     println!("Music folder: {}", config::MUSIC_FOLDER.display());
     println!("============================================================");
 
-    // Initialize the stream manager
+    // Initialize the stream manager with improved settings
     let stream_manager = StreamManager::new(
         &config::MUSIC_FOLDER,
         config::CHUNK_SIZE,
@@ -68,8 +68,7 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
             handlers::index,
             handlers::now_playing,
             handlers::get_stats,
-            handlers::stream_ws,      // WebSocket endpoint for real-time streaming
-            handlers::direct_stream,  // HTTP endpoint for direct streaming
+            handlers::stream_ws,  // WebSocket endpoint for real-time streaming
             handlers::static_files,
         ])
         .register("/", catchers![
