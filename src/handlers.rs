@@ -82,17 +82,32 @@ pub fn stream_ws(ws: ws::WebSocket, stream_manager: &State<StreamManager>) -> ws
         // Return an error message and close the connection
         println!("Max concurrent users limit reached");
         return ws.channel(move |mut stream| Box::pin(async move {
-            let _ = stream.send(ws::Message::Text("Server at capacity, try again later".into())).await;
+            let _ = stream.send(ws::Message::Text(serde_json::json!({
+                "error": "Server at capacity, try again later"
+            }).to_string())).await;
             Ok(())
         }));
     }
     
-    // Quick check for tracks availability without holding locks
-    if playlist::get_current_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER).is_none() {
-        // Return an error message and close the connection
-        println!("No tracks available");
+    // Check if there are any tracks available - IMPORTANT check
+    let has_tracks = playlist::get_current_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER).is_some();
+    if !has_tracks {
+        println!("No tracks available for playback");
         return ws.channel(move |mut stream| Box::pin(async move {
-            let _ = stream.send(ws::Message::Text("No tracks available".into())).await;
+            let _ = stream.send(ws::Message::Text(serde_json::json!({
+                "error": "No tracks available for playback"
+            }).to_string())).await;
+            Ok(())
+        }));
+    }
+    
+    // Make sure streaming is active
+    if !stream_manager.is_streaming() {
+        println!("Streaming is not active");
+        return ws.channel(move |mut stream| Box::pin(async move {
+            let _ = stream.send(ws::Message::Text(serde_json::json!({
+                "error": "Streaming is not currently active, try again later"
+            }).to_string())).await;
             Ok(())
         }));
     }
@@ -348,6 +363,11 @@ pub fn stream_ws(ws: ws::WebSocket, stream_manager: &State<StreamManager>) -> ws
         
         Ok(())
     }))
+}
+
+#[get("/diag")]
+pub async fn diagnostic_page() -> Option<NamedFile> {
+    NamedFile::open(Path::new("static/diag.html")).await.ok()
 }
 
 // Helper function to serve static files

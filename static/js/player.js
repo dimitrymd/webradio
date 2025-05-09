@@ -635,6 +635,19 @@ function connectWebSocket() {
         return;
     }
     
+    // Create audio element FIRST before setting up MediaSource open handler
+    const audioElement = document.createElement('audio');
+    audioElement.id = 'audio-stream';
+    audioElement.style.display = 'none';
+    document.body.appendChild(audioElement);
+    
+    // Set volume
+    audioElement.volume = volumeControl.value;
+    
+    // Create object URL from media source
+    const mediaSourceUrl = URL.createObjectURL(mediaSource);
+    audioElement.src = mediaSourceUrl;
+    
     // Set up MediaSource open handler
     mediaSource.addEventListener('sourceopen', function() {
         logDebug(`MediaSource opened, readyState: ${mediaSource.readyState}`, 'audio');
@@ -678,6 +691,13 @@ function connectWebSocket() {
                     clearTimeout(connectionTimeout);
                     connectionTimeout = null;
                 }
+                
+                // Start playback AFTER WebSocket is connected
+                audioElement.play().catch(function(e) {
+                    logDebug(`Error starting playback: ${e.message}`, 'audio', true);
+                    showStatus('Error starting playback. Please try again.', true);
+                    startBtn.disabled = false;
+                });
             };
             
             ws.onclose = function(event) {
@@ -710,19 +730,6 @@ function connectWebSocket() {
         logDebug('MediaSource ended', 'audio');
     });
     
-    // Create audio element and connect it to the media source
-    const audioElement = document.createElement('audio');
-    audioElement.id = 'audio-stream';
-    audioElement.style.display = 'none';
-    document.body.appendChild(audioElement);
-    
-    // Set volume
-    audioElement.volume = volumeControl.value;
-    
-    // Create object URL from media source
-    const mediaSourceUrl = URL.createObjectURL(mediaSource);
-    audioElement.src = mediaSourceUrl;
-    
     // Add event listeners
     audioElement.addEventListener('playing', function() {
         logDebug('Audio playback started', 'audio');
@@ -739,13 +746,6 @@ function connectWebSocket() {
     audioElement.addEventListener('error', function(e) {
         const errorCode = e.target.error ? e.target.error.code : 'unknown';
         logDebug(`Audio error (code ${errorCode})`, 'audio', true);
-    });
-    
-    // Start playback
-    audioElement.play().catch(function(e) {
-        logDebug(`Error starting playback: ${e.message}`, 'audio', true);
-        showStatus('Error starting playback. Please try again.', true);
-        startBtn.disabled = false;
     });
     
     // Set timeout for initial connection
@@ -775,6 +775,11 @@ function handleWebSocketMessage(event) {
         
         // Convert blob to array buffer
         event.data.arrayBuffer().then(buffer => {
+            if (buffer.byteLength === 0) {
+                logDebug('Received empty binary message (possible end of track marker)', 'ws');
+                return;
+            }
+            
             if (sourceBuffer && mediaSource && mediaSource.readyState === 'open') {
                 // Add to queue
                 audioQueue.push(buffer);
@@ -784,7 +789,13 @@ function handleWebSocketMessage(event) {
                     processQueue();
                 }
             } else {
-                logDebug('Cannot process audio data - MediaSource not ready', 'audio');
+                if (!mediaSource) {
+                    logDebug('Cannot process audio data - MediaSource not created', 'audio', true);
+                } else if (mediaSource.readyState !== 'open') {
+                    logDebug(`Cannot process audio data - MediaSource readyState: ${mediaSource.readyState}`, 'audio', true);
+                } else if (!sourceBuffer) {
+                    logDebug('Cannot process audio data - SourceBuffer not created', 'audio', true);
+                }
             }
         }).catch(e => {
             logDebug(`Error processing audio data: ${e.message}`, 'audio', true);
@@ -795,6 +806,13 @@ function handleWebSocketMessage(event) {
             logDebug(`Received text message: ${event.data}`, 'ws');
             const info = JSON.parse(event.data);
             logDebug(`Parsed track info: ${JSON.stringify(info)}`, 'track');
+            
+            // Check if this is an error message
+            if (info.error) {
+                logDebug(`Server error: ${info.error}`, 'ws', true);
+                showStatus(`Server error: ${info.error}`, true);
+                return;
+            }
             
             // Update display
             currentTitle.textContent = info.title || 'Unknown Title';
@@ -808,7 +826,8 @@ function handleWebSocketMessage(event) {
             // Update page title
             document.title = `${info.title} - ${info.artist} | Rust Web Radio`;
         } catch (e) {
-            logDebug(`Error parsing text message: ${event.data}`, 'track', true);
+            // If not valid JSON, just log the text message
+            logDebug(`Received non-JSON text message: ${event.data}`, 'ws');
         }
     }
 }
@@ -820,11 +839,21 @@ function processQueue() {
         const data = audioQueue.shift();
         
         try {
-            sourceBuffer.appendBuffer(data);
-            
-            // Log queue status periodically
-            if (audioQueue.length % 50 === 0 && audioQueue.length > 0) {
-                logDebug(`Queue status: ${audioQueue.length} chunks pending`, 'audio');
+            if (data && data.byteLength > 0) {
+                sourceBuffer.appendBuffer(data);
+                
+                // Log queue status periodically
+                if (audioQueue.length % 50 === 0 && audioQueue.length > 0) {
+                    logDebug(`Queue status: ${audioQueue.length} chunks pending`, 'audio');
+                }
+            } else {
+                logDebug('Skipping empty buffer in queue', 'audio');
+                isProcessingQueue = false;
+                
+                // Continue processing if there are more items
+                if (audioQueue.length > 0) {
+                    processQueue();
+                }
             }
         } catch (e) {
             logDebug(`Error appending buffer: ${e.name} - ${e.message}`, 'audio', true);
@@ -847,14 +876,17 @@ function processQueue() {
                 // Put the data back in the queue
                 audioQueue.unshift(data);
             }
+            
+            isProcessingQueue = false;
         }
-        
+    } else if (isProcessingQueue) {
+        // Already processing, do nothing
+    } else if (!sourceBuffer) {
+        logDebug('No source buffer available for processing queue', 'audio', true);
         isProcessingQueue = false;
-        
-        // Continue processing if there are more items and the buffer is not updating
-        if (audioQueue.length > 0 && !sourceBuffer.updating) {
-            processQueue();
-        }
+    } else if (sourceBuffer.updating) {
+        // SourceBuffer is busy, wait for updateend event
+        logDebug('SourceBuffer is updating, waiting for updateend event', 'audio');
     }
 }
 
@@ -909,51 +941,63 @@ function stopAudio(isError = false) {
         ws = null;
     }
     
-    // Clean up media source
+    // Stop audio playback first
+    const audioElement = document.getElementById('audio-stream');
+    if (audioElement) {
+        audioElement.pause();
+    }
+    
+    // Then clean up media source
     if (mediaSource && mediaSource.readyState === 'open') {
         try {
+            // End of stream should only be called when readyState is 'open'
             mediaSource.endOfStream();
         } catch (e) {
             logDebug(`Error ending media source stream: ${e.message}`, 'audio', true);
         }
     }
     
-    // Clear audio context
-    if (audioContext) {
-        try {
-            audioContext.close();
-        } catch (e) {
-            logDebug(`Error closing audio context: ${e.message}`, 'audio', true);
+    // Allow a brief moment for MediaSource to clean up
+    setTimeout(() => {
+        // Now remove the audio element
+        if (audioElement) {
+            audioElement.src = '';
+            audioElement.load(); // Important to release resources
+            audioElement.remove();
         }
-        audioContext = null;
-    }
-    
-    // Clear queued data
-    audioQueue = [];
-    isProcessingQueue = false;
-    
-    // Remove audio element
-    const audioElement = document.getElementById('audio-stream');
-    if (audioElement) {
-        audioElement.pause();
-        audioElement.src = '';
-        audioElement.load(); // Important to release resources
-        audioElement.remove();
-    }
-    
-    // Clear any pending timeout
-    if (connectionTimeout) {
-        clearTimeout(connectionTimeout);
-        connectionTimeout = null;
-    }
-    
-    if (!isError) {
-        showStatus('Disconnected from audio stream');
-    }
-    
-    startBtn.textContent = 'Connect';
-    startBtn.disabled = false;
-    startBtn.dataset.connected = 'false';
+        
+        // Clear audio context
+        if (audioContext) {
+            try {
+                audioContext.close();
+            } catch (e) {
+                logDebug(`Error closing audio context: ${e.message}`, 'audio', true);
+            }
+            audioContext = null;
+        }
+        
+        // Clear any references
+        mediaSource = null;
+        sourceBuffer = null;
+        
+        // Clear queued data
+        audioQueue = [];
+        isProcessingQueue = false;
+        
+        // Clear any pending timeout
+        if (connectionTimeout) {
+            clearTimeout(connectionTimeout);
+            connectionTimeout = null;
+        }
+        
+        if (!isError) {
+            showStatus('Disconnected from audio stream');
+        }
+        
+        startBtn.textContent = 'Connect';
+        startBtn.disabled = false;
+        startBtn.dataset.connected = 'false';
+    }, 100);
 }
 
 // Toggle connection

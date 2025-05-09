@@ -70,6 +70,7 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
             handlers::get_stats,
             handlers::stream_ws,  // WebSocket endpoint for real-time streaming
             handlers::static_files,
+            handlers::diagnostic_page, // Added diagnostic page
         ])
         .register("/", catchers![
             handlers::not_found,

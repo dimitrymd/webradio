@@ -226,6 +226,53 @@ impl StreamManager {
         (header, chunks)
     }
     
+    // Method to get saved chunks starting from current playback position
+    pub fn get_chunks_from_current_position(&self) -> (Option<Vec<u8>>, Vec<Vec<u8>>) {
+        // Use a short timeout for lock acquisition to avoid blocking
+        let guard = self.inner.lock();
+        
+        // Get ID3 header
+        let header = guard.id3_header.clone();
+        
+        // Calculate how many chunks to skip based on playback position
+        let current_position = self.get_playback_position();
+        let bytes_per_second = if let Some(track) = crate::services::playlist::get_current_track(
+            &crate::config::PLAYLIST_FILE, 
+            &crate::config::MUSIC_FOLDER
+        ) {
+            if track.duration > 0 {
+                // Estimate bytes per second based on file size and duration
+                let file_path = guard.music_folder.join(&track.path);
+                if let Ok(metadata) = std::fs::metadata(&file_path) {
+                    let file_size = metadata.len();
+                    file_size / track.duration
+                } else {
+                    16000 // Default to 16KB/s (128kbps)
+                }
+            } else {
+                16000 // Default to 16KB/s (128kbps)
+            }
+        } else {
+            16000 // Default to 16KB/s (128kbps)
+        };
+        
+        // Estimate bytes to skip based on current position
+        let bytes_to_skip = current_position * bytes_per_second;
+        
+        // Estimate chunks to skip (BROADCAST_CHUNK_SIZE is the chunk size)
+        let chunks_to_skip = bytes_to_skip / BROADCAST_CHUNK_SIZE as u64;
+        
+        // Skip beginning chunks if needed, but don't skip more than we have
+        let saved_chunks = if chunks_to_skip > 0 && chunks_to_skip < guard.saved_chunks.len() as u64 {
+            guard.saved_chunks.iter().skip(chunks_to_skip as usize).cloned().collect()
+        } else {
+            // If we can't estimate well or there are too few chunks, just return all
+            guard.saved_chunks.iter().cloned().collect()
+        };
+        
+        (header, saved_chunks)
+    }
+    
     // Improved buffer_track method that uses atomic flags
     fn buffer_track(
         inner: Arc<Mutex<StreamManagerInner>>, 
