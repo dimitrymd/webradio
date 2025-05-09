@@ -56,6 +56,12 @@ struct StreamManagerInner {
     
     // Reference to broadcast sender
     broadcast_tx: broadcast::Sender<Vec<u8>>,
+    
+    // Track start time for real-time position tracking
+    track_start_time: Instant,
+    
+    // Whether to use real-time position tracking
+    real_time_position: bool,
 }
 
 impl StreamManager {
@@ -84,6 +90,8 @@ impl StreamManager {
             playback_position: 0,
             id3_header: None,
             broadcast_tx: broadcast_tx.clone(),
+            track_start_time: Instant::now(),
+            real_time_position: true, // Use real-time tracking by default
         };
         
         Self {
@@ -130,6 +138,9 @@ impl StreamManager {
         inner.streaming = true;
         inner.track_ended = false;
         inner.last_buffer_update = Instant::now();
+        
+        // Reset the track start time for real-time position tracking
+        inner.track_start_time = Instant::now();
         
         let music_folder = inner.music_folder.clone();
         let track_path = track_path.to_string();
@@ -297,6 +308,9 @@ impl StreamManager {
         let mut total_bytes_read = 0;
         let mut chunks_sent = 0;
         
+        // Track real elapsed time since starting
+        let real_start_time = Instant::now();
+        
         // Track playback position
         let mut last_position_update = Instant::now();
         
@@ -314,17 +328,27 @@ impl StreamManager {
                 break;
             }
             
-            // Update playback position every second based on bytes read
+            // Update playback position based on real elapsed time (every second)
             if last_position_update.elapsed().as_secs() >= 1 {
-                let current_position = if bytes_per_second > 0 {
-                    total_bytes_read / bytes_per_second
-                } else {
-                    0
-                };
+                // Get the current playback position based on real elapsed time
+                let elapsed_secs = real_start_time.elapsed().as_secs();
                 
                 {
                     let mut inner_lock = inner.lock();
-                    inner_lock.playback_position = current_position;
+                    
+                    // For internal tracking, always update the byte-based position
+                    let byte_based_position = if bytes_per_second > 0 {
+                        total_bytes_read / bytes_per_second
+                    } else {
+                        0
+                    };
+                    inner_lock.playback_position = byte_based_position;
+                    
+                    // Don't allow real-time position to exceed track duration
+                    if inner_lock.real_time_position && expected_duration > 0 && elapsed_secs > expected_duration {
+                        // If we've reached the end of the track duration, don't report position beyond track length
+                        // This is handled in get_playback_position
+                    }
                 }
                 
                 last_position_update = Instant::now();
@@ -334,7 +358,18 @@ impl StreamManager {
             if last_progress_log.elapsed().as_secs() >= 5 {
                 let current_position = {
                     let inner_lock = inner.lock();
-                    inner_lock.playback_position
+                    // Report real or file-based position depending on setting
+                    if inner_lock.real_time_position {
+                        let elapsed = real_start_time.elapsed().as_secs();
+                        // Cap at track duration if needed
+                        if expected_duration > 0 && elapsed > expected_duration {
+                            expected_duration
+                        } else {
+                            elapsed
+                        }
+                    } else {
+                        inner_lock.playback_position
+                    }
                 };
                 
                 println!("BUFFER STATUS: Broadcasting \"{}\" - {} bytes read ({:.2}% of file) over {} seconds, position={}s", 
@@ -399,10 +434,12 @@ impl StreamManager {
                             
                             while *wait_active_for_thread.lock() {
                                 if last_update.elapsed().as_secs() >= 30 {
-                                    // Get current position from inner
-                                    let current_pos = {
-                                        let inner = inner_for_updates.lock();
-                                        inner.playback_position
+                                    // Report current real-time position
+                                    let elapsed_secs = real_start_time.elapsed().as_secs();
+                                    let current_pos = if expected_duration_copy > 0 && elapsed_secs > expected_duration_copy {
+                                        expected_duration_copy
+                                    } else {
+                                        elapsed_secs
                                     };
                                     
                                     println!("Still waiting for \"{}\" to complete... Position: {}s of {}s", 
@@ -600,9 +637,41 @@ impl StreamManager {
         inner.current_track_path.clone()
     }
     
+    // Modified get_playback_position method
     pub fn get_playback_position(&self) -> u64 {
         let inner = self.inner.lock();
-        inner.playback_position
+        
+        if inner.real_time_position {
+            // Calculate position based on real elapsed time since track started
+            let elapsed = inner.track_start_time.elapsed().as_secs();
+            
+            // Don't exceed track duration
+            if let Some(track) = crate::services::playlist::get_current_track(
+                &crate::config::PLAYLIST_FILE, 
+                &crate::config::MUSIC_FOLDER
+            ) {
+                if track.duration > 0 && elapsed > track.duration {
+                    return track.duration;
+                }
+            }
+            
+            return elapsed;
+        } else {
+            // Return the original position based on data read
+            inner.playback_position
+        }
+    }
+    
+    // Toggle between real-time and file-based position tracking
+    pub fn set_real_time_position(&self, enabled: bool) {
+        let mut inner = self.inner.lock();
+        inner.real_time_position = enabled;
+        info!("Real-time position tracking {}", if enabled { "enabled" } else { "disabled" });
+    }
+    
+    pub fn is_real_time_position(&self) -> bool {
+        let inner = self.inner.lock();
+        inner.real_time_position
     }
     
     pub fn buffer_status(&self) -> (usize, usize) {
