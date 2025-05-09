@@ -575,17 +575,28 @@ async function updateStats() {
 
 // Start audio streaming
 function startAudio() {
-    logDebug('Starting audio playback', 'audio');
+    logDebug('Starting audio playback - user initiated', 'audio');
     startBtn.disabled = true;
     
     // Reset reconnect attempts
     reconnectAttempts = 0;
     
-    // Add this debug logging
+    // Clean up any existing audio elements
+    if (directAudio) {
+        logDebug('Cleaning up existing audio element', 'audio');
+        directAudio.pause();
+        directAudio.src = '';
+        directAudio.load();
+        if (directAudio.parentNode) {
+            directAudio.parentNode.removeChild(directAudio);
+        }
+        directAudio = null;
+    }
+    
+    // Determine best streaming method based on browser capabilities
     const mediaSourceSupported = 'MediaSource' in window && MediaSource.isTypeSupported('audio/mpeg');
     logDebug(`Streaming method: ${mediaSourceSupported ? 'MediaSource API' : 'Direct HTTP streaming'}`, 'audio');
     
-    // Determine best streaming method based on browser capabilities
     if (mediaSourceSupported) {
         logDebug('Using MediaSource API for streaming', 'audio');
         startMSEStreaming();
@@ -605,31 +616,29 @@ function startAudio() {
 function startMSEStreaming() {
     logDebug('Starting MSE streaming setup', 'audio');
     
-    // Create audio element if needed
-    if (!directAudio) {
-        logDebug('Creating new audio element for MSE', 'audio');
-        directAudio = document.createElement('audio');
-        directAudio.autoplay = true;
-        directAudio.controls = false;
-        directAudio.style.display = 'none';
-        document.body.appendChild(directAudio);
-        
-        // Set initial volume
-        directAudio.volume = volumeControl.value;
-        
-        // Add event listeners for debugging
-        directAudio.addEventListener('playing', () => {
-            logDebug('Audio element started playing', 'audio');
-        });
-        
-        directAudio.addEventListener('waiting', () => {
-            logDebug('Audio buffering - waiting for more data', 'audio');
-        });
-        
-        directAudio.addEventListener('stalled', () => {
-            logDebug('Audio playback stalled', 'audio', true);
-        });
-    }
+    // Create a new audio element
+    logDebug('Creating new audio element for MSE', 'audio');
+    directAudio = document.createElement('audio');
+    directAudio.autoplay = true;  // Safe now since user has interacted
+    directAudio.controls = false;
+    directAudio.style.display = 'none';
+    document.body.appendChild(directAudio);
+    
+    // Set initial volume
+    directAudio.volume = volumeControl.value;
+    
+    // Add event listeners for debugging
+    directAudio.addEventListener('playing', () => {
+        logDebug('Audio element started playing', 'audio');
+    });
+    
+    directAudio.addEventListener('waiting', () => {
+        logDebug('Audio buffering - waiting for more data', 'audio');
+    });
+    
+    directAudio.addEventListener('stalled', () => {
+        logDebug('Audio playback stalled', 'audio', true);
+    });
     
     // Create Media Source
     logDebug('Creating MediaSource object', 'audio');
@@ -834,67 +843,65 @@ function connectWebSocket() {
 function startDirectStreaming() {
     logDebug('Starting direct HTTP streaming', 'audio');
     
-    // Create an audio element if it doesn't exist
-    if (!directAudio) {
-        logDebug('Creating new audio element for direct streaming', 'audio');
-        directAudio = document.createElement('audio');
-        directAudio.autoplay = true;
-        directAudio.controls = false;
-        directAudio.style.display = 'none';
-        document.body.appendChild(directAudio);
+    // Create a new audio element
+    logDebug('Creating new audio element for direct streaming', 'audio');
+    directAudio = document.createElement('audio');
+    directAudio.autoplay = true;  // Safe now since user has interacted
+    directAudio.controls = false;
+    directAudio.style.display = 'none';
+    document.body.appendChild(directAudio);
+    
+    // Handle events
+    directAudio.addEventListener('playing', () => {
+        logDebug('Direct streaming started successfully', 'audio');
+        showStatus('Connected to audio stream');
+        startBtn.textContent = 'Disconnect';
+        startBtn.disabled = false;
+        startBtn.dataset.connected = 'true';
+        isPlaying = true;
         
-        // Handle events
-        directAudio.addEventListener('playing', () => {
-            logDebug('Direct streaming started successfully', 'audio');
-            showStatus('Connected to audio stream');
-            startBtn.textContent = 'Disconnect';
-            startBtn.disabled = false;
-            startBtn.dataset.connected = 'true';
-            isPlaying = true;
-            
-            // Clear timeout if any
-            if (connectionTimeout) {
-                clearTimeout(connectionTimeout);
-                connectionTimeout = null;
-            }
-            
-            // Reset the audioLastUpdateTime
-            audioLastUpdateTime = Date.now();
-        });
+        // Clear timeout if any
+        if (connectionTimeout) {
+            clearTimeout(connectionTimeout);
+            connectionTimeout = null;
+        }
         
-        directAudio.addEventListener('error', (e) => {
-            const errorCode = e.target.error ? e.target.error.code : 'unknown';
-            const errorMessage = getAudioErrorMessage(errorCode);
-            logDebug(`Audio streaming error (code ${errorCode}): ${errorMessage}`, 'audio', true);
-            handleStreamError(`Error connecting to audio stream: ${errorMessage}`);
-        });
-        
-        directAudio.addEventListener('ended', () => {
-            logDebug('Stream ended', 'audio', true);
-            handleStreamEnd();
-        });
-        
-        // Add stalled and waiting events
-        directAudio.addEventListener('stalled', () => {
-            logDebug('Audio playback stalled', 'audio', true);
-        });
-        
-        directAudio.addEventListener('waiting', () => {
-            logDebug('Audio playback waiting for more data', 'audio');
-        });
-        
-        // Add canplay event
-        directAudio.addEventListener('canplay', () => {
-            logDebug('Audio can play - enough data is available', 'audio');
-        });
-        
-        // Add timeupdate event to monitor playback
-        directAudio.addEventListener('timeupdate', () => {
-            if (directAudio.currentTime % 10 < 0.1) { // Log every ~10 seconds
-                logDebug(`Audio playback time: ${Math.floor(directAudio.currentTime)}s`, 'audio');
-            }
-        });
-    }
+        // Reset the audioLastUpdateTime
+        audioLastUpdateTime = Date.now();
+    });
+    
+    directAudio.addEventListener('error', (e) => {
+        const errorCode = e.target.error ? e.target.error.code : 'unknown';
+        const errorMessage = getAudioErrorMessage(errorCode);
+        logDebug(`Audio streaming error (code ${errorCode}): ${errorMessage}`, 'audio', true);
+        handleStreamError(`Error connecting to audio stream: ${errorMessage}`);
+    });
+    
+    directAudio.addEventListener('ended', () => {
+        logDebug('Stream ended', 'audio', true);
+        handleStreamEnd();
+    });
+    
+    // Add stalled and waiting events
+    directAudio.addEventListener('stalled', () => {
+        logDebug('Audio playback stalled', 'audio', true);
+    });
+    
+    directAudio.addEventListener('waiting', () => {
+        logDebug('Audio playback waiting for more data', 'audio');
+    });
+    
+    // Add canplay event
+    directAudio.addEventListener('canplay', () => {
+        logDebug('Audio can play - enough data is available', 'audio');
+    });
+    
+    // Add timeupdate event to monitor playback
+    directAudio.addEventListener('timeupdate', () => {
+        if (directAudio.currentTime % 10 < 0.1) { // Log every ~10 seconds
+            logDebug(`Audio playback time: ${Math.floor(directAudio.currentTime)}s`, 'audio');
+        }
+    });
     
     // Add a unique timestamp parameter to prevent caching
     const timestamp = new Date().getTime();
@@ -1004,6 +1011,7 @@ function handleStreamError(message) {
         
         // Reset UI
         startBtn.textContent = 'Connect';
+        startBtn.disabled = false;
         startBtn.dataset.connected = 'false';
     }
 }
@@ -1058,6 +1066,12 @@ function stopAudio(isError = false) {
         directAudio.pause();
         directAudio.src = '';
         directAudio.load(); // Important: forces the element to reset
+        
+        // Remove from DOM
+        if (directAudio.parentNode) {
+            directAudio.parentNode.removeChild(directAudio);
+        }
+        directAudio = null;
     }
     
     // Clear any pending timeout
@@ -1083,8 +1097,8 @@ function toggleConnection() {
         logDebug('User requested disconnect', 'general');
         stopAudio();
     } else {
-        logDebug('User requested connect', 'general');
-        startAudio();
+        logDebug('User requested connect - starting audio now', 'general');
+        startAudio();  // This creates and starts the audio only after button click
     }
 }
 
@@ -1181,22 +1195,22 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Run browser checks
     checkBrowserSupport();
     
-    // Set initial button state
+    // Set initial button state - IMPORTANT: start in 'Connect' state
     startBtn.textContent = 'Connect';
     startBtn.dataset.connected = 'false';
     
-    // Set initial volume
+    // Set initial volume (but don't create audio elements yet)
     const savedVolume = localStorage.getItem('radioVolume');
     if (savedVolume !== null) {
         volumeControl.value = savedVolume;
         logDebug(`Restored saved volume: ${savedVolume}`, 'audio');
     }
     
-    // Update now playing
+    // Update now playing display but don't start audio
     await updateNowPlaying();
     
     // Regular stats update
     setInterval(updateStats, 10000);
     
-    logDebug('Initialization complete', 'general');
+    logDebug('Initialization complete - waiting for user to click Connect', 'general');
 });
