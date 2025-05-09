@@ -1,6 +1,3 @@
-I'll create a comprehensive README file with deployment instructions for setting up our Rust Web Radio with NGINX as a reverse proxy.
-
-```markdown
 # Rust Web Radio
 
 A high-performance, multi-user web radio server built with Rust and the Rocket framework. This application allows you to stream your MP3 collection as an internet radio station that can handle tens of thousands of simultaneous listeners.
@@ -345,6 +342,3 @@ MIT License
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
-```
-
-This README provides comprehensive instructions for deploying your Rust Web Radio application behind NGINX for production use. It includes detailed steps for system optimization, security configuration, and troubleshooting to ensure your streaming server can handle large numbers of concurrent listeners efficiently.
