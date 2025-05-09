@@ -27,14 +27,30 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         config::BUFFER_SIZE,
         config::STREAM_CACHE_TIME,
     );
+    
+    // Rescan and update durations before starting
+    println!("Checking and updating track durations...");
+    playlist::rescan_and_update_durations(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER);
 
     // Start the first track immediately
-    println!("Starting initial playback...");
+    println!("Starting initial playback in broadcast mode...");
     if let Some(track) = playlist::get_current_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER) {
-        println!("Starting initial track: {}", track.title);
+        println!("Starting initial track: {} (duration: {}s)", track.title, track.duration);
         stream_manager.start_streaming(&track.path);
     } else {
         println!("WARNING: No tracks available for initial playback");
+        
+        // Try to scan music folder for new tracks
+        println!("Scanning music folder for new tracks...");
+        playlist::scan_music_folder(&config::MUSIC_FOLDER, &config::PLAYLIST_FILE);
+        
+        // Try again after scanning
+        if let Some(track) = playlist::get_current_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER) {
+            println!("Found track after scanning: {} (duration: {}s)", track.title, track.duration);
+            stream_manager.start_streaming(&track.path);
+        } else {
+            println!("ERROR: Still no tracks available after scanning. Please add MP3 files to the music folder.");
+        }
     }
 
     // Start track switcher in a background thread
@@ -53,7 +69,7 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
             handlers::now_playing,
             handlers::get_stats,
             handlers::stream_ws,      // WebSocket endpoint for real-time streaming
-            handlers::direct_stream,  // Direct streaming endpoint
+            handlers::direct_stream,  // HTTP endpoint for direct streaming
             handlers::static_files,
         ])
         .register("/", catchers![

@@ -5,6 +5,30 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{ title }}</title>
     <link rel="stylesheet" href="/static/css/style.css">
+    <style>
+        .progress-container {
+            height: 8px;
+            background-color: #f0f0f0;
+            border-radius: 4px;
+            margin: 10px 0;
+            overflow: hidden;
+        }
+        
+        .progress-bar {
+            height: 100%;
+            background-color: #4a90e2;
+            width: 0%;
+            transition: width 1s linear;
+        }
+        
+        .time-display {
+            display: flex;
+            justify-content: space-between;
+            font-size: 14px;
+            color: #666;
+            margin-top: 5px;
+        }
+    </style>
 </head>
 <body>
     <div class="player">
@@ -14,7 +38,16 @@
             <div class="track-title" id="current-title">-</div>
             <div class="track-artist" id="current-artist">-</div>
             <div class="track-album" id="current-album">-</div>
-            <div class="duration" id="current-duration">-</div>
+            
+            <div class="progress-container">
+                <div class="progress-bar" id="progress-bar"></div>
+            </div>
+            
+            <div class="time-display">
+                <div id="current-position">0:00</div>
+                <div id="current-duration">-</div>
+            </div>
+            
             <div class="listeners" id="listener-count">Listeners: 0</div>
         </div>
         

@@ -21,6 +21,39 @@ A high-performance, multi-user web radio server built with Rust and the Rocket f
 - Linux server (recommended for production deployment)
 - NGINX (for reverse proxy)
 
+## Architecture
+```
+┌─────────────────┐
+│                 │
+│  Music Files    │
+│                 │
+└────────┬────────┘
+         │
+         │ Reads
+         ▼
+┌─────────────────┐          ┌─────────────────┐
+│                 │  Writes  │                 │
+│  Track Player   │────────▶│  Stream Buffer  │
+│   (Single)      │          │  (Shared)      │
+└─────────────────┘          └────────┬────────┘
+                                      │
+                                      │ Reads
+                                      ▼
+          ┌───────────────────────────────────────────┐
+          │                                           │
+          │             Stream Proxy                  │
+          │                                           │
+          └─┬─────────────────┬────────────────────┬──┘
+            │                 │                    │
+            │Serves           │Serves              │Serves
+            ▼                 ▼                    ▼
+  ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+  │                 │ │                 │ │                 │
+  │   Listener 1    │ │   Listener 2    │ │   Listener N    │
+  │                 │ │                 │ │                 │
+  └─────────────────┘ └─────────────────┘ └─────────────────┘
+```
+
 ## Quick Start
 
 1. **Clone the repository**:
