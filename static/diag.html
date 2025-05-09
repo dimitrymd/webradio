@@ -1,0 +1,854 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rust Web Radio Debug Test (Port 8000)</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        
+        .player {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        
+        .controls {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin: 20px 0;
+        }
+        
+        button {
+            background: #4a90e2;
+            border: none;
+            color: white;
+            padding: 10px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        
+        button:hover {
+            background: #3a80d2;
+        }
+        
+        .status-message {
+            background: #f8f8f8;
+            border-left: 4px solid #4a90e2;
+            padding: 10px;
+            margin: 10px 0;
+            color: #333;
+        }
+        
+        .debug-panel {
+            margin-top: 20px;
+            padding: 15px;
+            background: #2b2b2b;
+            color: #a5d6ff;
+            font-family: monospace;
+            border-radius: 5px;
+            height: 300px;
+            overflow-y: auto;
+        }
+        
+        .debug-panel pre {
+            margin: 0;
+            white-space: pre-wrap;
+        }
+        
+        .debug-panel .log-entry {
+            margin-bottom: 5px;
+            border-bottom: 1px solid #444;
+            padding-bottom: 5px;
+        }
+        
+        .test-section {
+            margin-top: 20px;
+            padding: 15px;
+            background: #f0f0f0;
+            border-radius: 5px;
+        }
+        
+        .tab-container {
+            display: flex;
+            margin-top: 20px;
+        }
+        
+        .tab {
+            padding: 10px 15px;
+            background: #ddd;
+            cursor: pointer;
+            border-radius: 5px 5px 0 0;
+            margin-right: 2px;
+        }
+        
+        .tab.active {
+            background: #2b2b2b;
+            color: white;
+        }
+        
+        .test-buttons {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 10px;
+        }
+        
+        .test-button {
+            background: #4a90e2;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            padding: 5px 10px;
+            cursor: pointer;
+        }
+        
+        .test-button:hover {
+            background: #3a80d2;
+        }
+        
+        .success {
+            color: #2ecc71;
+        }
+        
+        .error {
+            color: #e74c3c;
+        }
+    </style>
+</head>
+<body>
+    <div class="player">
+        <h1>Rust Web Radio Debug Test (Port 8000)</h1>
+        
+        <div class="status-message" id="status-message">
+            This page helps diagnose streaming issues with your web radio application.
+        </div>
+        
+        <div class="tab-container">
+            <div class="tab active" data-tab="connectivity">Connectivity</div>
+            <div class="tab" data-tab="audio">Audio</div>
+            <div class="tab" data-tab="websocket">WebSocket</div>
+            <div class="tab" data-tab="stream">Stream</div>
+        </div>
+        
+        <div class="test-section" id="connectivity-panel">
+            <h2>Server Connectivity Tests</h2>
+            <div class="test-buttons">
+                <button class="test-button" id="ping-server">Ping Server</button>
+                <button class="test-button" id="check-now-playing">Check Now Playing</button>
+                <button class="test-button" id="check-headers">Check Response Headers</button>
+            </div>
+            <div class="test-results" id="connectivity-results"></div>
+        </div>
+        
+        <div class="test-section" id="audio-panel" style="display:none">
+            <h2>Audio Capability Tests</h2>
+            <div class="test-buttons">
+                <button class="test-button" id="check-audio-capabilities">Check Audio Support</button>
+                <button class="test-button" id="test-audio-playback">Test Audio Playback</button>
+                <button class="test-button" id="test-mse-support">Test MSE Support</button>
+            </div>
+            <div class="test-results" id="audio-results"></div>
+        </div>
+        
+        <div class="test-section" id="websocket-panel" style="display:none">
+            <h2>WebSocket Tests</h2>
+            <div class="test-buttons">
+                <button class="test-button" id="test-ws-connection">Test WebSocket Connection</button>
+                <button class="test-button" id="test-ws-messaging">Test WebSocket Messaging</button>
+                <button class="test-button" id="close-ws-connection">Close Connection</button>
+            </div>
+            <div class="test-results" id="websocket-results"></div>
+        </div>
+        
+        <div class="test-section" id="stream-panel" style="display:none">
+            <h2>Stream Tests</h2>
+            <div class="test-buttons">
+                <button class="test-button" id="test-direct-stream">Test Direct Stream</button>
+                <button class="test-button" id="test-ws-stream">Test WebSocket Stream</button>
+                <button class="test-button" id="stop-streaming">Stop Streaming</button>
+            </div>
+            <div class="test-results" id="stream-results"></div>
+            <div class="controls">
+                <label>Volume:
+                    <input type="range" id="volume" min="0" max="1" step="0.1" value="0.5">
+                </label>
+                <button id="mute-btn">Mute</button>
+            </div>
+            <div id="now-playing">
+                <h3>Now Playing:</h3>
+                <div id="track-info">Not connected</div>
+            </div>
+        </div>
+        
+        <div class="debug-panel">
+            <h2>Debug Log</h2>
+            <div id="debug-log"></div>
+        </div>
+    </div>
+
+    <script>
+        // Debug utility functions
+        function log(message, isError = false) {
+            const debugLog = document.getElementById('debug-log');
+            const timestamp = new Date().toISOString().substr(11, 12);
+            
+            const logEntry = document.createElement('div');
+            logEntry.className = 'log-entry' + (isError ? ' error' : '');
+            logEntry.innerHTML = `<span>[${timestamp}]</span> ${message}`;
+            
+            debugLog.insertBefore(logEntry, debugLog.firstChild);
+            console.log(`[${timestamp}] ${message}`);
+        }
+        
+        function logResult(panelId, message, isSuccess = true) {
+            const resultsPanel = document.getElementById(panelId);
+            const resultItem = document.createElement('div');
+            resultItem.className = isSuccess ? 'success' : 'error';
+            resultItem.innerHTML = message;
+            resultsPanel.appendChild(resultItem);
+        }
+        
+        // Tab switching
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                // Hide all panels
+                document.querySelectorAll('.test-section').forEach(panel => {
+                    panel.style.display = 'none';
+                });
+                
+                // Remove active class from all tabs
+                document.querySelectorAll('.tab').forEach(t => {
+                    t.classList.remove('active');
+                });
+                
+                // Show the selected panel and mark tab as active
+                const tabName = tab.dataset.tab;
+                document.getElementById(`${tabName}-panel`).style.display = 'block';
+                tab.classList.add('active');
+            });
+        });
+        
+        // Audio element and WebSocket references
+        let audioElement = null;
+        let webSocket = null;
+        
+        // Connectivity Tests
+        document.getElementById('ping-server').addEventListener('click', async () => {
+            log('Pinging server at http://localhost:8000...');
+            try {
+                const startTime = performance.now();
+                const response = await fetch('http://127.0.0.1:8000/');
+                const endTime = performance.now();
+                const latency = Math.round(endTime - startTime);
+                
+                if (response.ok) {
+                    log(`Server ping successful - Response time: ${latency}ms`);
+                    logResult('connectivity-results', `✓ Server is responding (${latency}ms)`, true);
+                } else {
+                    log(`Server returned error status: ${response.status}`, true);
+                    logResult('connectivity-results', `✗ Server error: ${response.status}`, false);
+                }
+            } catch (error) {
+                log(`Server ping failed: ${error.message}`, true);
+                logResult('connectivity-results', `✗ Server unreachable: ${error.message}`, false);
+            }
+        });
+        
+        document.getElementById('check-now-playing').addEventListener('click', async () => {
+            log('Checking now playing API at http://localhost:8000/api/now-playing...');
+            try {
+                const response = await fetch('http://localhost:8000/api/now-playing');
+                if (response.ok) {
+                    const data = await response.json();
+                    log(`Now playing API response: ${JSON.stringify(data)}`);
+                    
+                    if (data.error) {
+                        logResult('connectivity-results', `⚠️ Now playing API returned error: ${data.error}`, false);
+                    } else {
+                        logResult('connectivity-results', `✓ Now playing: "${data.title}" by "${data.artist}"`, true);
+                    }
+                } else {
+                    log(`Now playing API returned error status: ${response.status}`, true);
+                    logResult('connectivity-results', `✗ Now playing API error: ${response.status}`, false);
+                }
+            } catch (error) {
+                log(`Now playing API request failed: ${error.message}`, true);
+                logResult('connectivity-results', `✗ Now playing API unreachable: ${error.message}`, false);
+            }
+        });
+        
+        document.getElementById('check-headers').addEventListener('click', async () => {
+            log('Checking response headers from http://localhost:8000/direct-stream...');
+            try {
+                const response = await fetch('http://localhost:8000/direct-stream');
+                
+                log(`Response status: ${response.status}`);
+                
+                // Check content type
+                const contentType = response.headers.get('content-type');
+                if (contentType && contentType.includes('audio/')) {
+                    log(`Content-Type: ${contentType} (correct for audio)`);
+                    logResult('connectivity-results', `✓ Content-Type: ${contentType}`, true);
+                } else {
+                    log(`Content-Type: ${contentType} (may not be correct for audio)`, true);
+                    logResult('connectivity-results', `⚠️ Content-Type may be incorrect: ${contentType}`, false);
+                }
+                
+                // Check other headers
+                log('Response headers:');
+                for (const [key, value] of response.headers.entries()) {
+                    log(`- ${key}: ${value}`);
+                }
+                
+            } catch (error) {
+                log(`Header check failed: ${error.message}`, true);
+                logResult('connectivity-results', `✗ Header check failed: ${error.message}`, false);
+            }
+        });
+        
+        // Audio Tests
+        document.getElementById('check-audio-capabilities').addEventListener('click', () => {
+            log('Checking audio capabilities...');
+            
+            // Check MediaSource
+            if ('MediaSource' in window) {
+                log('MediaSource API is available');
+                logResult('audio-results', '✓ MediaSource API is available', true);
+                
+                // Check various audio formats
+                const formats = ['audio/mpeg', 'audio/aac', 'audio/ogg', 'audio/webm'];
+                formats.forEach(format => {
+                    const supported = MediaSource.isTypeSupported(format);
+                    log(`Format ${format}: ${supported ? 'Supported' : 'Not supported'}`);
+                    logResult('audio-results', `${supported ? '✓' : '✗'} ${format}`, supported);
+                });
+            } else {
+                log('MediaSource API is NOT available', true);
+                logResult('audio-results', '✗ MediaSource API not available', false);
+            }
+            
+            // Check AudioContext
+            if ('AudioContext' in window || 'webkitAudioContext' in window) {
+                log('AudioContext API is available');
+                logResult('audio-results', '✓ AudioContext API is available', true);
+            } else {
+                log('AudioContext API is NOT available', true);
+                logResult('audio-results', '✗ AudioContext API not available', false);
+            }
+        });
+        
+        document.getElementById('test-audio-playback').addEventListener('click', async () => {
+            log('Testing basic audio playback...');
+            
+            // Clean up previous audio if any
+            if (audioElement) {
+                audioElement.pause();
+                audioElement.remove();
+            }
+            
+            // Create test audio with short beep sound (data URI)
+            audioElement = new Audio();
+            
+            // Base64 encoded short beep sound
+            audioElement.src = 'data:audio/mp3;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4Ljc2LjEwMAAAAAAAAAAAAAAA//tQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAACAAADwADMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM//////////////////////////////////////////////////////////////////8AAAAATGF2YzU4LjEzAAAAAAAAAAAAAAAAJAMAAAAAAAAAA8CsOBzUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=';
+            
+            // Set up event listeners
+            audioElement.addEventListener('playing', () => {
+                log('Basic audio playback successful');
+                logResult('audio-results', '✓ Basic audio playback successful', true);
+            });
+            
+            audioElement.addEventListener('error', (e) => {
+                const errorCode = e.target.error ? e.target.error.code : 'unknown';
+                log(`Audio playback error (code ${errorCode})`, true);
+                logResult('audio-results', `✗ Audio playback failed (error code ${errorCode})`, false);
+            });
+            
+            // Try to play
+            try {
+                audioElement.volume = 0.2; // Low volume
+                document.body.appendChild(audioElement);
+                await audioElement.play();
+            } catch (error) {
+                log(`Audio playback failed: ${error.message}`, true);
+                logResult('audio-results', `✗ Audio playback failed: ${error.message}`, false);
+                
+                // Check for autoplay policy
+                if (error.name === 'NotAllowedError') {
+                    logResult('audio-results', '⚠️ Autoplay blocked by browser - user interaction required', false);
+                }
+            }
+        });
+        
+        document.getElementById('test-mse-support').addEventListener('click', () => {
+            log('Testing MediaSource Extensions (MSE) support...');
+            
+            if (!('MediaSource' in window)) {
+                log('MediaSource API not supported by this browser', true);
+                logResult('audio-results', '✗ MediaSource not supported', false);
+                return;
+            }
+            
+            try {
+                // Create media source
+                const mediaSource = new MediaSource();
+                log(`MediaSource created, readyState: ${mediaSource.readyState}`);
+                
+                // Create test video element
+                const audio = document.createElement('audio');
+                audio.style.display = 'none';
+                document.body.appendChild(audio);
+                
+                // Connect media source to audio
+                audio.src = URL.createObjectURL(mediaSource);
+                log('MediaSource connected to audio element');
+                
+                // Set up source open handler
+                mediaSource.addEventListener('sourceopen', () => {
+                    log(`MediaSource opened, readyState: ${mediaSource.readyState}`);
+                    
+                    try {
+                        // Try to add audio buffer
+                        const sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
+                        log('SourceBuffer for audio/mpeg created successfully');
+                        logResult('audio-results', '✓ MSE fully supported with audio/mpeg', true);
+                        
+                        // Clean up
+                        setTimeout(() => {
+                            URL.revokeObjectURL(audio.src);
+                            audio.remove();
+                        }, 1000);
+                    } catch (error) {
+                        log(`Error creating SourceBuffer: ${error.message}`, true);
+                        logResult('audio-results', `✗ Error creating SourceBuffer: ${error.message}`, false);
+                    }
+                });
+                
+                mediaSource.addEventListener('error', (e) => {
+                    log(`MediaSource error: ${e.message || 'Unknown error'}`, true);
+                    logResult('audio-results', '✗ MediaSource error occurred', false);
+                });
+            } catch (error) {
+                log(`MSE test failed: ${error.message}`, true);
+                logResult('audio-results', `✗ MSE test failed: ${error.message}`, false);
+            }
+        });
+        
+        // WebSocket Tests
+        document.getElementById('test-ws-connection').addEventListener('click', () => {
+            log('Testing WebSocket connection...');
+            
+            // Close existing connection if any
+            if (webSocket) {
+                webSocket.close();
+                webSocket = null;
+            }
+            
+            try {
+                // Determine WebSocket URL
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = `${protocol}//localhost:8000/stream`;
+                log(`Connecting to WebSocket: ${wsUrl}`);
+                
+                webSocket = new WebSocket(wsUrl);
+                
+                webSocket.onopen = (event) => {
+                    log('WebSocket connection established successfully');
+                    logResult('websocket-results', '✓ WebSocket connected', true);
+                };
+                
+                webSocket.onclose = (event) => {
+                    log(`WebSocket connection closed: Code ${event.code}`);
+                    if (event.code !== 1000) { // 1000 is normal closure
+                        logResult('websocket-results', `⚠️ WebSocket closed: Code ${event.code}`, false);
+                    }
+                };
+                
+                webSocket.onerror = (error) => {
+                    log('WebSocket connection error', true);
+                    logResult('websocket-results', '✗ WebSocket connection error', false);
+                };
+                
+                webSocket.onmessage = (event) => {
+                    if (event.data instanceof Blob) {
+                        log(`Received binary data from WebSocket: ${event.data.size} bytes`);
+                    } else {
+                        try {
+                            const data = JSON.parse(event.data);
+                            log(`Received JSON from WebSocket: ${JSON.stringify(data)}`);
+                            
+                            // Update track info
+                            if (data.title) {
+                                document.getElementById('track-info').innerHTML = `
+                                    <div><strong>Title:</strong> ${data.title || 'Unknown'}</div>
+                                    <div><strong>Artist:</strong> ${data.artist || 'Unknown'}</div>
+                                    <div><strong>Album:</strong> ${data.album || 'Unknown'}</div>
+                                    <div><strong>Duration:</strong> ${data.duration || 0} seconds</div>
+                                `;
+                            }
+                        } catch (e) {
+                            log(`Received text from WebSocket: ${event.data}`);
+                        }
+                    }
+                };
+            } catch (error) {
+                log(`WebSocket connection creation failed: ${error.message}`, true);
+                logResult('websocket-results', `✗ WebSocket creation failed: ${error.message}`, false);
+            }
+        });
+        
+        document.getElementById('test-ws-messaging').addEventListener('click', () => {
+            log('Testing WebSocket messaging...');
+            
+            if (!webSocket || webSocket.readyState !== WebSocket.OPEN) {
+                log('No open WebSocket connection available', true);
+                logResult('websocket-results', '✗ No open WebSocket connection', false);
+                return;
+            }
+            
+            // For a real application, you might want to send a specific message
+            // that your server understands. Since this is just a test, we're just
+            // checking if messages arrive.
+            log('Monitoring incoming WebSocket messages for 5 seconds...');
+            logResult('websocket-results', 'Monitoring messages for 5 seconds...', true);
+            
+            let messageCount = 0;
+            const originalOnMessage = webSocket.onmessage;
+            
+            webSocket.onmessage = (event) => {
+                messageCount++;
+                
+                // Call the original handler
+                if (originalOnMessage) {
+                    originalOnMessage(event);
+                }
+            };
+            
+            // After 5 seconds, check if we received any messages
+            setTimeout(() => {
+                log(`Received ${messageCount} WebSocket messages in 5 seconds`);
+                
+                if (messageCount > 0) {
+                    logResult('websocket-results', `✓ Received ${messageCount} messages in 5 seconds`, true);
+                } else {
+                    logResult('websocket-results', '⚠️ No messages received in 5 seconds', false);
+                }
+                
+                // Restore original handler
+                webSocket.onmessage = originalOnMessage;
+            }, 5000);
+        });
+        
+        document.getElementById('close-ws-connection').addEventListener('click', () => {
+            if (webSocket) {
+                log('Closing WebSocket connection...');
+                webSocket.close(1000, 'User requested close');
+                webSocket = null;
+                logResult('websocket-results', '✓ WebSocket connection closed', true);
+            } else {
+                log('No WebSocket connection to close');
+                logResult('websocket-results', '⚠️ No WebSocket connection to close', false);
+            }
+        });
+        
+        // Stream Tests
+        let streamAudio = null;
+        
+        document.getElementById('test-direct-stream').addEventListener('click', async () => {
+            log('Testing direct HTTP streaming from http://localhost:8000/direct-stream...');
+            
+            // Clean up any existing audio
+            if (streamAudio) {
+                streamAudio.pause();
+                streamAudio.src = '';
+                streamAudio.removeAttribute('src');
+                streamAudio.load();
+            }
+            
+            try {
+                // Create a fresh audio element
+                streamAudio = new Audio();
+                streamAudio.controls = false;
+                streamAudio.volume = document.getElementById('volume').value;
+                
+                // Set up event listeners
+                streamAudio.addEventListener('playing', () => {
+                    log('Direct streaming started successfully');
+                    logResult('stream-results', '✓ Direct HTTP streaming successful', true);
+                });
+                
+                streamAudio.addEventListener('error', (e) => {
+                    const errorCode = e.target.error ? e.target.error.code : 'unknown';
+                    log(`Direct streaming error (code ${errorCode})`, true);
+                    logResult('stream-results', `✗ Direct streaming failed (error code ${errorCode})`, false);
+                });
+                
+                streamAudio.addEventListener('waiting', () => {
+                    log('Stream buffering...');
+                });
+                
+                streamAudio.addEventListener('stalled', () => {
+                    log('Stream stalled');
+                });
+                
+                // Add timestamp to prevent caching
+                const timestamp = new Date().getTime();
+                streamAudio.src = `http://localhost:8000/direct-stream?t=${timestamp}`;
+                
+                document.body.appendChild(streamAudio);
+                log('Starting audio playback...');
+                await streamAudio.play();
+            } catch (error) {
+                log(`Direct streaming failed: ${error.message}`, true);
+                logResult('stream-results', `✗ Direct streaming failed: ${error.message}`, false);
+            }
+        });
+        
+        document.getElementById('test-ws-stream').addEventListener('click', async () => {
+            log('Testing WebSocket streaming...');
+            
+            // Close existing WebSocket if any
+            if (webSocket) {
+                webSocket.close();
+                webSocket = null;
+            }
+            
+            // Clean up any existing audio
+            if (streamAudio) {
+                streamAudio.pause();
+                streamAudio.src = '';
+                streamAudio.removeAttribute('src');
+                streamAudio.load();
+            }
+            
+            try {
+                // We'll need MSE
+                if (!('MediaSource' in window)) {
+                    throw new Error('MediaSource API not supported by this browser');
+                }
+                
+                // Create MediaSource
+                const mediaSource = new MediaSource();
+                log(`MediaSource created, readyState: ${mediaSource.readyState}`);
+                
+                // Create audio element
+                streamAudio = new Audio();
+                streamAudio.controls = false;
+                streamAudio.volume = document.getElementById('volume').value;
+                streamAudio.src = URL.createObjectURL(mediaSource);
+                document.body.appendChild(streamAudio);
+                
+                // Create queue for audio chunks
+                const audioQueue = [];
+                let isProcessingQueue = false;
+                let sourceBuffer = null;
+                
+                // Process queue function
+                const processQueue = () => {
+                    if (audioQueue.length > 0 && !isProcessingQueue && sourceBuffer && !sourceBuffer.updating) {
+                        isProcessingQueue = true;
+                        const data = audioQueue.shift();
+                        try {
+                            sourceBuffer.appendBuffer(data);
+                        } catch (e) {
+                            log(`Error appending buffer: ${e.message}`, true);
+                            
+                            // If we hit a quota exceeded error, clear the buffer and try again
+                            if (e.name === 'QuotaExceededError') {
+                                log('Buffer full, removing old data');
+                                if (sourceBuffer.buffered.length > 0) {
+                                    const start = sourceBuffer.buffered.start(0);
+                                    const end = start + 10;
+                                    sourceBuffer.remove(start, end);
+                                }
+                                // Put the data back in the queue
+                                audioQueue.unshift(data);
+                            }
+                        }
+                        isProcessingQueue = false;
+                    }
+                };
+                
+                // Set up MediaSource open handler
+                mediaSource.addEventListener('sourceopen', () => {
+                    log(`MediaSource opened, readyState: ${mediaSource.readyState}`);
+                    
+                    try {
+                        // Create SourceBuffer
+                        sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
+                        log('SourceBuffer created for audio/mpeg');
+                        
+                        // Handle update end events
+                        sourceBuffer.addEventListener('updateend', () => {
+                            processQueue();
+                        });
+                        
+                        // Connect to WebSocket
+                        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                        const wsUrl = `${protocol}//localhost:8000/stream`;
+                        log(`Connecting to WebSocket for streaming: ${wsUrl}`);
+                        
+                        webSocket = new WebSocket(wsUrl);
+                        
+                        webSocket.onopen = () => {
+                            log('WebSocket connection opened for streaming');
+                            streamAudio.play().catch(e => {
+                                log(`Error starting audio playback: ${e.message}`, true);
+                            });
+                        };
+                        
+                        webSocket.onclose = (event) => {
+                            log(`WebSocket connection closed: Code ${event.code}`);
+                        };
+                        
+                        webSocket.onerror = () => {
+                            log('WebSocket error occurred', true);
+                            logResult('stream-results', '✗ WebSocket streaming error', false);
+                        };
+                        
+                        webSocket.onmessage = (event) => {
+                            if (event.data instanceof Blob) {
+                                // Process binary audio data
+                                event.data.arrayBuffer().then(buffer => {
+                                    if (sourceBuffer && mediaSource.readyState === 'open') {
+                                        // Add to queue
+                                        audioQueue.push(buffer);
+                                        
+                                        // Process queue if needed
+                                        if (!isProcessingQueue && !sourceBuffer.updating) {
+                                            processQueue();
+                                        }
+                                        
+                                        // Log progress occasionally
+                                        if (audioQueue.length % 50 === 0) {
+                                            log(`WebSocket streaming: ${audioQueue.length} chunks in queue`);
+                                        }
+                                        
+                                        // Show success after receiving some data
+                                        if (audioQueue.length === 10) {
+                                            logResult('stream-results', '✓ WebSocket streaming receiving data', true);
+                                        }
+                                    }
+                                }).catch(e => {
+                                    log(`Error processing audio data: ${e.message}`, true);
+                                });
+                            } else {
+                                // Process text data (likely track info)
+                                try {
+                                    const data = JSON.parse(event.data);
+                                    log(`Received track info: ${JSON.stringify(data)}`);
+                                    
+                                    // Update track info display
+                                    document.getElementById('track-info').innerHTML = `
+                                        <div><strong>Title:</strong> ${data.title || 'Unknown'}</div>
+                                        <div><strong>Artist:</strong> ${data.artist || 'Unknown'}</div>
+                                        <div><strong>Album:</strong> ${data.album || 'Unknown'}</div>
+                                        <div><strong>Duration:</strong> ${data.duration || 0} seconds</div>
+                                    `;
+                                } catch (e) {
+                                    log(`Received text message: ${event.data}`);
+                                }
+                            }
+                        };
+                    } catch (error) {
+                        log(`Error setting up streaming: ${error.message}`, true);
+                        logResult('stream-results', `✗ Error setting up streaming: ${error.message}`, false);
+                    }
+                });
+                
+                // Play audio
+                streamAudio.play().catch(e => {
+                    log(`Error starting audio playback: ${e.message}`, true);
+                });
+                
+                log('WebSocket streaming setup complete');
+                
+            } catch (error) {
+                log(`WebSocket streaming setup failed: ${error.message}`, true);
+                logResult('stream-results', `✗ WebSocket streaming failed: ${error.message}`, false);
+            }
+        });
+        
+        document.getElementById('stop-streaming').addEventListener('click', () => {
+            log('Stopping all streaming...');
+            
+            // Stop audio
+            if (streamAudio) {
+                streamAudio.pause();
+                streamAudio.src = '';
+                streamAudio.removeAttribute('src');
+                streamAudio.load();
+                log('Audio playback stopped');
+            }
+            
+            // Close WebSocket
+            if (webSocket) {
+                webSocket.close();
+                webSocket = null;
+                log('WebSocket connection closed');
+            }
+            
+            logResult('stream-results', '✓ All streaming stopped', true);
+        });
+        
+        // Handle volume control
+        document.getElementById('volume').addEventListener('input', (e) => {
+            const volume = e.target.value;
+            if (streamAudio) {
+                streamAudio.volume = volume;
+                log(`Volume set to ${volume}`);
+            }
+        });
+        
+        // Handle mute button
+        document.getElementById('mute-btn').addEventListener('click', () => {
+            if (streamAudio) {
+                streamAudio.muted = !streamAudio.muted;
+                document.getElementById('mute-btn').textContent = streamAudio.muted ? 'Unmute' : 'Mute';
+                log(`Audio ${streamAudio.muted ? 'muted' : 'unmuted'}`);
+            }
+        });
+        
+        // Initialize
+        log('Debug test page loaded');
+        log(`User agent: ${navigator.userAgent}`);
+        log(`Protocol: ${window.location.protocol}`);
+        log('Target server: http://localhost:8000');
+        
+        // Check for HTTPS
+        if (window.location.protocol !== 'https:') {
+            log('Note: Using HTTP. Some browser features may require HTTPS.', true);
+        }
+        
+        // Log network type if available
+        if (navigator.connection) {
+            const connection = navigator.connection;
+            log(`Network: Type ${connection.type || 'unknown'}, Downlink: ${connection.downlink || 'unknown'} Mbps`);
+        }
+        
+        // Check audio capabilities immediately
+        if ('MediaSource' in window) {
+            log('MediaSource API is available');
+            
+            // Check MP3 support
+            if (MediaSource.isTypeSupported('audio/mpeg')) {
+                log('Browser supports MP3 with MediaSource');
+            } else {
+                log('Browser does not support MP3 with MediaSource', true);
+            }
+        } else {
+            log('MediaSource API is NOT available - fallback streaming will be used', true);
+        }
+    </script>
+</body>
+</html>
