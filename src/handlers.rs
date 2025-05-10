@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
 use std::time::{Duration, Instant};
 use futures::stream::StreamExt;
+use std::collections::VecDeque;
 
 use crate::models::playlist::Playlist;
 use crate::services::playlist;
@@ -72,7 +73,7 @@ pub async fn get_stats(stream_manager: &State<StreamManager>) -> Json<serde_json
     }))
 }
 
-// WebSocket handler for streaming audio - NON-BLOCKING VERSION
+// WebSocket handler for streaming audio - Fixed version with live join support
 #[get("/stream")]
 pub fn stream_ws(ws: ws::WebSocket, stream_manager: &State<StreamManager>) -> ws::Channel<'static> {
     println!("WebSocket connection request received");
@@ -120,12 +121,19 @@ pub fn stream_ws(ws: ws::WebSocket, stream_manager: &State<StreamManager>) -> ws
         // Use an Arc to share the stream between the heartbeat task and main task
         let stream = Arc::new(tokio::sync::Mutex::new(stream));
         
-        // Prepare broadcast subscription BEFORE incrementing listeners
-        // to ensure we don't miss messages
-        let mut broadcast_rx = stream_manager_clone.get_broadcast_receiver();
+        // CRITICAL: Get all needed data FIRST before incrementing listeners
+        let track_info = stream_manager_clone.get_track_info();
         
-        // Increment active listener count - must be done before setup
-        // to ensure proper state tracking
+        // Get only recent chunks for smooth join to live broadcast, not entire track history
+        let (id3_header_opt, saved_chunks) = stream_manager_clone.get_chunks_from_current_position();
+        
+        // Log what we're sending to the new client
+        println!("New client joining live broadcast. ID3 header: {} bytes, Recent chunks: {}", 
+                 id3_header_opt.as_ref().map_or(0, |h| h.len()),
+                 saved_chunks.len());
+        
+        // Now create broadcast receiver and increment listeners
+        let mut broadcast_rx = stream_manager_clone.get_broadcast_receiver();
         stream_manager_clone.increment_listener_count();
         let listener_id = stream_manager_clone.get_active_listeners();
         println!("Listener {} connected. Active listeners: {}", listener_id, stream_manager_clone.get_active_listeners());
@@ -149,100 +157,40 @@ pub fn stream_ws(ws: ws::WebSocket, stream_manager: &State<StreamManager>) -> ws
             }
         });
 
-        // Send track info first - QUICK OPERATION
-        if let Some(track_info) = stream_manager_clone.get_track_info() {
+        // Send track info first - QUICK OPERATION (data already fetched)
+        if let Some(track_info) = track_info {
             println!("Sending track info to client {}: {}", listener_id, track_info);
             if let Err(e) = stream.lock().await.send(ws::Message::Text(track_info)).await {
                 println!("Error sending track info to client {}: {:?}", listener_id, e);
                 stream_manager_clone.decrement_listener_count();
+                client_connected.store(false, Ordering::Relaxed);
                 return Ok(());
             }
         }
         
-        // Get saved data from the current playback position (instead of from the beginning)
-        let (id3_header_opt, saved_chunks) = stream_manager_clone.get_chunks_from_current_position();
-        
-        // Send ID3 header first - QUICK OPERATION
+        // Send ID3 header if available (data already fetched)
         if let Some(id3_header) = id3_header_opt {
             println!("Sending ID3 header to client {} ({} bytes)", listener_id, id3_header.len());
             if let Err(e) = stream.lock().await.send(ws::Message::Binary(id3_header)).await {
                 println!("Error sending ID3 header to client {}: {:?}", listener_id, e);
                 stream_manager_clone.decrement_listener_count();
+                client_connected.store(false, Ordering::Relaxed);
                 return Ok(());
             }
         }
         
-        // Send saved chunks in a separate async task to avoid blocking
-        // This allows the main task to continue receiving broadcast messages
-        // immediately, even while chunks are being sent
-        let saved_chunks_count = saved_chunks.len();
+        // Create a queue for saved chunks (no locks held while sending)
+        let mut saved_chunks_queue = VecDeque::from(saved_chunks);
+        let saved_chunks_count = saved_chunks_queue.len();
         
-        // Only spawn separate task if there are chunks to send
         if saved_chunks_count > 0 {
-            println!("Sending {} saved chunks to client {} for catch-up", saved_chunks_count, listener_id);
-            
-            // Create a clone for the task
-            let stream_for_chunks = stream.clone();
-            let client_connected_for_chunks = client_connected.clone();
-            let listener_id_copy = listener_id;
-            
-            // Spawn a separate task to send the chunks
-            tokio::spawn(async move {
-                // Track progress for debugging
-                let mut chunks_sent = 0;
-                let start_time = Instant::now();
-                
-                // Send chunks with rate limiting to avoid overwhelming the client
-                for (i, chunk) in saved_chunks.iter().enumerate() {
-                    // Check if client is still connected
-                    if !client_connected_for_chunks.load(Ordering::Relaxed) {
-                        println!("Client {} disconnected during chunk catch-up after sending {}/{} chunks",
-                                listener_id_copy, chunks_sent, saved_chunks_count);
-                        break;
-                    }
-                    
-                    if !chunk.is_empty() {
-                        match stream_for_chunks.lock().await.send(ws::Message::Binary(chunk.clone())).await {
-                            Ok(_) => {
-                                chunks_sent += 1;
-                                // Log progress periodically
-                                if chunks_sent % 100 == 0 {
-                                    println!("Sent {}/{} catch-up chunks to client {}", 
-                                           chunks_sent, saved_chunks_count, listener_id_copy);
-                                }
-                            },
-                            Err(e) => {
-                                println!("Error sending saved chunk {} to client {}: {:?}", 
-                                       i, listener_id_copy, e);
-                                break;
-                            }
-                        }
-                        
-                        // Rate limit the sending based on size 
-                        // Larger chunks = more delay to avoid overwhelming the client
-                        let delay_ms = if chunk.len() > 32768 {
-                            20 // Larger chunk = more delay
-                        } else if chunk.len() > 16384 {
-                            10
-                        } else {
-                            5 // Small chunk = minimal delay
-                        };
-                        
-                        // Only apply delay every few chunks to maintain throughput
-                        if i % 10 == 0 {
-                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                        }
-                    }
-                }
-                
-                let elapsed = start_time.elapsed();
-                println!("Finished sending {}/{} catch-up chunks to client {} in {:.2}s",
-                       chunks_sent, saved_chunks_count, listener_id_copy, elapsed.as_secs_f32());
-            });
+            println!("Sending {} recent chunks to client {} for smooth join to live broadcast", 
+                    saved_chunks_count, listener_id);
         }
         
-        // Process broadcast messages immediately while chunks are being sent in background
+        // Process broadcast messages and saved chunks in the same task
         let mut chunk_count = 0;
+        let mut catch_up_count = 0;
         let mut error_count = 0;
         let mut last_activity = Instant::now();
         let mut consecutive_timeouts = 0;
@@ -255,8 +203,72 @@ pub fn stream_ws(ws: ws::WebSocket, stream_manager: &State<StreamManager>) -> ws
                 break;
             }
             
-            // Try to receive the next broadcast chunk with a SHORTER timeout (2s instead of 5s)
-            // This makes the server more responsive to shutdown requests
+            // First, try to send one saved chunk if available
+            if let Some(chunk) = saved_chunks_queue.pop_front() {
+                // Update activity timestamp
+                last_activity = Instant::now();
+                
+                // Skip empty chunks (end of track marker)
+                if chunk.is_empty() {
+                    continue;
+                }
+                
+                catch_up_count += 1;
+                if catch_up_count % 20 == 0 || catch_up_count == saved_chunks_count {
+                    println!("Sent {}/{} recent chunks to client {} for live join", 
+                           catch_up_count, saved_chunks_count, listener_id);
+                }
+                
+                // Send binary data
+                match stream.lock().await.send(ws::Message::Binary(chunk)).await {
+                    Ok(_) => {
+                        // Successfully sent chunk, reset error count
+                        error_count = 0;
+                    },
+                    Err(e) => {
+                        // Error sending chunk
+                        error_count += 1;
+                        println!("Error sending catch-up chunk to client {}: {:?}", listener_id, e);
+                        
+                        if error_count >= 3 {
+                            println!("Too many errors, closing client {} WebSocket connection", listener_id);
+                            break;
+                        }
+                        
+                        // Brief pause before trying again
+                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    }
+                }
+                
+                // Rate limit catch-up to avoid overwhelming client and holding locks
+                // Shorter delay for better responsiveness
+                if catch_up_count % 5 == 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                
+                // After sending a saved chunk, also try to process a broadcast message
+                // This ensures we don't fall behind on live data
+                match tokio::time::timeout(Duration::from_millis(1), broadcast_rx.recv()).await {
+                    Ok(Ok(broadcast_chunk)) => {
+                        // Handle broadcast chunk immediately
+                        if !broadcast_chunk.is_empty() {
+                            if let Err(e) = stream.lock().await.send(ws::Message::Binary(broadcast_chunk)).await {
+                                println!("Error sending broadcast chunk during catch-up: {:?}", e);
+                                break;
+                            }
+                        }
+                    },
+                    _ => {} // Timeout or error, continue with catch-up
+                }
+                
+                continue; // Continue with next saved chunk
+            }
+            
+            // If no more saved chunks, we're now fully live - process broadcast messages
+            if catch_up_count > 0 && saved_chunks_queue.is_empty() {
+                println!("Client {} finished catch-up, now receiving live broadcast", listener_id);
+            }
+            
             let receive_future = broadcast_rx.recv();
             match tokio::time::timeout(Duration::from_secs(2), receive_future).await {
                 Ok(Ok(chunk)) => {
@@ -269,6 +281,7 @@ pub fn stream_ws(ws: ws::WebSocket, stream_manager: &State<StreamManager>) -> ws
                     // Skip empty chunks (end of track marker)
                     if chunk.is_empty() {
                         println!("Client {} received end of track marker", listener_id);
+                        // Don't disconnect, just continue listening for next track
                         continue;
                     }
                     
@@ -327,9 +340,7 @@ pub fn stream_ws(ws: ws::WebSocket, stream_manager: &State<StreamManager>) -> ws
                     // If track ended but streaming is still active, wait for next track
                     if stream_manager_clone.track_ended() && stream_manager_clone.is_streaming() {
                         println!("Client {}: Current track ended, waiting for next track...", listener_id);
-                        // Get a fresh receiver for the next track
-                        broadcast_rx = stream_manager_clone.get_broadcast_receiver();
-                        // Brief pause to allow next track to start
+                        // Brief pause before checking again
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
@@ -353,8 +364,8 @@ pub fn stream_ws(ws: ws::WebSocket, stream_manager: &State<StreamManager>) -> ws
         client_connected.store(false, Ordering::Relaxed);
         let _ = heartbeat_task.await;
         
-        println!("WebSocket stream for client {} ended after sending {} broadcast chunks", 
-               listener_id, chunk_count);
+        println!("WebSocket stream for client {} ended after sending {} broadcast chunks and {} catch-up chunks", 
+               listener_id, chunk_count, catch_up_count);
         
         // Decrement active listener count when done
         stream_manager_clone.decrement_listener_count();
