@@ -684,7 +684,7 @@ impl StreamManager {
             let chunks_to_keep = (bytes_to_keep / BROADCAST_CHUNK_SIZE as u64) as usize;
             
             // Get only the most recent chunks
-            let saved_chunks = if guard.saved_chunks.len() > chunks_to_keep {
+            let saved_chunks: Vec<Vec<u8>> = if guard.saved_chunks.len() > chunks_to_keep {
                 // Skip older chunks and return only recent ones
                 let skip_count = guard.saved_chunks.len() - chunks_to_keep;
                 guard.saved_chunks.iter().skip(skip_count).cloned().collect()
@@ -699,7 +699,7 @@ impl StreamManager {
             (header, saved_chunks)
         } else {
             // If live join is disabled, return all saved chunks (old behavior)
-            let saved_chunks = guard.saved_chunks.iter().cloned().collect();
+            let saved_chunks: Vec<Vec<u8>> = guard.saved_chunks.iter().cloned().collect();
             println!("New client starting from beginning. Sending all {} saved chunks", saved_chunks.len());
             (header, saved_chunks)
         }

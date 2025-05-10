@@ -9,11 +9,18 @@
       "duration": 169
     },
     {
-      "path": "Seagull and Sparrow (Remastered) (Cover).mp3",
-      "title": "Seagull and Sparrow (Remastered) (Cover)",
+      "path": "Dhiyana.mp3",
+      "title": "Dhiyana",
       "artist": "seagull_sparrow",
       "album": "Unknown",
-      "duration": 288
+      "duration": 204
+    },
+    {
+      "path": "Singing Birds.mp3",
+      "title": "Singing Birds",
+      "artist": "seagull_sparrow",
+      "album": "Unknown",
+      "duration": 182
     }
   ]
 }
