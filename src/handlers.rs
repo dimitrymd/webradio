@@ -124,8 +124,14 @@ pub fn stream_ws(ws: ws::WebSocket, stream_manager: &State<StreamManager>) -> ws
         // CRITICAL: Get all needed data FIRST before incrementing listeners
         let track_info = stream_manager_clone.get_track_info();
         
-        // Get only recent chunks for smooth join to live broadcast, not entire track history
+        // Get enough initial chunks for smooth playback
         let (id3_header_opt, saved_chunks) = stream_manager_clone.get_chunks_from_current_position();
+        
+        // Ensure we have at least MIN_BUFFER_CHUNKS chunks
+        if saved_chunks.len() < config::MIN_BUFFER_CHUNKS {
+            println!("Warning: Only {} chunks available for new client, may experience buffering", 
+                    saved_chunks.len());
+        }
         
         // Log what we're sending to the new client
         println!("New client joining live broadcast. ID3 header: {} bytes, Recent chunks: {}", 

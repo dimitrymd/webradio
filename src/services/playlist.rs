@@ -413,12 +413,7 @@ pub fn track_switcher(stream_manager: StreamManager) {
                 
                 println!("WARNING: Stream appears to be stalled. Restarting broadcast.");
                 
-                // Force stop current stream
-                stream_manager.force_stop_streaming();
-                
-                // Brief pause to allow cleanup
-                thread::sleep(Duration::from_millis(200));
-                
+                // Don't force stop the stream - just restart it
                 // Restart the same track (without advancing)
                 if let Some(track) = get_current_track(&crate::config::PLAYLIST_FILE, &crate::config::MUSIC_FOLDER) {
                     println!("Restarting broadcast of track: \"{}\" by \"{}\"", 
@@ -520,8 +515,7 @@ pub fn track_switcher(stream_manager: StreamManager) {
                         last_log_time = std::time::Instant::now();
                     } else {
                         println!("FATAL: No tracks available after recovery attempt");
-                        // Force stream_manager into a valid state to avoid deadlock
-                        stream_manager.force_stop_streaming();
+                        // Don't force stop streaming - just let it continue
                     }
                 }
             }

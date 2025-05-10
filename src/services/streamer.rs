@@ -8,16 +8,25 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use log::{info, error, warn, debug};
 use tokio::sync::broadcast;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU64, Ordering};
+use id3::TagLike;
+
+// Global thread counter for debugging
+static THREAD_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // Size of chunks for broadcasting
-const BROADCAST_CHUNK_SIZE: usize = 8192; // 8KB chunks for broadcasting
-const BROADCAST_RATE_LIMITER_MS: u64 = 50; // Control how fast we send chunks to match real-time playback
+const BROADCAST_CHUNK_SIZE: usize = 16384; // Increase from 8KB to 16KB for better buffering
+const BROADCAST_RATE_LIMITER_MS: u64 = 10; // Reduce from 50ms to 10ms minimum
+const MIN_BUFFER_BEFORE_PLAY: usize = 10; // Ensure at least 10 chunks are buffered
 
 // Constants for live broadcast joining
 const LIVE_JOIN_BUFFER_SECONDS: u64 = 3; // How many seconds of recent audio to send to new clients
 const MAX_RECENT_CHUNKS_FOR_LIVE: usize = 50; // Maximum recent chunks to keep for live joining (~6 seconds at 128kbps)
 const LIVE_JOIN_ENABLED: bool = true; // Whether to join live broadcast or start from beginning
+
+// Add these new constants for adaptive streaming
+const ADAPTIVE_RATE_ADJUSTMENT: bool = true;
+const BITRATE_MARGIN: f64 = 1.2; // 20% margin for bitrate variations
 
 #[derive(Clone)]
 pub struct StreamManager {
@@ -124,7 +133,34 @@ impl StreamManager {
     }
     
     pub fn start_streaming(&self, track_path: &str) {
-        // CRITICAL: Reset ALL state flags at the beginning
+        // First, check if we're already streaming this track
+        let needs_transition = {
+            let inner = self.inner.lock();
+            inner.current_track_path.as_deref() != Some(track_path) || 
+            self.track_ended.load(Ordering::SeqCst)
+        };
+        
+        if !needs_transition {
+            println!("Already streaming track: {}", track_path);
+            return;
+        }
+        
+        // Signal track transition to clients with a clear separator
+        if self.is_streaming.load(Ordering::SeqCst) {
+            // Send track transition marker
+            let transition_marker = vec![0xFF, 0xFE]; // Special marker for track change
+            let _ = self.broadcast_tx.send(transition_marker);
+            
+            // Send a few empty chunks to ensure buffer is flushed
+            for _ in 0..5 {
+                let _ = self.broadcast_tx.send(vec![]);
+            }
+            
+            // Brief pause for clients to process
+            thread::sleep(Duration::from_millis(200));
+        }
+        
+        // Now reset all flags properly
         self.is_streaming.store(true, Ordering::SeqCst);
         self.track_ended.store(false, Ordering::SeqCst);
         
@@ -133,27 +169,24 @@ impl StreamManager {
         // Now acquire the mutex for the actual work
         let mut inner = self.inner.lock();
         
-        // If already streaming this track, do nothing
-        if inner.current_track_path.as_deref() == Some(track_path) && 
-           self.is_streaming.load(Ordering::SeqCst) && 
-           !self.track_ended.load(Ordering::SeqCst) {
-            debug!("Already streaming track: {}", track_path);
-            return;
-        }
-        
         info!("Starting to stream track: {}", track_path);
         
         // Clean up existing stream thread if any
         self.cleanup_stream_thread(&mut inner);
         
-        // Clear ALL buffers for the new track - ensure clean start
+        // CRITICAL: Clear ALL buffers for the new track - ensure clean start
         inner.buffer.clear();
         inner.chunk_times.clear();
         inner.playback_position = 0;
         inner.id3_header = None;
-        inner.saved_chunks.clear(); // CRITICAL: Clear all saved chunks
-        inner.saved_chunks = VecDeque::with_capacity(MAX_RECENT_CHUNKS_FOR_LIVE); // Reset with limited capacity
-        debug!("Cleared all buffers for new track");
+        
+        // CRITICAL: Clear saved chunks completely
+        inner.saved_chunks.clear();
+        
+        // Force drop and recreate the saved_chunks to ensure it's completely empty
+        inner.saved_chunks = VecDeque::with_capacity(MAX_RECENT_CHUNKS_FOR_LIVE);
+        
+        debug!("Cleared all buffers for new track - ensured no audio mixing");
         
         // Set the current track path
         inner.current_track_path = Some(track_path.to_string());
@@ -173,68 +206,62 @@ impl StreamManager {
         
         let music_folder = inner.music_folder.clone();
         let track_path = track_path.to_string();
-        let chunk_size = BROADCAST_CHUNK_SIZE; // Use broadcast chunk size for streaming
+        let chunk_size = BROADCAST_CHUNK_SIZE;
         let inner_clone = self.inner.clone();
         let is_streaming = self.is_streaming.clone();
         let track_ended = self.track_ended.clone();
-        let broadcast_tx = self.broadcast_tx.clone(); // Clone broadcast tx for direct access
+        let broadcast_tx = self.broadcast_tx.clone();
         
-        debug!("Creating new stream thread for track: {}", track_path);
+        // Generate unique thread ID using atomic counter
+        let thread_id = THREAD_COUNTER.fetch_add(1, Ordering::SeqCst);
+        
+        println!("Creating new stream thread {} for track: {}", thread_id, track_path);
+        
+        // Create new thread for streaming
+        let track_path_clone = track_path.clone();
         let thread_handle = thread::spawn(move || {
-            // Stream the track to all listeners
-            Self::buffer_track(inner_clone, broadcast_tx, is_streaming, track_ended, &music_folder, &track_path, chunk_size);
+            println!("Stream thread {} started for: {}", thread_id, track_path_clone);
+            Self::buffer_track(thread_id, inner_clone, broadcast_tx, is_streaming, track_ended, &music_folder, &track_path_clone, chunk_size);
+            println!("Stream thread {} finished for: {}", thread_id, track_path_clone);
         });
         
         inner.stream_thread = Some(thread_handle);
     }
     
-    // Fixed cleanup_stream_thread method to avoid deadlocks
     fn cleanup_stream_thread(&self, inner: &mut StreamManagerInner) {
         // Store thread locally, drop lock completely when joining
-        let thread_to_join = if self.is_streaming.load(Ordering::SeqCst) && inner.stream_thread.is_some() {
+        if let Some(thread) = inner.stream_thread.take() {
             info!("Stopping existing stream thread");
-            self.is_streaming.store(false, Ordering::SeqCst);
-            inner.stream_thread.take()
-        } else {
-            None
-        };
-        
-        // Only join if we have a thread
-        if let Some(thread) = thread_to_join {
-            // CRITICAL: Release the mutex completely before joining
-            // This avoids the deadlock where the thread might be waiting for the same lock
+            
+            // Signal the thread to stop by setting a flag
+            self.track_ended.store(true, Ordering::SeqCst);
+            
+            // Drop the inner lock completely before operations that might block
             std::mem::drop(inner);
             
-            // Simple timeout join attempt
-            let timeout = Duration::from_secs(5);
-            let now = Instant::now();
-            let mut joined = false;
+            // Force the thread to wake up if it's sleeping
+            let _ = self.broadcast_tx.send(vec![0xFF, 0xFD]); // Stop marker
             
-            while now.elapsed() < timeout {
-                if thread.is_finished() {
-                    // Safe to join now
-                    if let Err(e) = thread.join() {
-                        error!("Error joining stream thread: {:?}", e);
-                    }
-                    joined = true;
-                    break;
+            // Brief pause to allow thread to react
+            thread::sleep(Duration::from_millis(100));
+            
+            // Try to join with a simple approach - just join and handle the result
+            info!("Attempting to join stream thread");
+            match thread.join() {
+                Ok(_) => {
+                    info!("Stream thread joined successfully");
                 }
-                thread::sleep(Duration::from_millis(100));
+                Err(e) => {
+                    error!("Error joining stream thread: {:?}", e);
+                }
             }
-            
-            if !joined {
-                warn!("Timed out waiting for stream thread to finish - continuing without join");
-            }
-            
-            // Note: We don't try to reacquire the lock here
-            // The caller will handle the lock acquisition as needed
         }
     }
     
-    // Fixed buffer_track method with non-blocking broadcasting and live join support
     fn buffer_track(
+        thread_id: u64,
         inner: Arc<Mutex<StreamManagerInner>>, 
-        broadcast_tx: Arc<broadcast::Sender<Vec<u8>>>, // Direct access to broadcaster
+        broadcast_tx: Arc<broadcast::Sender<Vec<u8>>>,
         is_streaming: Arc<AtomicBool>,
         track_ended: Arc<AtomicBool>,
         music_folder: &Path, 
@@ -244,21 +271,25 @@ impl StreamManager {
         let file_path = music_folder.join(track_path);
         let start_time = std::time::Instant::now();
         
-        println!("Starting to buffer track: {}", file_path.display());
+        println!("Thread {}: Buffer track starting for: {}", thread_id, file_path.display());
+        
+        // Check if we should even start - might have been signaled to stop
+        if track_ended.load(Ordering::SeqCst) {
+            println!("Thread {}: Track already ended, not starting buffer for: {}", thread_id, file_path.display());
+            return;
+        }
         
         if !file_path.exists() {
-            println!("ERROR: File not found: {}", file_path.display());
-            is_streaming.store(false, Ordering::SeqCst);
+            println!("Thread {}: ERROR: File not found: {}", thread_id, file_path.display());
             track_ended.store(true, Ordering::SeqCst);
             return;
         }
         
-        println!("Opening file for streaming: {}", file_path.display());
+        println!("Thread {}: Opening file for streaming: {}", thread_id, file_path.display());
         let mut file = match File::open(&file_path) {
             Ok(f) => f,
             Err(e) => {
-                println!("ERROR: Error opening file {}: {}", file_path.display(), e);
-                is_streaming.store(false, Ordering::SeqCst);
+                println!("Thread {}: ERROR: Error opening file {}: {}", thread_id, file_path.display(), e);
                 track_ended.store(true, Ordering::SeqCst);
                 return;
             }
@@ -280,30 +311,67 @@ impl StreamManager {
             0
         };
         
-        println!("Starting to broadcast file: {}, size: {} bytes, expected duration: {} seconds", 
-                 file_path.display(), file_size, expected_duration);
+        println!("Thread {}: Starting to broadcast file: {}, size: {} bytes, expected duration: {} seconds", 
+                 thread_id, file_path.display(), file_size, expected_duration);
         
-        // Calculate playback rate based on file size and duration
-        let bytes_per_second = if file_size > 0 && expected_duration > 0 {
-            file_size / expected_duration
+        // Improve the bitrate calculation
+        let mut actual_bitrate = 0u64;
+        
+        // Try to get actual bitrate from MP3 metadata
+        if let Ok(tag) = id3::Tag::read_from_path(&file_path) {
+            if let Some(frame) = tag.get("TLEN") {
+                if let Ok(duration_ms) = frame.content().text().unwrap_or("0").parse::<u64>() {
+                    if duration_ms > 0 && file_size > 0 {
+                        actual_bitrate = (file_size * 8 * 1000) / duration_ms;
+                        println!("Thread {}: Detected actual bitrate from ID3: {} bps", thread_id, actual_bitrate);
+                    }
+                }
+            }
+        }
+        
+        // If we couldn't get bitrate from metadata, use estimation
+        if actual_bitrate == 0 {
+            // Read first few MP3 frames to estimate bitrate
+            let mut sample_buffer = vec![0u8; 32768]; // 32KB sample
+            if let Ok(bytes_read) = file.read(&mut sample_buffer) {
+                actual_bitrate = estimate_mp3_bitrate(&sample_buffer[..bytes_read]);
+                file.seek(SeekFrom::Start(0)).ok();
+            }
+        }
+        
+        // Fall back to file size / duration if needed
+        if actual_bitrate == 0 && file_size > 0 && expected_duration > 0 {
+            actual_bitrate = (file_size * 8) / expected_duration;
+        }
+        
+        // Default to 128kbps if all else fails
+        if actual_bitrate == 0 {
+            actual_bitrate = 128000;
+        }
+        
+        println!("Thread {}: Using bitrate: {} bps for streaming calculations", thread_id, actual_bitrate);
+        
+        // Calculate chunk delay with margin for variations
+        let bytes_per_second = actual_bitrate / 8;
+        let adjusted_bytes_per_second = if ADAPTIVE_RATE_ADJUSTMENT {
+            (bytes_per_second as f64 * BITRATE_MARGIN) as u64
         } else {
-            16000 // default to 16KB/s (128kbps)
+            bytes_per_second
         };
         
-        println!("Calculated streaming rate: {} bytes/second", bytes_per_second);
-        
-        // Calculate chunk delay based on expected duration
         let bytes_per_chunk = chunk_size as f64;
-        let chunks_per_second = bytes_per_second as f64 / bytes_per_chunk;
+        let chunks_per_second = adjusted_bytes_per_second as f64 / bytes_per_chunk;
         let chunk_delay_ms = 1000.0 / chunks_per_second;
         
-        // Use at least a minimum delay to avoid overwhelming clients
-        let chunk_delay = std::cmp::max(
-            Duration::from_millis(BROADCAST_RATE_LIMITER_MS),
+        // Use adaptive delay with minimum threshold
+        let chunk_delay = if chunk_delay_ms < BROADCAST_RATE_LIMITER_MS as f64 {
+            Duration::from_millis(BROADCAST_RATE_LIMITER_MS)
+        } else {
             Duration::from_millis(chunk_delay_ms as u64)
-        );
+        };
         
-        println!("Broadcasting with delay of {:.2}ms between chunks", chunk_delay.as_millis());
+        println!("Thread {}: Adaptive streaming: chunk delay = {:.2}ms for bitrate {}kbps", 
+                 thread_id, chunk_delay.as_millis(), actual_bitrate / 1000);
         
         // Send track info first
         if let Some(track) = crate::services::playlist::get_current_track(
@@ -311,7 +379,7 @@ impl StreamManager {
             &crate::config::MUSIC_FOLDER
         ) {
             if let Ok(track_info) = serde_json::to_string(&track) {
-                println!("Broadcasting track info: {}", track_info);
+                println!("Thread {}: Broadcasting track info: {}", thread_id, track_info);
                 
                 // Update track info with minimal locking
                 if let Some(mut inner_lock) = inner.try_lock() {
@@ -341,21 +409,18 @@ impl StreamManager {
                 
                 // Reset file position to beginning
                 if let Err(e) = file.seek(SeekFrom::Start(0)) {
-                    println!("ERROR: Failed to seek back to beginning of file: {}", e);
-                    is_streaming.store(false, Ordering::SeqCst);
+                    println!("Thread {}: ERROR: Failed to seek back to beginning of file: {}", thread_id, e);
                     track_ended.store(true, Ordering::SeqCst);
                     return;
                 }
             },
             Ok(0) => {
-                println!("WARNING: Empty file: {}", file_path.display());
-                is_streaming.store(false, Ordering::SeqCst);
+                println!("Thread {}: WARNING: Empty file: {}", thread_id, file_path.display());
                 track_ended.store(true, Ordering::SeqCst);
                 return;
             },
             Err(e) => {
-                println!("ERROR: Failed to read ID3 header: {}", e);
-                is_streaming.store(false, Ordering::SeqCst);
+                println!("Thread {}: ERROR: Failed to read ID3 header: {}", thread_id, e);
                 track_ended.store(true, Ordering::SeqCst);
                 return;
             },
@@ -380,6 +445,12 @@ impl StreamManager {
         let mut eof_reached = false;
         
         while is_streaming.load(Ordering::SeqCst) && !eof_reached {
+            // Check if this thread should stop (track has ended)
+            if track_ended.load(Ordering::SeqCst) {
+                println!("Thread {}: Track ended flag detected, stopping buffer thread for: {}", thread_id, track_path);
+                break;
+            }
+            
             // Update playback position based on real elapsed time (every second)
             if last_position_update.elapsed().as_secs() >= 1 {
                 // Calculate position based on bytes read and expected bitrate
@@ -414,14 +485,16 @@ impl StreamManager {
                         inner_lock.playback_position
                     };
                     
-                    println!("BUFFER STATUS: Broadcasting \"{}\" - {} bytes read ({:.2}% of file) over {} seconds, position={}s", 
+                    println!("Thread {}: BUFFER STATUS: Broadcasting \"{}\" - {} bytes read ({:.2}% of file) over {} seconds, position={}s", 
+                           thread_id,
                            track_path, 
                            total_bytes_read,
                            if file_size > 0 { (total_bytes_read as f64 / file_size as f64) * 100.0 } else { 0.0 },
                            start_time.elapsed().as_secs(),
                            current_position);
                     
-                    println!("Buffer status: {}/{} chunks ({:.2}%), {} active receivers", 
+                    println!("Thread {}: Buffer status: {}/{} chunks ({:.2}%), {} active receivers", 
+                           thread_id,
                            inner_lock.buffer.len(), inner_lock.buffer.capacity(), 
                            if inner_lock.buffer.capacity() > 0 { 
                                (inner_lock.buffer.len() as f64 / inner_lock.buffer.capacity() as f64) * 100.0
@@ -429,8 +502,8 @@ impl StreamManager {
                            inner_lock.broadcast_tx.receiver_count());
                     
                     // Also log saved chunks status for live join
-                    println!("Saved chunks for live join: {} (max: {})", 
-                           inner_lock.saved_chunks.len(), MAX_RECENT_CHUNKS_FOR_LIVE);
+                    println!("Thread {}: Saved chunks for live join: {} (max: {})", 
+                           thread_id, inner_lock.saved_chunks.len(), MAX_RECENT_CHUNKS_FOR_LIVE);
                 }
                 
                 last_progress_log = std::time::Instant::now();
@@ -478,19 +551,25 @@ impl StreamManager {
                         elapsed
                     };
                     
-                    println!("End of file reached for track: {} after {} seconds, position={}s of expected {}s", 
-                           track_path, elapsed, position, expected_duration);
+                    println!("Thread {}: End of file reached for track: {} after {} seconds, position={}s of expected {}s", 
+                           thread_id, track_path, elapsed, position, expected_duration);
                     
                     // If we need to wait to reach expected duration
                     if expected_duration > 0 && position < expected_duration {
                         let wait_seconds = expected_duration - position;
-                        println!("Waiting {} more seconds to complete full track duration", wait_seconds);
+                        println!("Thread {}: Waiting {} more seconds to complete full track duration", thread_id, wait_seconds);
                         
                         // Use a longer sleep interval for better efficiency
                         let sleep_interval = 1; // 1 second
                         let mut remaining = wait_seconds;
                         
                         while remaining > 0 && is_streaming.load(Ordering::SeqCst) {
+                            // Check if we should stop during waiting
+                            if track_ended.load(Ordering::SeqCst) {
+                                println!("Thread {}: Track ended during duration wait", thread_id);
+                                break;
+                            }
+                            
                             // Sleep for the interval or the remaining time, whichever is smaller
                             let sleep_time = std::cmp::min(sleep_interval, remaining);
                             thread::sleep(Duration::from_secs(sleep_time));
@@ -506,24 +585,23 @@ impl StreamManager {
                             
                             // Log progress every 30 seconds or at the end
                             if remaining % 30 == 0 || remaining < sleep_interval {
-                                println!("Track \"{}\" at position {}s of {}s, {} seconds remaining", 
-                                       track_path, new_position, expected_duration, 
+                                println!("Thread {}: Track \"{}\" at position {}s of {}s, {} seconds remaining", 
+                                       thread_id, track_path, new_position, expected_duration, 
                                        if new_position < expected_duration { expected_duration - new_position } else { 0 });
                             }
                         }
                     }
                     
-                    println!("Track playback complete after waiting: {} actual seconds", start_time.elapsed().as_secs());
+                    println!("Thread {}: Track playback complete after waiting: {} actual seconds", thread_id, start_time.elapsed().as_secs());
                     
-                    // Signal the end of track using atomic flag first
+                    // Send proper track end marker
+                    let end_marker = vec![0xFF, 0xFF]; // Track end marker
+                    let _ = broadcast_tx.send(end_marker);
+                    
+                    // Signal the end of track using atomic flag
                     track_ended.store(true, Ordering::SeqCst);
                     
-                    // Send track end marker (special pattern)
-                    // This is a specially crafted empty chunk that clients recognize as an end marker
-                    let _ = broadcast_tx.send(Vec::new());
-                    
-                    println!("Set track_ended flag for \"{}\" after {} seconds - STREAMING REMAINS ACTIVE", 
-                           track_path, start_time.elapsed().as_secs());
+                    println!("Thread {}: Track \"{}\" ended properly - STREAMING REMAINS ACTIVE", thread_id, track_path);
                     break;
                 },
                 Ok(n) => {
@@ -588,8 +666,8 @@ impl StreamManager {
                         total_bytes_read += chunk_data.len() as u64;
                         
                         if chunks_sent % 100 == 0 {
-                            println!("Sent {} chunks, {} bytes ({:.2}% of file)", 
-                                   chunks_sent, total_bytes_read,
+                            println!("Thread {}: Sent {} chunks, {} bytes ({:.2}% of file)", 
+                                   thread_id, chunks_sent, total_bytes_read,
                                    if file_size > 0 { (total_bytes_read as f64 / file_size as f64) * 100.0 } else { 0.0 });
                         }
                         
@@ -626,7 +704,7 @@ impl StreamManager {
                                 
                                 // Log occasionally to avoid spam
                                 if chunks_sent % 20 == 10 {
-                                    debug!("Broadcasted chunk directly without buffer update (lock contention)");
+                                    debug!("Thread {}: Broadcasted chunk directly without buffer update (lock contention)", thread_id);
                                 }
                             }
                         }
@@ -639,10 +717,9 @@ impl StreamManager {
                     thread::sleep(chunk_delay);
                 },
                 Err(e) => {
-                    println!("ERROR: Error reading file {}: {}", file_path.display(), e);
+                    println!("Thread {}: ERROR: Error reading file {}: {}", thread_id, file_path.display(), e);
                     
-                    // Set error state with minimal locking
-                    is_streaming.store(false, Ordering::SeqCst);
+                    // Set error state with minimal locking - but keep streaming active
                     track_ended.store(true, Ordering::SeqCst);
                     
                     // Send end of track signal
@@ -653,7 +730,7 @@ impl StreamManager {
             }
         }
         
-        println!("Exiting buffer_track thread for track: {}", track_path);
+        println!("Thread {}: Exiting buffer_track thread for track: {}", thread_id, track_path);
     }
     
     // Non-blocking method to get saved chunks - returns immediately without waiting
@@ -884,6 +961,57 @@ impl StreamManager {
                 return Some(i);
             }
         }
+        None
+    }
+}
+
+// Add helper function to estimate MP3 bitrate
+fn estimate_mp3_bitrate(data: &[u8]) -> u64 {
+    // Look for MP3 frame headers and calculate average bitrate
+    let mut total_bitrate = 0u64;
+    let mut frame_count = 0;
+    let mut pos = 0;
+    
+    while pos < data.len() - 4 {
+        if data[pos] == 0xFF && (data[pos + 1] & 0xE0) == 0xE0 {
+            // Found potential frame header
+            let header = ((data[pos + 1] as u32) << 16) | 
+                        ((data[pos + 2] as u32) << 8) | 
+                        (data[pos + 3] as u32);
+            
+            // Extract bitrate index
+            let bitrate_index = (header >> 12) & 0x0F;
+            let mpeg_version = (header >> 19) & 0x03;
+            let layer = (header >> 17) & 0x03;
+            
+            if let Some(bitrate) = get_mp3_bitrate(mpeg_version, layer, bitrate_index) {
+                total_bitrate += bitrate;
+                frame_count += 1;
+            }
+            
+            pos += 4; // Move to next potential frame
+        } else {
+            pos += 1;
+        }
+    }
+    
+    if frame_count > 0 {
+        (total_bitrate / frame_count) * 1000 // Convert to bps
+    } else {
+        128000 // Default to 128kbps
+    }
+}
+
+// Add MP3 bitrate lookup table
+fn get_mp3_bitrate(version: u32, layer: u32, bitrate_index: u32) -> Option<u64> {
+    // Simplified bitrate table for MPEG1 Layer III (MP3)
+    let bitrates = [
+        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0
+    ];
+    
+    if version == 3 && layer == 1 && bitrate_index < 16 {
+        Some(bitrates[bitrate_index as usize])
+    } else {
         None
     }
 }

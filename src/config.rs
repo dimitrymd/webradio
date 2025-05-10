@@ -22,3 +22,9 @@ pub const STREAM_CACHE_TIME: u64 = 60;  // Seconds to cache stream chunks
 pub const PORT: u16 = 8000;
 pub const HOST: &str = "0.0.0.0";
 pub const MAX_CONCURRENT_USERS: usize = 50;  // Maximum number of simultaneous connections
+
+// Adaptive buffering configuration
+pub const ADAPTIVE_BUFFERING: bool = true;
+pub const MIN_BUFFER_CHUNKS: usize = 10;
+pub const MAX_BUFFER_DURATION_SECS: u64 = 30;
+pub const HIGH_BITRATE_THRESHOLD: u64 = 192000; // 192kbps
