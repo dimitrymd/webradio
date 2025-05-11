@@ -213,7 +213,6 @@ function handleSourceBufferError(e) {
     handleMediaError(new Error('SourceBuffer error'));
 }
 
-// Enhanced WebSocket message handler
 function handleWebSocketMessage(event) {
     // Clear connection timeout if set
     if (connectionTimeout) {
@@ -239,36 +238,10 @@ function handleWebSocketMessage(event) {
                 
                 // Track transition marker
                 if (view[0] === 0xFF && view[1] === 0xFE) {
-                    logDebug('Track transition detected', 'ws');
+                    logDebug('Track transition detected - preparing for new track', 'ws');
                     
-                    // CRITICAL: Clear all audio data for clean transition
-                    if (sourceBuffer && mediaSource && mediaSource.readyState === 'open') {
-                        // Clear the queue completely
-                        audioQueue = [];
-                        isProcessingQueue = false;
-                        
-                        try {
-                            // Abort any pending operations
-                            if (sourceBuffer.updating) {
-                                sourceBuffer.abort();
-                            }
-                            
-                            // Remove ALL buffered data to prevent mixing
-                            if (sourceBuffer.buffered.length > 0) {
-                                const start = sourceBuffer.buffered.start(0);
-                                const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-                                sourceBuffer.remove(start, end);
-                                logDebug(`Cleared all buffer data from ${start} to ${end} for track transition`, 'audio');
-                            }
-                            
-                            // Reset MediaSource timing
-                            if (mediaSource.readyState === 'open' && mediaSource.duration !== Infinity) {
-                                mediaSource.duration = Infinity;
-                            }
-                        } catch (e) {
-                            logDebug(`Error during track transition cleanup: ${e.message}`, 'audio', true);
-                        }
-                    }
+                    // CRITICAL: Reset MediaSource for clean track transition
+                    handleTrackTransition();
                     return;
                 }
                 
@@ -282,7 +255,6 @@ function handleWebSocketMessage(event) {
             // Handle empty buffer (track end or flush)
             if (buffer.byteLength === 0) {
                 logDebug('Empty buffer received (track end or flush)', 'ws');
-                // Don't add empty buffers to the queue
                 return;
             }
             
@@ -301,12 +273,18 @@ function handleWebSocketMessage(event) {
                     logDebug(`Warning: Audio queue growing large: ${audioQueue.length} chunks`, 'audio');
                 }
             } else {
-                if (!mediaSource) {
-                    logDebug('Cannot process audio data - MediaSource not created', 'audio', true);
-                } else if (mediaSource.readyState !== 'open') {
-                    logDebug(`Cannot process audio data - MediaSource readyState: ${mediaSource.readyState}`, 'audio', true);
-                } else if (!sourceBuffer) {
-                    logDebug('Cannot process audio data - SourceBuffer not created', 'audio', true);
+                // If MediaSource isn't ready, we might need to recreate it
+                if (!mediaSource || mediaSource.readyState !== 'open') {
+                    logDebug('MediaSource not ready for audio data, attempting recovery', 'audio', true);
+                    
+                    // Store the audio data temporarily
+                    if (!window.pendingAudioData) {
+                        window.pendingAudioData = [];
+                    }
+                    window.pendingAudioData.push(buffer);
+                    
+                    // Try to reinitialize MediaSource
+                    reinitializeMediaSource();
                 }
             }
         }).catch(e => {
@@ -337,9 +315,8 @@ function handleWebSocketMessage(event) {
                 // Reset progress bar for new track
                 updateProgressBar(0, info.duration);
                 
-                // Clear any remaining audio in the queue for the new track
-                audioQueue = [];
-                isProcessingQueue = false;
+                // Reinitialize audio system for new track
+                reinitializeMediaSource();
             }
             
             // Update display
@@ -358,150 +335,162 @@ function handleWebSocketMessage(event) {
             logDebug(`Received non-JSON text message: ${event.data}`, 'ws');
         }
     }
-}// Enhanced WebSocket message handler
-function handleWebSocketMessage(event) {
-    // Clear connection timeout if set
-    if (connectionTimeout) {
-        clearTimeout(connectionTimeout);
-        connectionTimeout = null;
+}
+
+// Handle track transitions properly
+function handleTrackTransition() {
+    logDebug('Handling track transition - resetting audio system', 'audio');
+    
+    // Clear audio queue
+    audioQueue = [];
+    isProcessingQueue = false;
+    
+    // Clear any pending audio data
+    window.pendingAudioData = [];
+    
+    // Reset MediaSource and SourceBuffer
+    if (sourceBuffer && mediaSource && mediaSource.readyState === 'open') {
+        try {
+            // Abort any pending operations
+            if (sourceBuffer.updating) {
+                sourceBuffer.abort();
+            }
+            
+            // Remove all buffered data
+            if (sourceBuffer.buffered.length > 0) {
+                const start = sourceBuffer.buffered.start(0);
+                const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+                sourceBuffer.remove(start, end);
+                logDebug(`Cleared buffer data from ${start} to ${end} for track transition`, 'audio');
+            }
+        } catch (e) {
+            logDebug(`Error during track transition cleanup: ${e.message}`, 'audio', true);
+        }
     }
     
-    // Reset the audioLastUpdateTime
-    audioLastUpdateTime = Date.now();
+    // Reset timers and counters
+    lastKnownPosition = 0;
     
-    // Process binary audio data
-    if (event.data instanceof Blob) {
-        // Log binary message size occasionally
-        if (Math.random() < 0.01) { // Log roughly 1% of binary messages
-            logDebug(`Received binary data: ${event.data.size} bytes`, 'ws');
+    // Reinitialize the MediaSource for the new track
+    setTimeout(() => {
+        reinitializeMediaSource();
+    }, 100);
+}
+
+// Reinitialize MediaSource for new track or after error
+function reinitializeMediaSource() {
+    logDebug('Reinitializing MediaSource', 'audio');
+    
+    // Clean up existing MediaSource
+    if (mediaSource) {
+        if (mediaSource.readyState === 'open') {
+            try {
+                mediaSource.endOfStream();
+            } catch (e) {
+                logDebug(`Error ending MediaSource: ${e.message}`, 'audio');
+            }
+        }
+        mediaSource = null;
+    }
+    
+    // Clean up source buffer
+    if (sourceBuffer) {
+        sourceBuffer = null;
+    }
+    
+    // Create new MediaSource
+    try {
+        mediaSource = new MediaSource();
+        logDebug(`Created new MediaSource, readyState: ${mediaSource.readyState}`, 'audio');
+        
+        // Ensure audio element exists
+        if (!audioElement) {
+            audioElement = document.createElement('audio');
+            audioElement.id = 'audio-stream';
+            audioElement.controls = false;
+            audioElement.volume = volumeControl.value;
+            audioElement.muted = isMuted;
+            document.body.appendChild(audioElement);
         }
         
-        // Convert blob to array buffer
-        event.data.arrayBuffer().then(buffer => {
-            // Check for special markers
-            if (buffer.byteLength === 2) {
-                const view = new Uint8Array(buffer);
-                
-                // Track transition marker
-                if (view[0] === 0xFF && view[1] === 0xFE) {
-                    logDebug('Track transition detected', 'ws');
-                    
-                    // CRITICAL: Clear all audio data for clean transition
-                    if (sourceBuffer && mediaSource && mediaSource.readyState === 'open') {
-                        // Clear the queue completely
-                        audioQueue = [];
-                        isProcessingQueue = false;
-                        
-                        try {
-                            // Abort any pending operations
-                            if (sourceBuffer.updating) {
-                                sourceBuffer.abort();
-                            }
-                            
-                            // Remove ALL buffered data to prevent mixing
-                            if (sourceBuffer.buffered.length > 0) {
-                                const start = sourceBuffer.buffered.start(0);
-                                const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-                                sourceBuffer.remove(start, end);
-                                logDebug(`Cleared all buffer data from ${start} to ${end} for track transition`, 'audio');
-                            }
-                            
-                            // Reset MediaSource timing
-                            if (mediaSource.readyState === 'open' && mediaSource.duration !== Infinity) {
-                                mediaSource.duration = Infinity;
-                            }
-                        } catch (e) {
-                            logDebug(`Error during track transition cleanup: ${e.message}`, 'audio', true);
-                        }
-                    }
-                    return;
-                }
-                
-                // Track end marker
-                if (view[0] === 0xFF && view[1] === 0xFF) {
-                    logDebug('Track end marker received', 'ws');
-                    return;
-                }
-            }
-            
-            // Handle empty buffer (track end or flush)
-            if (buffer.byteLength === 0) {
-                logDebug('Empty buffer received (track end or flush)', 'ws');
-                // Don't add empty buffers to the queue
-                return;
-            }
-            
-            // Process normal audio data
-            if (sourceBuffer && mediaSource && mediaSource.readyState === 'open') {
-                // Add to queue
-                audioQueue.push(buffer);
-                
-                // Process queue if not already processing
-                if (!isProcessingQueue && !sourceBuffer.updating) {
-                    processQueue();
-                }
-                
-                // If queue is getting too large, log a warning
-                if (audioQueue.length > 100) {
-                    logDebug(`Warning: Audio queue growing large: ${audioQueue.length} chunks`, 'audio');
-                }
-            } else {
-                if (!mediaSource) {
-                    logDebug('Cannot process audio data - MediaSource not created', 'audio', true);
-                } else if (mediaSource.readyState !== 'open') {
-                    logDebug(`Cannot process audio data - MediaSource readyState: ${mediaSource.readyState}`, 'audio', true);
-                } else if (!sourceBuffer) {
-                    logDebug('Cannot process audio data - SourceBuffer not created', 'audio', true);
-                }
-            }
-        }).catch(e => {
-            logDebug(`Error processing audio data: ${e.message}`, 'audio', true);
-            handleMediaError(e);
-        });
-    } else {
-        // Process text data (likely track info)
-        try {
-            logDebug(`Received text message: ${event.data}`, 'ws');
-            const info = JSON.parse(event.data);
-            logDebug(`Parsed track info: ${JSON.stringify(info)}`, 'track');
-            
-            // Check if this is an error message
-            if (info.error) {
-                logDebug(`Server error: ${info.error}`, 'ws', true);
-                showStatus(`Server error: ${info.error}`, true);
-                return;
-            }
-            
-            // Check if track has changed
-            const newTrackId = info.path;
-            if (currentTrackId !== newTrackId) {
-                logDebug(`Track changed from ${currentTrackId} to ${newTrackId}`, 'track');
-                currentTrackId = newTrackId;
-                lastKnownPosition = 0;
-                
-                // Reset progress bar for new track
-                updateProgressBar(0, info.duration);
-                
-                // Clear any remaining audio in the queue for the new track
-                audioQueue = [];
-                isProcessingQueue = false;
-            }
-            
-            // Update display
-            currentTitle.textContent = info.title || 'Unknown Title';
-            currentArtist.textContent = info.artist || 'Unknown Artist';
-            currentAlbum.textContent = info.album || 'Unknown Album';
-            currentDuration.textContent = formatTime(info.duration);
-            
-            // Store track ID
-            currentTitle.dataset.trackId = info.path;
-            
-            // Update page title
-            document.title = `${info.title} - ${info.artist} | Rust Web Radio`;
-        } catch (e) {
-            // If not valid JSON, just log the text message
-            logDebug(`Received non-JSON text message: ${event.data}`, 'ws');
+        // Create object URL from media source
+        const oldSrc = audioElement.src;
+        if (oldSrc && oldSrc.startsWith('blob:')) {
+            URL.revokeObjectURL(oldSrc);
         }
+        
+        const mediaSourceUrl = URL.createObjectURL(mediaSource);
+        audioElement.src = mediaSourceUrl;
+        
+        // Setup MediaSource event handlers
+        mediaSource.addEventListener('sourceopen', onSourceOpen);
+        mediaSource.addEventListener('sourceended', onSourceEnded);
+        mediaSource.addEventListener('sourceclose', onSourceClose);
+        mediaSource.addEventListener('error', onMediaSourceError);
+        
+        // Clear audio queue
+        audioQueue = [];
+        isProcessingQueue = false;
+        
+    } catch (e) {
+        logDebug(`Error reinitializing MediaSource: ${e.message}`, 'audio', true);
+        handleMediaError(e);
+    }
+}
+
+// Update the onSourceOpen handler to process any pending audio data
+function onSourceOpen() {
+    logDebug(`MediaSource opened, readyState: ${mediaSource.readyState}`, 'audio');
+    
+    try {
+        // Create source buffer for MP3
+        const mimeType = 'audio/mpeg';
+        if (!MediaSource.isTypeSupported(mimeType)) {
+            throw new Error(`Unsupported MIME type: ${mimeType}`);
+        }
+        
+        sourceBuffer = mediaSource.addSourceBuffer(mimeType);
+        logDebug('SourceBuffer created for audio/mpeg', 'audio');
+        
+        // Setup source buffer event handlers
+        sourceBuffer.addEventListener('updateend', function() {
+            processQueue();
+        });
+        
+        sourceBuffer.addEventListener('error', handleSourceBufferError);
+        
+        sourceBuffer.addEventListener('abort', () => {
+            logDebug('SourceBuffer abort event', 'audio');
+        });
+        
+        // Set the mode to sequence if supported
+        if ('mode' in sourceBuffer) {
+            sourceBuffer.mode = 'sequence';
+            logDebug('SourceBuffer mode set to sequence', 'audio');
+        }
+        
+        // Reset audio queue
+        audioQueue = [];
+        isProcessingQueue = false;
+        
+        // Process any pending audio data
+        if (window.pendingAudioData && window.pendingAudioData.length > 0) {
+            logDebug(`Processing ${window.pendingAudioData.length} pending audio chunks`, 'audio');
+            audioQueue = window.pendingAudioData;
+            window.pendingAudioData = [];
+            processQueue();
+        }
+        
+        // Start playback if not already playing
+        if (audioElement.paused) {
+            audioElement.play().catch(e => {
+                logDebug(`Error starting playback: ${e.message}`, 'audio');
+            });
+        }
+        
+    } catch (e) {
+        logDebug(`Error setting up SourceBuffer: ${e.message}`, 'audio', true);
+        handleMediaError(e);
     }
 }
 
