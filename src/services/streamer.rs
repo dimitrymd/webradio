@@ -133,11 +133,17 @@ impl StreamManager {
     }
     
     pub fn start_streaming(&self, track_path: &str) {
-        // First, check if we're already streaming this track
+        // First, check if we're already streaming this track AND it's not ended
         let needs_transition = {
             let inner = self.inner.lock();
-            inner.current_track_path.as_deref() != Some(track_path) || 
-            self.track_ended.load(Ordering::SeqCst)
+            let track_ended = self.track_ended.load(Ordering::SeqCst);
+            let different_track = inner.current_track_path.as_deref() != Some(track_path);
+            
+            // We need to start/restart if:
+            // 1. It's a different track, OR
+            // 2. The current track has ended, OR
+            // 3. We don't have a stream thread running
+            different_track || track_ended || inner.stream_thread.is_none()
         };
         
         if !needs_transition {
@@ -145,13 +151,29 @@ impl StreamManager {
             return;
         }
         
-        // Signal track transition to clients with a clear separator
+        println!("Starting/restarting track: {}", track_path);
+        
+        // CRITICAL: Ensure we only have one thread streaming at a time
+        {
+            let mut inner = self.inner.lock();
+            
+            // If there's an existing thread, we MUST stop it first
+            if inner.stream_thread.is_some() {
+                println!("Cleaning up existing stream thread before starting new one");
+                self.cleanup_stream_thread();
+                
+                // Reacquire the lock after cleanup
+                inner = self.inner.lock();
+            }
+        }
+        
+        // Signal track transition to clients
         if self.is_streaming.load(Ordering::SeqCst) {
             // Send track transition marker
             let transition_marker = vec![0xFF, 0xFE]; // Special marker for track change
             let _ = self.broadcast_tx.send(transition_marker);
             
-            // Send a few empty chunks to ensure buffer is flushed
+            // Send multiple empty chunks to ensure buffer is flushed
             for _ in 0..5 {
                 let _ = self.broadcast_tx.send(vec![]);
             }
@@ -160,21 +182,20 @@ impl StreamManager {
             thread::sleep(Duration::from_millis(200));
         }
         
-        // Now reset all flags properly
+        // Now reset all flags properly - this is critical
         self.is_streaming.store(true, Ordering::SeqCst);
         self.track_ended.store(false, Ordering::SeqCst);
         
-        println!("Start streaming - reset streaming flags to correct state");
+        println!("Reset streaming flags - streaming={}, track_ended={}", 
+                self.is_streaming.load(Ordering::SeqCst),
+                self.track_ended.load(Ordering::SeqCst));
         
         // Now acquire the mutex for the actual work
         let mut inner = self.inner.lock();
         
         info!("Starting to stream track: {}", track_path);
         
-        // Clean up existing stream thread if any
-        self.cleanup_stream_thread(&mut inner);
-        
-        // CRITICAL: Clear ALL buffers for the new track - ensure clean start
+        // Clear ALL buffers for the new track - ensure clean start
         inner.buffer.clear();
         inner.chunk_times.clear();
         inner.playback_position = 0;
@@ -186,7 +207,7 @@ impl StreamManager {
         // Force drop and recreate the saved_chunks to ensure it's completely empty
         inner.saved_chunks = VecDeque::with_capacity(MAX_RECENT_CHUNKS_FOR_LIVE);
         
-        debug!("Cleared all buffers for new track - ensured no audio mixing");
+        debug!("Cleared all buffers for track: {}", track_path);
         
         // Set the current track path
         inner.current_track_path = Some(track_path.to_string());
@@ -197,7 +218,8 @@ impl StreamManager {
             &crate::config::MUSIC_FOLDER
         ) {
             if let Ok(track_json) = serde_json::to_string(&track) {
-                inner.current_track_info = Some(track_json);
+                inner.current_track_info = Some(track_json.clone());
+                println!("Set track info JSON: {}", track_json);
             }
         }
         
@@ -216,28 +238,42 @@ impl StreamManager {
         let thread_id = THREAD_COUNTER.fetch_add(1, Ordering::SeqCst);
         
         println!("Creating new stream thread {} for track: {}", thread_id, track_path);
+        println!("About to spawn thread with track_ended={}", track_ended.load(Ordering::SeqCst));
         
         // Create new thread for streaming
         let track_path_clone = track_path.clone();
         let thread_handle = thread::spawn(move || {
             println!("Stream thread {} started for: {}", thread_id, track_path_clone);
+            println!("Thread {} checking track_ended flag: {}", thread_id, track_ended.load(Ordering::SeqCst));
             Self::buffer_track(thread_id, inner_clone, broadcast_tx, is_streaming, track_ended, &music_folder, &track_path_clone, chunk_size);
             println!("Stream thread {} finished for: {}", thread_id, track_path_clone);
         });
         
         inner.stream_thread = Some(thread_handle);
+        
+        // Reset last buffer update time to current to avoid immediate stall detection
+        inner.last_buffer_update = Instant::now();
+        
+        println!("Successfully set up streaming thread {} for: {}", thread_id, track_path);
+        println!("Thread handle is Some: {}", inner.stream_thread.is_some());
     }
     
-    fn cleanup_stream_thread(&self, inner: &mut StreamManagerInner) {
-        // Store thread locally, drop lock completely when joining
-        if let Some(thread) = inner.stream_thread.take() {
+    fn cleanup_stream_thread(&self) -> bool {
+        println!("cleanup_stream_thread called");
+        
+        // First, get the thread from the inner structure
+        let thread_to_join = {
+            let mut inner = self.inner.lock();
+            inner.stream_thread.take()
+        };
+        
+        // Now handle the thread outside of any locks
+        if let Some(thread) = thread_to_join {
             info!("Stopping existing stream thread");
+            println!("Found thread to stop");
             
             // Signal the thread to stop by setting a flag
             self.track_ended.store(true, Ordering::SeqCst);
-            
-            // Drop the inner lock completely before operations that might block
-            std::mem::drop(inner);
             
             // Force the thread to wake up if it's sleeping
             let _ = self.broadcast_tx.send(vec![0xFF, 0xFD]); // Stop marker
@@ -250,11 +286,18 @@ impl StreamManager {
             match thread.join() {
                 Ok(_) => {
                     info!("Stream thread joined successfully");
+                    println!("Thread joined successfully");
+                    true
                 }
                 Err(e) => {
                     error!("Error joining stream thread: {:?}", e);
+                    println!("Error joining thread: {:?}", e);
+                    false
                 }
             }
+        } else {
+            println!("No thread to cleanup");
+            true
         }
     }
     
@@ -272,6 +315,9 @@ impl StreamManager {
         let start_time = std::time::Instant::now();
         
         println!("Thread {}: Buffer track starting for: {}", thread_id, file_path.display());
+        println!("Thread {}: Music folder: {}", thread_id, music_folder.display());
+        println!("Thread {}: Track path: {}", thread_id, track_path);
+        println!("Thread {}: Full file path: {}", thread_id, file_path.display());
         
         // Check if we should even start - might have been signaled to stop
         if track_ended.load(Ordering::SeqCst) {
@@ -281,6 +327,7 @@ impl StreamManager {
         
         if !file_path.exists() {
             println!("Thread {}: ERROR: File not found: {}", thread_id, file_path.display());
+            println!("Thread {}: Current directory: {:?}", thread_id, std::env::current_dir());
             track_ended.store(true, Ordering::SeqCst);
             return;
         }
@@ -933,7 +980,27 @@ impl StreamManager {
     // Check for stalled streams
     pub fn is_stream_stalled(&self) -> bool {
         if let Some(inner) = self.inner.try_lock() {
-            inner.last_buffer_update.elapsed() > Duration::from_secs(10) && self.is_streaming.load(Ordering::SeqCst)
+            // Stream is stalled if:
+            // 1. We should be streaming but the track has ended unexpectedly
+            // 2. The buffer hasn't been updated in a while
+            // 3. We don't have a stream thread
+            let track_ended = self.track_ended.load(Ordering::SeqCst);
+            let is_streaming = self.is_streaming.load(Ordering::SeqCst);
+            let no_thread = inner.stream_thread.is_none();
+            let buffer_stale = inner.last_buffer_update.elapsed() > Duration::from_secs(10);
+            
+            // If we're supposed to be streaming but have no thread, it's stalled
+            if is_streaming && no_thread {
+                return true;
+            }
+            
+            // If the track ended and buffer is stale, it's stalled
+            if track_ended && buffer_stale {
+                return true;
+            }
+            
+            // If buffer hasn't been updated in a while and we're streaming
+            buffer_stale && is_streaming
         } else {
             false
         }

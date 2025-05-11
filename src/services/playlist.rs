@@ -335,6 +335,9 @@ pub fn track_switcher(stream_manager: StreamManager) {
                         // Start streaming the new track
                         stream_manager.start_streaming(&next_track.path);
                         
+                        // Wait a moment to ensure the stream actually starts
+                        thread::sleep(Duration::from_millis(500));
+                        
                         // Update tracking variables
                         prev_track_path = next_track.path.clone();
                         playback_start_time = std::time::Instant::now();
@@ -349,6 +352,7 @@ pub fn track_switcher(stream_manager: StreamManager) {
                             println!("Emergency recovery successful");
                             stream_manager.reset_track_ended_flag();
                             stream_manager.start_streaming(&track.path);
+                            thread::sleep(Duration::from_millis(500));
                             prev_track_path = track.path.clone();
                             playback_start_time = std::time::Instant::now();
                             last_log_time = std::time::Instant::now();
