@@ -258,7 +258,7 @@ pub fn rescan_and_update_durations(playlist_file: &Path, music_folder: &Path) {
     println!("Playlist updated and saved");
 }
 
-// Fixed track_switcher function with improved synchronization
+// Fixed track_switcher function with proper access to StreamManager
 pub fn track_switcher(stream_manager: StreamManager) {
     // The broadcast thread now handles all track switching internally
     // This function is now just a monitoring function
@@ -272,6 +272,7 @@ pub fn track_switcher(stream_manager: StreamManager) {
         
         // Just monitor and log status
         if last_log_time.elapsed().as_secs() >= 10 {
+            // Get a reference to the StreamManager
             let active_listeners = stream_manager.get_active_listeners();
             let is_streaming = stream_manager.is_streaming();
             let playback_position = stream_manager.get_playback_position();

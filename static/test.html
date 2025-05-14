@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Web Radio Diagnostic</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        .panel { background: #f5f5f5; border: 1px solid #ddd; padding: 15px; margin-bottom: 20px; border-radius: 5px; }
+        .success { color: green; }
+        .error { color: red; }
+        .button { background: #4a90e2; color: white; border: none; padding: 10px 15px; cursor: pointer; margin-right: 10px; }
+        #log { height: 200px; overflow-y: auto; background: #f0f0f0; padding: 10px; font-family: monospace; }
+    </style>
+</head>
+<body>
+    <h1>Web Radio Diagnostic Tool</h1>
+    
+    <div class="panel">
+        <h2>API Tests</h2>
+        <button class="button" id="test-now-playing">Test Now Playing API</button>
+        <button class="button" id="test-stats">Test Stats API</button>
+        <div id="api-result"></div>
+    </div>
+    
+    <div class="panel">
+        <h2>WebSocket Test</h2>
+        <button class="button" id="test-ws">Test WebSocket Connection</button>
+        <div id="ws-result"></div>
+    </div>
+    
+    <div class="panel">
+        <h2>Log</h2>
+        <div id="log"></div>
+    </div>
+    
+    <script>
+        function log(message, isError = false) {
+            const logEl = document.getElementById('log');
+            const entry = document.createElement('div');
+            entry.className = isError ? 'error' : '';
+            entry.textContent = new Date().toLocaleTimeString() + ': ' + message;
+            logEl.insertBefore(entry, logEl.firstChild);
+        }
+        
+        document.getElementById('test-now-playing').addEventListener('click', async () => {
+            try {
+                log('Testing /api/now-playing endpoint...');
+                const response = await fetch('/api/now-playing');
+                const data = await response.json();
+                log('API response: ' + JSON.stringify(data));
+                
+                const resultEl = document.getElementById('api-result');
+                resultEl.innerHTML = '<div class="success">Now Playing API working!</div>';
+                resultEl.innerHTML += '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
+            } catch (error) {
+                log('Error testing Now Playing API: ' + error.message, true);
+                document.getElementById('api-result').innerHTML = 
+                    '<div class="error">Error: ' + error.message + '</div>';
+            }
+        });
+        
+        document.getElementById('test-stats').addEventListener('click', async () => {
+            try {
+                log('Testing /api/stats endpoint...');
+                const response = await fetch('/api/stats');
+                const data = await response.json();
+                log('Stats response: ' + JSON.stringify(data));
+                
+                const resultEl = document.getElementById('api-result');
+                resultEl.innerHTML = '<div class="success">Stats API working!</div>';
+                resultEl.innerHTML += '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
+            } catch (error) {
+                log('Error testing Stats API: ' + error.message, true);
+                document.getElementById('api-result').innerHTML = 
+                    '<div class="error">Error: ' + error.message + '</div>';
+            }
+        });
+        
+        document.getElementById('test-ws').addEventListener('click', () => {
+            log('Testing WebSocket connection...');
+            const wsResult = document.getElementById('ws-result');
+            wsResult.innerHTML = '<div>Connecting...</div>';
+            
+            try {
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = `${protocol}//${window.location.host}/stream`;
+                
+                log('Connecting to: ' + wsUrl);
+                const ws = new WebSocket(wsUrl);
+                
+                ws.onopen = () => {
+                    log('WebSocket connection established!');
+                    wsResult.innerHTML = '<div class="success">WebSocket connected successfully!</div>';
+                };
+                
+                ws.onmessage = (event) => {
+                    if (event.data instanceof Blob) {
+                        log('Received binary data: ' + event.data.size + ' bytes');
+                    } else {
+                        log('Received text message: ' + event.data);
+                        try {
+                            const json = JSON.parse(event.data);
+                            wsResult.innerHTML += '<pre>' + JSON.stringify(json, null, 2) + '</pre>';
+                        } catch (e) {
+                            // Not JSON
+                        }
+                    }
+                };
+                
+                ws.onerror = (error) => {
+                    log('WebSocket error: ' + error, true);
+                    wsResult.innerHTML = '<div class="error">WebSocket error</div>';
+                };
+                
+                ws.onclose = (event) => {
+                    log('WebSocket closed: Code ' + event.code);
+                    wsResult.innerHTML += '<div>Connection closed (code ' + event.code + ')</div>';
+                };
+                
+                // Close the connection after 10 seconds
+                setTimeout(() => {
+                    if (ws.readyState === WebSocket.OPEN) {
+                        log('Closing WebSocket after 10s test');
+                        ws.close();
+                    }
+                }, 10000);
+                
+            } catch (error) {
+                log('Error creating WebSocket: ' + error.message, true);
+                wsResult.innerHTML = '<div class="error">Error: ' + error.message + '</div>';
+            }
+        });
+        
+        log('Diagnostic tool loaded');
+    </script>
+</body>
+</html>

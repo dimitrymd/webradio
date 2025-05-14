@@ -56,54 +56,40 @@ struct StreamManagerInner {
     should_stop: Arc<AtomicBool>,
 }
 
+// Complete StreamManager implementation with all required methods
 impl StreamManager {
-    pub fn new(music_folder: &Path, chunk_size: usize, _buffer_size: usize, _cache_time: u64) -> Self {
-        info!("Initializing StreamManager with single broadcast thread architecture");
+    pub fn new(music_folder: &Path, _chunk_size: usize, _buffer_size: usize, _cache_time: u64) -> Self {
+        info!("Initializing StreamManager");
         
-        let (broadcast_tx, _) = broadcast::channel(200);
+        // Larger buffer for smoother streaming
+        let (broadcast_tx, _) = broadcast::channel(1000);
         let should_stop = Arc::new(AtomicBool::new(false));
         
         let inner = StreamManagerInner {
             music_folder: music_folder.to_path_buf(),
-            chunk_size,
             current_track_path: None,
             current_track_info: None,
             playback_position: 0,
             track_start_time: Instant::now(),
             id3_header: None,
             broadcast_tx: broadcast_tx.clone(),
-            saved_chunks: VecDeque::with_capacity(MAX_RECENT_CHUNKS_FOR_LIVE),
-            max_saved_chunks: MAX_RECENT_CHUNKS_FOR_LIVE,
+            saved_chunks: VecDeque::with_capacity(MAX_RECENT_CHUNKS),
             broadcast_thread: None,
             should_stop: should_stop.clone(),
         };
         
-        let manager = Self {
+        Self {
             inner: Arc::new(Mutex::new(inner)),
             broadcast_tx: Arc::new(broadcast_tx),
             active_listeners: Arc::new(AtomicUsize::new(0)),
             is_streaming: Arc::new(AtomicBool::new(false)),
             track_ended: Arc::new(AtomicBool::new(false)),
-        };
-        
-        // Don't start the thread here - let the main function do it after ensuring tracks exist
-        
-        manager
-    }
-
-    pub fn get_current_track(&self) -> Option<crate::models::playlist::Track> {
-        let inner = self.inner.lock();
-        if let Some(track_json) = &inner.current_track_info {
-            serde_json::from_str(track_json).ok()
-        } else {
-            None
         }
     }
     
     pub fn start_broadcast_thread(&self) {
         let mut inner = self.inner.lock();
         
-        // Make sure we don't already have a broadcast thread
         if inner.broadcast_thread.is_some() {
             warn!("Broadcast thread already exists");
             return;
@@ -115,7 +101,7 @@ impl StreamManager {
         let track_ended = self.track_ended.clone();
         let should_stop = inner.should_stop.clone();
         
-        info!("Starting single broadcast thread");
+        info!("Starting broadcast thread");
         
         let thread_handle = thread::spawn(move || {
             Self::broadcast_thread_loop(
@@ -141,68 +127,49 @@ impl StreamManager {
         info!("Broadcast thread started");
         is_streaming.store(true, Ordering::SeqCst);
         
-        let mut last_track_path: Option<String> = None;
+        let mut current_track_index: Option<usize> = None;
         
         while !should_stop.load(Ordering::SeqCst) {
-            // Get the current track to play
-            let track = match crate::services::playlist::get_current_track(
-                &crate::config::PLAYLIST_FILE,
-                &crate::config::MUSIC_FOLDER,
-            ) {
+            // Get current playlist state
+            let playlist = crate::services::playlist::get_playlist(&crate::config::PLAYLIST_FILE);
+            
+            // Determine which track to play
+            let track_to_play = if let Some(index) = current_track_index {
+                // We have a known index, use it
+                playlist.tracks.get(index).cloned()
+            } else {
+                // First time or reset, use playlist's current track
+                let index = playlist.current_track;
+                current_track_index = Some(index);
+                playlist.tracks.get(index).cloned()
+            };
+            
+            let track = match track_to_play {
                 Some(track) => track,
                 None => {
-                    warn!("No tracks available, waiting...");
+                    warn!("No track at index {:?}", current_track_index);
                     thread::sleep(Duration::from_secs(1));
-                    // Try to scan for new tracks
-                    crate::services::playlist::scan_music_folder(
-                        &crate::config::MUSIC_FOLDER,
-                        &crate::config::PLAYLIST_FILE,
-                    );
                     continue;
                 }
             };
             
-            // Check if we're about to play the same track again
-            if let Some(ref last_path) = last_track_path {
-                if last_path == &track.path {
-                    warn!("Detected same track about to play again: {}. Forcing advance.", track.path);
-                    // Force advance to next track
-                    if let Some(next_track) = crate::services::playlist::advance_track(
-                        &crate::config::PLAYLIST_FILE,
-                        &crate::config::MUSIC_FOLDER,
-                    ) {
-                        info!("Advanced to next track: {}", next_track.path);
-                        continue; // Go back to the beginning of the loop to play the new track
-                    } else {
-                        warn!("No next track available, continuing with current");
-                    }
-                }
-            }
-            
             let track_path = music_folder.join(&track.path);
-            info!("Starting to broadcast track: {} ({})", track.title, track_path.display());
+            info!("Broadcasting track {}: {} by {}", 
+                 current_track_index.unwrap_or(0), track.title, track.artist);
             
-            // Update current track info
+            // Update track info
             {
                 let mut inner_lock = inner.lock();
                 inner_lock.current_track_path = Some(track.path.clone());
                 inner_lock.track_start_time = Instant::now();
                 inner_lock.playback_position = 0;
+                inner_lock.saved_chunks.clear(); // Clear old chunks
                 
-                // Prepare track info JSON
                 if let Ok(track_json) = serde_json::to_string(&track) {
                     inner_lock.current_track_info = Some(track_json.clone());
-                    
-                    // Send track info
                     let _ = inner_lock.broadcast_tx.send(track_json.into_bytes());
                 }
-                
-                // Clear saved chunks for new track
-                inner_lock.saved_chunks.clear();
             }
-            
-            // Remember what track we're playing
-            last_track_path = Some(track.path.clone());
             
             // Reset track ended flag
             track_ended.store(false, Ordering::SeqCst);
@@ -217,53 +184,51 @@ impl StreamManager {
                 should_stop.clone(),
             );
             
-            // Track has ended, send transition marker
+            // Track has ended
             if !should_stop.load(Ordering::SeqCst) {
-                info!("Track {} finished, preparing transition", track.title);
+                info!("Track {} finished", track.title);
                 
-                let transition_marker = vec![0xFF, 0xFE];
+                // Send transition marker
                 if let Some(mut inner_lock) = inner.try_lock() {
-                    let _ = inner_lock.broadcast_tx.send(transition_marker);
+                    let _ = inner_lock.broadcast_tx.send(vec![0xFF, 0xFE]);
+                    // Clear buffer to ensure clean transition
+                    inner_lock.saved_chunks.clear();
                 }
                 
-                // Small delay before moving to next track
+                // Move to next track
+                if let Some(index) = current_track_index {
+                    let next_index = (index + 1) % playlist.tracks.len();
+                    current_track_index = Some(next_index);
+                    info!("Moving to track index: {}", next_index);
+                    
+                    // Update playlist file to reflect current position
+                    let mut new_playlist = playlist.clone();
+                    new_playlist.current_track = next_index;
+                    crate::services::playlist::save_playlist(
+                        &new_playlist, 
+                        &crate::config::PLAYLIST_FILE
+                    );
+                }
+                
+                // Brief pause between tracks
                 thread::sleep(Duration::from_millis(500));
-                
-                // Advance to next track BEFORE the loop continues
-                match crate::services::playlist::advance_track(
-                    &crate::config::PLAYLIST_FILE,
-                    &crate::config::MUSIC_FOLDER,
-                ) {
-                    Some(next_track) => {
-                        info!("Advanced playlist to: {} by {}", next_track.title, next_track.artist);
-                        // Clear the track ended flag
-                        track_ended.store(false, Ordering::SeqCst);
-                    },
-                    None => {
-                        error!("Failed to advance to next track");
-                        // Try rescanning
-                        crate::services::playlist::scan_music_folder(
-                            &crate::config::MUSIC_FOLDER,
-                            &crate::config::PLAYLIST_FILE,
-                        );
-                    }
-                }
             }
         }
         
         info!("Broadcast thread ending");
-    }    
+    }
     
+    // IMPORTANT: Fix the syntax by adding 'fn' keyword
     fn broadcast_single_track(
         inner: &Arc<Mutex<StreamManagerInner>>,
         file_path: &Path,
         track: &crate::models::playlist::Track,
-        is_streaming: Arc<AtomicBool>,
+        _is_streaming: Arc<AtomicBool>,
         track_ended: Arc<AtomicBool>,
         should_stop: Arc<AtomicBool>,
     ) {
         let track_start = Instant::now();
-        info!("Broadcasting single track: {} (duration: {}s)", track.title, track.duration);
+        info!("Broadcasting: {} ({}s)", track.title, track.duration);
         
         let mut file = match File::open(file_path) {
             Ok(f) => f,
@@ -274,8 +239,8 @@ impl StreamManager {
             }
         };
         
-        // Extract and broadcast ID3 header
-        let mut id3_buffer = vec![0; 16384];
+        // Read and send ID3 header
+        let mut id3_buffer = vec![0; 4096];
         match file.read(&mut id3_buffer) {
             Ok(n) if n > 0 => {
                 let id3_data = id3_buffer[..n].to_vec();
@@ -283,14 +248,10 @@ impl StreamManager {
                 if let Some(mut inner_lock) = inner.try_lock() {
                     inner_lock.id3_header = Some(id3_data.clone());
                     let _ = inner_lock.broadcast_tx.send(id3_data);
+                    inner_lock.saved_chunks.push_back(vec![]); // Separator
                 }
                 
-                // Reset file position
-                if let Err(e) = file.seek(SeekFrom::Start(0)) {
-                    error!("Failed to seek to start: {}", e);
-                    track_ended.store(true, Ordering::SeqCst);
-                    return;
-                }
+                let _ = file.seek(SeekFrom::Start(0));
             },
             _ => {
                 error!("Failed to read ID3 header");
@@ -299,186 +260,127 @@ impl StreamManager {
             }
         }
         
-        // Better bitrate calculation
+        // Calculate streaming parameters
         let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-        let duration = track.duration;
-        let bitrate = if duration > 0 && file_size > 0 {
-            (file_size * 8) / duration
+        let bitrate = if track.duration > 0 && file_size > 0 {
+            (file_size * 8) / track.duration
         } else {
-            128000 // Default to 128kbps
+            128000
         };
         
+        // Adaptive timing based on bitrate
         let bytes_per_second = bitrate / 8;
-        let chunk_delay = Duration::from_millis(
-            ((BROADCAST_CHUNK_SIZE as f64 / bytes_per_second as f64) * 1000.0) as u64
-        ).max(Duration::from_millis(BROADCAST_RATE_LIMITER_MS));
+        let chunk_duration_ms = (BROADCAST_CHUNK_SIZE as f64 * 1000.0) / bytes_per_second as f64;
+        let target_delay = Duration::from_millis(chunk_duration_ms as u64);
         
-        info!("Streaming {} at {}kbps, chunk delay: {}ms", 
-             track.title, bitrate / 1000, chunk_delay.as_millis());
+        info!("Bitrate: {}kbps, chunk delay: {}ms", bitrate/1000, target_delay.as_millis());
         
-        // Stream the track
+        // Create initial buffer
         let mut buffer = vec![0; BROADCAST_CHUNK_SIZE];
-        let mut total_bytes_read = 0;
+        let mut chunk_buffer: VecDeque<Vec<u8>> = VecDeque::with_capacity(BROADCAST_BUFFER_SIZE);
+        let mut bytes_read_total = 0;
         let mut chunks_sent = 0;
-        let mut last_chunk_time = Instant::now();
         
-        loop {
-            // Check if we should stop
-            if should_stop.load(Ordering::SeqCst) || track_ended.load(Ordering::SeqCst) {
-                break;
-            }
-            
-            // Read chunk
+        // Fill initial buffer
+        info!("Pre-buffering {} chunks...", MIN_BUFFER_CHUNKS);
+        while chunk_buffer.len() < MIN_BUFFER_CHUNKS {
             match file.read(&mut buffer) {
-                Ok(0) => {
-                    // End of file
-                    info!("Reached end of file for track: {}", track.title);
-                    break;
-                },
+                Ok(0) => break, // EOF
                 Ok(n) => {
-                    let chunk = buffer[..n].to_vec();
-                    total_bytes_read += n as u64;
-                    
-                    // Broadcast chunk
-                    if let Some(mut inner_lock) = inner.try_lock() {
-                        // Update playback position based on actual elapsed time
-                        let elapsed = track_start.elapsed().as_secs();
-                        inner_lock.playback_position = elapsed;
-                        
-                        // Save chunk for new clients
-                        inner_lock.saved_chunks.push_back(chunk.clone());
-                        while inner_lock.saved_chunks.len() > inner_lock.max_saved_chunks {
-                            inner_lock.saved_chunks.pop_front();
-                        }
-                        
-                        // Broadcast
-                        let _ = inner_lock.broadcast_tx.send(chunk);
-                        
-                        // Log progress
-                        if chunks_sent % 100 == 0 {
-                            info!("Track {}: Sent {} chunks, position {}s of {}s", 
-                                  track.title, chunks_sent, elapsed, track.duration);
-                        }
-                    }
-                    
-                    chunks_sent += 1;
-                    
-                    // Rate limiting
-                    let elapsed_since_last = last_chunk_time.elapsed();
-                    if elapsed_since_last < chunk_delay {
-                        thread::sleep(chunk_delay - elapsed_since_last);
-                    }
-                    last_chunk_time = Instant::now();
+                    chunk_buffer.push_back(buffer[..n].to_vec());
+                    bytes_read_total += n;
                 },
                 Err(e) => {
-                    error!("Error reading file: {}", e);
+                    error!("Error during pre-buffering: {}", e);
                     break;
                 }
             }
         }
         
-        // Wait for track duration to complete if we finished early
-        let elapsed = track_start.elapsed().as_secs();
-        if duration > 0 && elapsed < duration {
-            let wait_time = duration - elapsed;
-            info!("Track {} finished early. Waiting {}s to complete duration", 
-                 track.title, wait_time);
-            
-            // Update position during wait
-            let wait_start = Instant::now();
-            while wait_start.elapsed().as_secs() < wait_time && 
-                  !should_stop.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_secs(1));
-                
-                // Update position
-                if let Some(mut inner_lock) = inner.try_lock() {
-                    let total_elapsed = track_start.elapsed().as_secs();
-                    inner_lock.playback_position = total_elapsed;
+        let mut last_send_time = Instant::now();
+        let mut file_finished = false;
+        
+        // Main streaming loop
+        while !should_stop.load(Ordering::SeqCst) && !track_ended.load(Ordering::SeqCst) {
+            // Keep buffer filled
+            while chunk_buffer.len() < BROADCAST_BUFFER_SIZE && !file_finished {
+                match file.read(&mut buffer) {
+                    Ok(0) => {
+                        file_finished = true;
+                        break;
+                    },
+                    Ok(n) => {
+                        chunk_buffer.push_back(buffer[..n].to_vec());
+                        bytes_read_total += n;
+                    },
+                    Err(e) => {
+                        error!("Error reading file: {}", e);
+                        file_finished = true;
+                        break;
+                    }
                 }
+            }
+            
+            // Send chunk if available
+            if let Some(chunk) = chunk_buffer.pop_front() {
+                if let Some(mut inner_lock) = inner.try_lock() {
+                    let elapsed = track_start.elapsed().as_secs();
+                    inner_lock.playback_position = elapsed;
+                    
+                    // Save for late joiners
+                    inner_lock.saved_chunks.push_back(chunk.clone());
+                    while inner_lock.saved_chunks.len() > MAX_RECENT_CHUNKS {
+                        inner_lock.saved_chunks.pop_front();
+                    }
+                    
+                    // Broadcast
+                    let _ = inner_lock.broadcast_tx.send(chunk);
+                    
+                    if chunks_sent % 100 == 0 {
+                        info!("Sent {} chunks, buffer: {}, pos: {}s", 
+                              chunks_sent, chunk_buffer.len(), elapsed);
+                    }
+                }
+                
+                chunks_sent += 1;
+                
+                // Adaptive timing
+                let elapsed_since_last = last_send_time.elapsed();
+                if elapsed_since_last < target_delay {
+                    thread::sleep(target_delay - elapsed_since_last);
+                }
+                last_send_time = Instant::now();
+            } else if file_finished {
+                // No more data
+                break;
+            } else {
+                // Buffer underrun - wait a bit
+                warn!("Buffer underrun, waiting...");
+                thread::sleep(Duration::from_millis(100));
             }
         }
         
-        info!("Track {} completed after {}s", track.title, track_start.elapsed().as_secs());
+        // Ensure track plays for full duration
+        let elapsed = track_start.elapsed().as_secs();
+        if track.duration > 0 && elapsed < track.duration {
+            let wait_time = track.duration - elapsed;
+            info!("Waiting {}s to complete track duration", wait_time);
+            thread::sleep(Duration::from_secs(wait_time));
+        }
         
-        // Mark track as ended
+        info!("Track {} finished after {}s", track.title, track_start.elapsed().as_secs());
         track_ended.store(true, Ordering::SeqCst);
         
-        // Send track end marker
+        // Send end marker
         if let Some(mut inner_lock) = inner.try_lock() {
             let _ = inner_lock.broadcast_tx.send(vec![0xFF, 0xFF]);
         }
     }
-
-    // Helper function to detect actual MP3 bitrate
-    pub fn detect_mp3_bitrate(file: &mut File) -> Option<u64> {
-        let mut buffer = vec![0; 8192];
-        if let Ok(n) = file.read(&mut buffer) {
-            // Simple MP3 frame detection
-            for i in 0..n.saturating_sub(4) {
-                if buffer[i] == 0xFF && (buffer[i + 1] & 0xE0) == 0xE0 {
-                    // Found potential frame sync
-                    let header = ((buffer[i + 1] as u32) << 16) | 
-                                ((buffer[i + 2] as u32) << 8) | 
-                                (buffer[i + 3] as u32);
-                    
-                    let bitrate_index = (header >> 12) & 0x0F;
-                    let version = (header >> 19) & 0x03;
-                    let layer = (header >> 17) & 0x03;
-                    
-                    // MPEG1 Layer 3 bitrates
-                    if version == 3 && layer == 1 {
-                        let bitrates = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
-                        if (bitrate_index as usize) < bitrates.len() {
-                            return Some(bitrates[bitrate_index as usize] as u64 * 1000);
-                        }
-                    }
-                }
-            }
-        }
-        None
-    }
     
-    // Helper function to calculate adaptive chunk delay
-    pub fn calculate_chunk_delay(chunk_size: usize, bitrate: u64) -> Duration {
-        let bytes_per_second = bitrate / 8;
-        let seconds_per_chunk = chunk_size as f64 / bytes_per_second as f64;
-        let ms_per_chunk = (seconds_per_chunk * 1000.0) as u64;
-        
-        // Add a small buffer to prevent underrun
-        let buffered_ms = ms_per_chunk + 5;
-        
-        Duration::from_millis(buffered_ms.max(BROADCAST_RATE_LIMITER_MS))
-    }
+    // These methods are referenced in handlers.rs but missing from implementation
+    // Add them here
     
-    // Simplified public interface
-    pub fn start_streaming(&self, track_path: &str) {
-        // The broadcast thread handles everything internally
-        // This method is now just for compatibility
-        info!("Start streaming requested for: {} (handled by broadcast thread)", track_path);
-    }
-    
-    pub fn prepare_for_track_switch(&self) {
-        // The broadcast thread handles transitions internally
-        info!("Track switch preparation (handled by broadcast thread)");
-    }
-    
-    pub fn stop_broadcasting(&self) {
-        info!("Stopping broadcast explicitly");
-        
-        self.inner.lock().should_stop.store(true, Ordering::SeqCst);
-        self.is_streaming.store(false, Ordering::SeqCst);
-        
-        let thread = {
-            let mut inner = self.inner.lock();
-            inner.broadcast_thread.take()
-        };
-        
-        if let Some(thread) = thread {
-            let _ = thread.join();
-        }
-    }
-    
-    // All the other public methods remain the same
+    // Connection management
     pub fn get_broadcast_receiver(&self) -> broadcast::Receiver<Vec<u8>> {
         self.broadcast_tx.subscribe()
     }
@@ -499,47 +401,15 @@ impl StreamManager {
     }
     
     pub fn increment_listener_count(&self) {
-        let prev_count = self.active_listeners.load(Ordering::SeqCst);
         let new_count = self.active_listeners.fetch_add(1, Ordering::SeqCst) + 1;
-        
-        // Sanity check
-        if new_count > 1000 {
-            warn!("Suspicious listener count: {} (was {})", new_count, prev_count);
-        }
-        
-        info!("Listener connected. Active listeners: {} -> {}", prev_count, new_count);
+        info!("Listener connected. Active: {}", new_count);
     }
     
     pub fn decrement_listener_count(&self) {
-        let prev_count = self.active_listeners.load(Ordering::SeqCst);
-        
-        // Prevent underflow
-        if prev_count == 0 {
-            warn!("Attempted to decrement listener count below 0");
-            return;
-        }
-        
-        let new_count = self.active_listeners.fetch_sub(1, Ordering::SeqCst) - 1;
-        info!("Listener disconnected. Active listeners: {} -> {}", prev_count, new_count);
-    }
-    
-    // Add a method to check and fix listener count
-    pub fn validate_listener_count(&self) {
-        let current = self.active_listeners.load(Ordering::SeqCst);
-        let receiver_count = self.broadcast_tx.receiver_count();
-        
-        if current != receiver_count {
-            warn!("Listener count mismatch: {} vs {} receivers. Correcting...", 
-                  current, receiver_count);
-            self.active_listeners.store(receiver_count, Ordering::SeqCst);
-        }
-    }
-    
-    // Add a method to reset listener count
-    pub fn reset_listener_count(&self) {
-        let old_count = self.active_listeners.swap(0, Ordering::SeqCst);
-        if old_count != 0 {
-            warn!("Reset listener count from {} to 0", old_count);
+        let prev = self.active_listeners.load(Ordering::SeqCst);
+        if prev > 0 {
+            let new_count = self.active_listeners.fetch_sub(1, Ordering::SeqCst) - 1;
+            info!("Listener disconnected. Active: {}", new_count);
         }
     }
     
@@ -559,37 +429,29 @@ impl StreamManager {
         self
     }
     
-    pub fn get_current_track_path(&self) -> Option<String> {
-        self.inner.lock().current_track_path.clone()
+    pub fn stop_broadcasting(&self) {
+        info!("Stopping broadcast");
+        
+        self.inner.lock().should_stop.store(true, Ordering::SeqCst);
+        self.is_streaming.store(false, Ordering::SeqCst);
+        
+        let thread = {
+            let mut inner = self.inner.lock();
+            inner.broadcast_thread.take()
+        };
+        
+        if let Some(thread) = thread {
+            let _ = thread.join();
+        }
     }
     
-    pub fn is_stream_stalled(&self) -> bool {
-        // With single thread design, stream is less likely to stall
-        false
-    }
-    
-    pub fn reset_track_ended_flag(&self) {
-        self.track_ended.store(false, Ordering::SeqCst);
-    }
-    
+    // Add the missing methods that caused the compilation errors
     pub fn get_receiver_count(&self) -> usize {
         self.broadcast_tx.receiver_count()
     }
     
     pub fn get_saved_chunks_count(&self) -> usize {
         self.inner.lock().saved_chunks.len()
-    }
-
-    pub fn refresh_track_info(&self) {
-        if let Some(track) = crate::services::playlist::get_current_track(
-            &crate::config::PLAYLIST_FILE,
-            &crate::config::MUSIC_FOLDER,
-        ) {
-            if let Ok(track_json) = serde_json::to_string(&track) {
-                let mut inner = self.inner.lock();
-                inner.current_track_info = Some(track_json);
-            }
-        }
     }
 }
 
