@@ -1,4 +1,4 @@
-// player.js with improved connection stability and resilience
+// player.js - Part 1: Initialization and Setup
 
 // Elements
 const startBtn = document.getElementById('start-btn');
@@ -24,11 +24,11 @@ let audioQueue = [];
 let isPlaying = false;
 let isMuted = false;
 let reconnectAttempts = 0;
-let maxReconnectAttempts = 10; // Increased max attempts
+let maxReconnectAttempts = 15; // Increased max attempts
 let connectionTimeout = null;
 let checkNowPlayingInterval = null;
 let lastAudioChunkTime = Date.now();
-let debugMode = true;
+let debugMode = false; // Reduce console spam in production
 
 // State tracking
 let currentTrackId = null;
@@ -37,12 +37,28 @@ let connectionHealthTimer = null;
 let lastErrorTime = 0;
 let consecutiveErrors = 0;
 
+// Buffer management constants - centralized configuration
+const TARGET_BUFFER_SIZE = 10; // Target buffer duration in seconds
+const MIN_BUFFER_SIZE = 3;     // Minimum buffer before playback starts
+const MAX_BUFFER_SIZE = 30;    // Maximum buffer size in seconds
+const BUFFER_MONITOR_INTERVAL = 3000; // Check buffer every 3 seconds
+const NO_DATA_TIMEOUT = 20;   // Timeout for no data in seconds (increased from 15)
+const AUDIO_STARVATION_THRESHOLD = 2; // Seconds of buffer left before action needed
+
 // Format time (seconds to MM:SS)
 function formatTime(seconds) {
     if (!seconds) return '0:00';
     const minutes = Math.floor(seconds / 60);
     const secs = Math.floor(seconds % 60);
     return `${minutes}:${secs.toString().padStart(2, '0')}`;
+}
+
+// Enhanced logging with timestamps and categories
+function log(message, category = 'INFO', isError = false) {
+    if (isError || debugMode) {
+        const timestamp = new Date().toISOString().substr(11, 8);
+        console[isError ? 'error' : 'log'](`[${timestamp}] [${category}] ${message}`);
+    }
 }
 
 // Update the progress bar
@@ -59,7 +75,7 @@ function updateProgressBar(position, duration) {
 
 // Show status message with optional auto-hide
 function showStatus(message, isError = false, autoHide = true) {
-    console.log(`Status: ${message}${isError ? ' (ERROR)' : ''}`);
+    log(`Status: ${message}`, 'UI', isError);
     
     statusMessage.textContent = message;
     statusMessage.style.display = 'block';
@@ -73,11 +89,47 @@ function showStatus(message, isError = false, autoHide = true) {
     }
 }
 
-// Process the audio queue with improved error handling
+// Get current buffer health metrics
+function getBufferHealth() {
+    if (!sourceBuffer || !audioElement || sourceBuffer.buffered.length === 0) {
+        return {
+            current: 0,
+            ahead: 0,
+            duration: 0,
+            underflow: true
+        };
+    }
+    
+    const currentTime = audioElement.currentTime;
+    const bufferedEnd = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+    const bufferAhead = bufferedEnd - currentTime;
+    const totalBuffered = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1) - 
+                         sourceBuffer.buffered.start(0);
+    
+    return {
+        current: currentTime,
+        ahead: bufferAhead,
+        duration: totalBuffered,
+        underflow: bufferAhead < AUDIO_STARVATION_THRESHOLD
+    };
+}
+
+// Improved process queue with smarter buffer management strategies
 function processQueue() {
-    // Don't process if no data, not initialized, or already updating
+    // Exit conditions - ensure all necessary components are ready
     if (audioQueue.length === 0 || !sourceBuffer || !mediaSource || 
         mediaSource.readyState !== 'open' || sourceBuffer.updating) {
+        return;
+    }
+    
+    // Check buffer health before processing
+    const bufferHealth = getBufferHealth();
+    const queueSizeInChunks = audioQueue.length;
+    
+    // If we have a very high buffer, slow down processing
+    if (bufferHealth.ahead > TARGET_BUFFER_SIZE * 1.5 && queueSizeInChunks > 5) {
+        // We have plenty of buffer, so delay processing to avoid excess memory usage
+        setTimeout(processQueue, 100);
         return;
     }
     
@@ -90,67 +142,98 @@ function processQueue() {
         // Reset consecutive errors since we successfully processed data
         consecutiveErrors = 0;
         
+        // Log buffer status occasionally
+        if (queueSizeInChunks % 50 === 0 || bufferHealth.underflow) {
+            log(`Buffer health: ${bufferHealth.ahead.toFixed(1)}s ahead, ${queueSizeInChunks} chunks queued`, 'BUFFER');
+        }
+        
         // Set up callback for when this append completes
         sourceBuffer.addEventListener('updateend', function onUpdateEnd() {
             sourceBuffer.removeEventListener('updateend', onUpdateEnd);
             
-            // Continue processing queue
-            setTimeout(processQueue, 0);
+            // Continue processing queue with adaptive scheduling
+            if (audioQueue.length > 0) {
+                // Adjust timing based on buffer health
+                if (bufferHealth.ahead < MIN_BUFFER_SIZE) {
+                    // Buffer is low, process next chunk immediately
+                    processQueue();
+                } else {
+                    // Normal processing with a small delay to reduce CPU load
+                    setTimeout(processQueue, 5);  // Small delay instead of 0
+                }
+            }
         }, { once: true });
         
     } catch (e) {
-        console.error(`Error processing audio data: ${e.message}`);
+        log(`Error processing audio data: ${e.message}`, 'BUFFER', true);
         consecutiveErrors++;
         
-        // Handle quota exceeded errors
+        // Handle different error types
         if (e.name === 'QuotaExceededError') {
-            try {
-                if (sourceBuffer.buffered.length > 0) {
-                    // Just remove a small portion of the buffer
-                    const start = sourceBuffer.buffered.start(0);
-                    const end = Math.min(
-                        sourceBuffer.buffered.end(0), 
-                        start + 10
-                    );
-                    
-                    console.log(`Clearing buffer segment ${start}-${end}s`);
-                    sourceBuffer.remove(start, end);
-                    
-                    // Put the data back in the queue
-                    audioQueue.unshift(data);
-                    
-                    // Continue after buffer clear
-                    sourceBuffer.addEventListener('updateend', function onClearEnd() {
-                        sourceBuffer.removeEventListener('updateend', onClearEnd);
-                        setTimeout(processQueue, 50);
-                    }, { once: true });
-                    return;
-                }
-            } catch (clearError) {
-                console.error(`Error clearing buffer: ${clearError.message}`);
+            // More strategic buffer management for quota errors
+            handleQuotaExceededError();
+        } else {
+            // For other errors, try again soon with backoff
+            const retryDelay = Math.min(50 * consecutiveErrors, 1000);
+            setTimeout(processQueue, retryDelay);
+            
+            // If we've had many consecutive errors, try recreation
+            if (consecutiveErrors > 5) {
+                log('Too many consecutive errors, recreating MediaSource', 'BUFFER', true);
+                recreateMediaSource();
+            }
+        }
+    }
+}
+
+// Handle quota exceeded errors with smarter buffer management
+function handleQuotaExceededError() {
+    try {
+        if (sourceBuffer && sourceBuffer.buffered.length > 0) {
+            const currentTime = audioElement.currentTime;
+            
+            // Only remove data that's definitely been played
+            const safeRemovalPoint = Math.max(
+                sourceBuffer.buffered.start(0),
+                currentTime - 2  // Keep 2 seconds before current position
+            );
+            
+            // Calculate how much we need to remove
+            const removalEnd = Math.min(
+                safeRemovalPoint + 5,  // Remove 5 seconds of audio
+                currentTime - 1  // But never too close to current playback position
+            );
+            
+            if (removalEnd > safeRemovalPoint) {
+                log(`Clearing buffer segment ${safeRemovalPoint.toFixed(1)}-${removalEnd.toFixed(1)}s`, 'BUFFER');
+                sourceBuffer.remove(safeRemovalPoint, removalEnd);
+                
+                // Continue after buffer clear
+                sourceBuffer.addEventListener('updateend', function onClearEnd() {
+                    sourceBuffer.removeEventListener('updateend', onClearEnd);
+                    setTimeout(processQueue, 50);
+                }, { once: true });
+                return;
             }
         }
         
-        // For other errors, try again soon, but don't retry too quickly
-        // if we keep seeing errors
-        const retryDelay = Math.min(100 * consecutiveErrors, 2000);
-        setTimeout(processQueue, retryDelay);
-        
-        // If we've had too many consecutive errors, try recreating the MediaSource
-        if (consecutiveErrors > 10) {
-            console.warn('Too many consecutive errors, recreating MediaSource');
-            recreateMediaSource();
-        }
+        // If we couldn't clear the buffer using the approach above
+        log('Could not clear buffer, trying alternative approach', 'BUFFER', true);
+        recreateMediaSource();
+    } catch (clearError) {
+        log(`Error clearing buffer: ${clearError.message}`, 'BUFFER', true);
+        recreateMediaSource();
     }
 }
 
 // Recreate the MediaSource to recover from serious errors
 function recreateMediaSource() {
-    console.log('Recreating MediaSource');
+    log('Recreating MediaSource', 'MEDIA');
     
     try {
         // Preserve some audio data to continue playback
-        const savedQueue = [...audioQueue];
+        const savedQueue = audioQueue.slice(-50); // Keep only the last 50 chunks
+        audioQueue = []; // Clear the queue
         
         // Clean up old MediaSource
         if (sourceBuffer) {
@@ -169,18 +252,24 @@ function recreateMediaSource() {
         mediaSource = new MediaSource();
         
         mediaSource.addEventListener('sourceopen', function onSourceOpen() {
-            console.log('New MediaSource opened');
+            log('New MediaSource opened', 'MEDIA');
             
             try {
                 // Create source buffer
                 sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
+                
+                // Setup error handler
+                sourceBuffer.addEventListener('error', (event) => {
+                    log(`SourceBuffer error: ${event.message || 'Unknown error'}`, 'MEDIA', true);
+                });
                 
                 // Restore queue and continue
                 audioQueue = savedQueue;
                 consecutiveErrors = 0;
                 setTimeout(processQueue, 100);
             } catch (e) {
-                console.error(`Error creating source buffer: ${e.message}`);
+                log(`Error creating source buffer: ${e.message}`, 'MEDIA', true);
+                attemptReconnection();
             }
         });
         
@@ -191,11 +280,11 @@ function recreateMediaSource() {
         // Make sure we're playing
         if (audioElement.paused && isPlaying) {
             audioElement.play().catch(e => {
-                console.error(`Error playing after recreation: ${e.message}`);
+                log(`Error playing after recreation: ${e.message}`, 'MEDIA', true);
             });
         }
     } catch (e) {
-        console.error(`Error recreating MediaSource: ${e.message}`);
+        log(`Error recreating MediaSource: ${e.message}`, 'MEDIA', true);
         // If recreation fails, attempt reconnection as a last resort
         attemptReconnection();
     }
@@ -217,12 +306,12 @@ function handleWebSocketMessage(event) {
             if (buffer.byteLength === 2) {
                 const view = new Uint8Array(buffer);
                 if (view[0] === 0xFF && view[1] === 0xFE) {
-                    console.log('Track transition marker received');
+                    log('Track transition marker received', 'STREAM');
                     // For track transitions, just keep processing
                     return;
                 }
                 if (view[0] === 0xFF && view[1] === 0xFF) {
-                    console.log('Track end marker received');
+                    log('Track end marker received', 'STREAM');
                     return;
                 }
             }
@@ -240,7 +329,7 @@ function handleWebSocketMessage(event) {
             processQueue();
             
         }).catch(e => {
-            console.error(`Error processing binary data: ${e.message}`);
+            log(`Error processing binary data: ${e.message}`, 'STREAM', true);
         });
     } else {
         // Process text data (track info)
@@ -256,7 +345,7 @@ function handleWebSocketMessage(event) {
             // Store track ID for change detection
             const newTrackId = info.path;
             if (currentTrackId !== newTrackId) {
-                console.log(`Track changed to: ${info.title}`);
+                log(`Track changed to: ${info.title}`, 'TRACK');
                 currentTrackId = newTrackId;
                 
                 // Reset position tracking
@@ -289,35 +378,28 @@ function handleWebSocketMessage(event) {
             // Update page title
             document.title = `${info.title} - ${info.artist} | Rust Web Radio`;
         } catch (e) {
-            console.log(`Non-JSON message: ${event.data}`);
+            log(`Non-JSON message: ${event.data}`, 'STREAM');
         }
     }
 }
 
-// Check connection health periodically
+// Improved connection health monitoring
 function checkConnectionHealth() {
     if (!isPlaying) return;
     
     const now = Date.now();
     const timeSinceLastAudio = (now - lastAudioChunkTime) / 1000;
     
+    // Get buffer metrics
+    const bufferHealth = getBufferHealth();
+    
     // Check if we've received audio data recently
-    if (timeSinceLastAudio > 15) { // 15 seconds without data is a problem
-        console.warn(`No audio data received for ${timeSinceLastAudio.toFixed(1)}s`);
-        
-        // Check buffer health
-        let bufferAhead = 0;
-        if (sourceBuffer && sourceBuffer.buffered.length > 0 && !audioElement.paused) {
-            const currentTime = audioElement.currentTime;
-            const bufferedEnd = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-            bufferAhead = bufferedEnd - currentTime;
-            
-            console.log(`Buffer has ${bufferAhead.toFixed(1)}s of audio ahead`);
-        }
+    if (timeSinceLastAudio > NO_DATA_TIMEOUT) {
+        log(`No audio data received for ${timeSinceLastAudio.toFixed(1)}s`, 'HEALTH', true);
         
         // If buffer is also getting low, we need to reconnect
-        if (bufferAhead < 3) {
-            console.warn('Buffer depleted and no new data, reconnecting');
+        if (bufferHealth.ahead < AUDIO_STARVATION_THRESHOLD) {
+            log('Buffer depleted and no new data, reconnecting', 'HEALTH', true);
             showStatus('Connection interrupted. Reconnecting...', true, false);
             attemptReconnection();
         } else {
@@ -326,25 +408,27 @@ function checkConnectionHealth() {
             if (ws && ws.readyState === WebSocket.OPEN) {
                 try {
                     ws.send('ping');
-                    console.log('Sent ping to check connection');
+                    log('Sent ping to check connection', 'HEALTH');
                 } catch (e) {
-                    console.error(`Error sending ping: ${e.message}`);
+                    log(`Error sending ping: ${e.message}`, 'HEALTH', true);
                 }
             }
         }
-    } else if (sourceBuffer && sourceBuffer.buffered.length > 0 && !audioElement.paused) {
-        // Just log buffer state for debugging
-        const currentTime = audioElement.currentTime;
-        const bufferedEnd = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-        const bufferAhead = bufferedEnd - currentTime;
-        
-        console.log(`Health check: ${bufferAhead.toFixed(1)}s buffered, ${audioQueue.length} chunks queued`);
+    } else {
+        // Log buffer state for monitoring
+        if (bufferHealth.ahead < AUDIO_STARVATION_THRESHOLD) {
+            log(`WARNING: Low buffer - ${bufferHealth.ahead.toFixed(1)}s ahead, ${audioQueue.length} chunks queued`, 'HEALTH');
+        } else if (debugMode) {
+            log(`Buffer health: ${bufferHealth.ahead.toFixed(1)}s ahead, ${audioQueue.length} chunks queued`, 'HEALTH');
+        }
     }
 }
 
-// Initialize and start playback
+// player.js - Part 3: Connection and Playback Control
+
+// Initialize and start playback with improved setup
 function startAudio() {
-    console.log('Starting audio playback');
+    log('Starting audio playback', 'CONTROL');
     startBtn.disabled = true;
     showStatus('Connecting to stream...', false, false);
     
@@ -374,6 +458,8 @@ function startAudio() {
         audioElement.volume = volumeControl.value;
         audioElement.muted = isMuted;
         audioElement.preload = 'auto';
+        // Add to document but hide visually
+        audioElement.style.display = 'none';
         document.body.appendChild(audioElement);
         
         // Set up audio event listeners
@@ -387,7 +473,7 @@ function startAudio() {
     if (connectionHealthTimer) {
         clearInterval(connectionHealthTimer);
     }
-    connectionHealthTimer = setInterval(checkConnectionHealth, 5000);
+    connectionHealthTimer = setInterval(checkConnectionHealth, BUFFER_MONITOR_INTERVAL);
     
     // Start now playing updates
     if (checkNowPlayingInterval) {
@@ -399,23 +485,23 @@ function startAudio() {
 // Set up audio element event listeners
 function setupAudioListeners() {
     audioElement.addEventListener('playing', () => {
-        console.log('Audio playing');
+        log('Audio playing', 'AUDIO');
         showStatus('Audio playing');
     });
     
     audioElement.addEventListener('waiting', () => {
-        console.log('Audio buffering');
+        log('Audio buffering', 'AUDIO');
         showStatus('Buffering...', false, false);
     });
     
     audioElement.addEventListener('stalled', () => {
-        console.log('Audio stalled');
+        log('Audio stalled', 'AUDIO');
         showStatus('Stream stalled - buffering', true, false);
     });
     
     audioElement.addEventListener('error', (e) => {
         const errorCode = e.target.error ? e.target.error.code : 'unknown';
-        console.error(`Audio error (code ${errorCode})`);
+        log(`Audio error (code ${errorCode})`, 'AUDIO', true);
         
         // Only react to errors if we're still trying to play
         if (isPlaying) {
@@ -432,12 +518,27 @@ function setupAudioListeners() {
     });
     
     audioElement.addEventListener('ended', () => {
-        console.log('Audio ended');
+        log('Audio ended', 'AUDIO');
         // If we shouldn't be at the end, try to restart
         if (isPlaying) {
-            console.warn('Audio ended unexpectedly, attempting to recover');
+            log('Audio ended unexpectedly, attempting to recover', 'AUDIO', true);
             showStatus('Audio ended - reconnecting', true, false);
             attemptReconnection();
+        }
+    });
+    
+    // Add new timeupdate listener to monitor buffer health dynamically
+    audioElement.addEventListener('timeupdate', () => {
+        // Check buffer health on time updates (but not too frequently - skip most updates)
+        if (Math.random() < 0.05) { // Only check ~5% of time updates to reduce overhead
+            const bufferHealth = getBufferHealth();
+            if (bufferHealth.underflow) {
+                log(`Buffer underfull during playback: ${bufferHealth.ahead.toFixed(2)}s ahead`, 'AUDIO');
+                // Process queue immediately if we have data
+                if (audioQueue.length > 0 && !sourceBuffer.updating) {
+                    processQueue();
+                }
+            }
         }
     });
 }
@@ -450,40 +551,64 @@ function setupMediaSource() {
         
         // Set up event handlers
         mediaSource.addEventListener('sourceopen', () => {
-            console.log('MediaSource opened');
+            log('MediaSource opened', 'MEDIA');
             
             try {
                 // Create source buffer for MP3
                 sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
                 
+                // Add buffer monitoring event
+                sourceBuffer.addEventListener('updateend', () => {
+                    // Check how much we've buffered after each update
+                    if (sourceBuffer && sourceBuffer.buffered.length > 0 && audioElement) {
+                        const bufferHealth = getBufferHealth();
+                        
+                        // If buffer is getting very large, trim it
+                        if (bufferHealth.duration > MAX_BUFFER_SIZE) {
+                            const currentTime = audioElement.currentTime;
+                            const trimPoint = Math.max(sourceBuffer.buffered.start(0), currentTime - 10);
+                            log(`Trimming buffer: ${trimPoint.toFixed(2)}s to current time - 10`, 'BUFFER');
+                            try {
+                                sourceBuffer.remove(sourceBuffer.buffered.start(0), trimPoint);
+                            } catch (e) {
+                                log(`Error trimming buffer: ${e.message}`, 'BUFFER');
+                            }
+                        }
+                    }
+                });
+                
                 // Connect to WebSocket after MediaSource is ready
                 connectWebSocket();
             } catch (e) {
-                console.error(`Error creating source buffer: ${e.message}`);
+                log(`Error creating source buffer: ${e.message}`, 'MEDIA', true);
                 showStatus(`Media error: ${e.message}`, true);
                 startBtn.disabled = false;
             }
         });
         
-        mediaSource.addEventListener('sourceended', () => console.log('MediaSource ended'));
-        mediaSource.addEventListener('sourceclose', () => console.log('MediaSource closed'));
+        mediaSource.addEventListener('sourceended', () => log('MediaSource ended', 'MEDIA'));
+        mediaSource.addEventListener('sourceclose', () => log('MediaSource closed', 'MEDIA'));
         
         // Create object URL and set as audio source
         const url = URL.createObjectURL(mediaSource);
         audioElement.src = url;
         
     } catch (e) {
-        console.error(`MediaSource setup error: ${e.message}`);
+        log(`MediaSource setup error: ${e.message}`, 'MEDIA', true);
         showStatus(`Media error: ${e.message}`, true);
         startBtn.disabled = false;
     }
 }
 
-// Connect to WebSocket
+// Improved WebSocket connection with better error handling
 function connectWebSocket() {
     // Clean up any existing connection
     if (ws) {
-        ws.close();
+        try {
+            ws.close();
+        } catch (e) {
+            // Ignore close errors
+        }
         ws = null;
     }
     
@@ -491,14 +616,14 @@ function connectWebSocket() {
         // Determine WebSocket URL
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${protocol}//${window.location.host}/stream`;
-        console.log(`Connecting to WebSocket: ${wsUrl}`);
+        log(`Connecting to WebSocket: ${wsUrl}`, 'STREAM');
         
         // Create connection
         ws = new WebSocket(wsUrl);
         
         // Set up event handlers
         ws.onopen = () => {
-            console.log('WebSocket connection established');
+            log('WebSocket connection established', 'STREAM');
             showStatus('Connected to stream');
             startBtn.textContent = 'Disconnect';
             startBtn.disabled = false;
@@ -510,8 +635,9 @@ function connectWebSocket() {
             
             // Start audio playback
             if (audioElement.paused) {
-                audioElement.play().catch(e => {
-                    console.error(`Play error: ${e.message}`);
+                const playPromise = audioElement.play();
+                playPromise.catch(e => {
+                    log(`Play error: ${e.message}`, 'AUDIO', true);
                     if (e.name === 'NotAllowedError') {
                         showStatus('Click play to start audio (browser requires user interaction)', true, false);
                     }
@@ -520,7 +646,7 @@ function connectWebSocket() {
         };
         
         ws.onclose = (event) => {
-            console.log(`WebSocket closed: Code ${event.code}`);
+            log(`WebSocket closed: Code ${event.code}`, 'STREAM');
             
             // Only attempt reconnect if we're still supposed to be playing
             if (isPlaying) {
@@ -534,8 +660,8 @@ function connectWebSocket() {
             }
         };
         
-        ws.onerror = () => {
-            console.error('WebSocket error');
+        ws.onerror = (error) => {
+            log('WebSocket error', 'STREAM', true);
             
             // Don't immediately try to reconnect - wait for the close event
             showStatus('Connection error', true, false);
@@ -543,17 +669,17 @@ function connectWebSocket() {
         
         ws.onmessage = handleWebSocketMessage;
         
-        // Set connection timeout
+        // Set connection timeout (increased for slower connections)
         connectionTimeout = setTimeout(() => {
             if (ws && audioQueue.length === 0) {
-                console.error('Connection timeout - no data received');
+                log('Connection timeout - no data received', 'STREAM', true);
                 showStatus('Connection timeout. Reconnecting...', true, false);
                 attemptReconnection();
             }
-        }, 15000); // Longer timeout
+        }, 20000); // Increased from 15s to 20s
         
     } catch (e) {
-        console.error(`WebSocket setup error: ${e.message}`);
+        log(`WebSocket setup error: ${e.message}`, 'STREAM', true);
         showStatus(`Connection error: ${e.message}`, true);
         attemptReconnection();
     }
@@ -566,7 +692,7 @@ function attemptReconnection() {
     
     // Check if we've reached the maximum attempts
     if (reconnectAttempts >= maxReconnectAttempts) {
-        console.error(`Maximum reconnection attempts (${maxReconnectAttempts}) reached`);
+        log(`Maximum reconnection attempts (${maxReconnectAttempts}) reached`, 'CONTROL', true);
         showStatus('Could not reconnect to server. Please try again later.', true);
         
         // Reset UI
@@ -578,16 +704,21 @@ function attemptReconnection() {
     reconnectAttempts++;
     
     // Calculate delay with exponential backoff and a bit of randomness
-    const baseDelay = Math.min(1000 * Math.pow(1.5, reconnectAttempts - 1), 10000);
+    // More gradual backoff with smaller initial delays
+    const baseDelay = Math.min(500 * Math.pow(1.3, reconnectAttempts - 1), 8000);
     const jitter = Math.random() * 1000; // Add up to 1 second of jitter
     const delay = baseDelay + jitter;
     
-    console.log(`Reconnection attempt ${reconnectAttempts}/${maxReconnectAttempts} in ${(delay/1000).toFixed(1)}s`);
+    log(`Reconnection attempt ${reconnectAttempts}/${maxReconnectAttempts} in ${(delay/1000).toFixed(1)}s`, 'CONTROL');
     showStatus(`Reconnecting (${reconnectAttempts}/${maxReconnectAttempts})...`, true, false);
     
     // Close existing connection
     if (ws) {
-        ws.close();
+        try {
+            ws.close();
+        } catch (e) {
+            // Ignore close errors
+        }
         ws = null;
     }
     
@@ -602,7 +733,7 @@ function attemptReconnection() {
 
 // Stop audio playback and disconnect
 function stopAudio(isError = false) {
-    console.log(`Stopping audio playback${isError ? ' (due to error)' : ''}`);
+    log(`Stopping audio playback${isError ? ' (due to error)' : ''}`, 'CONTROL');
     
     isPlaying = false;
     
@@ -624,7 +755,11 @@ function stopAudio(isError = false) {
     
     // Close WebSocket
     if (ws) {
-        ws.close();
+        try {
+            ws.close();
+        } catch (e) {
+            // Ignore close errors
+        }
         ws = null;
     }
     
@@ -637,7 +772,7 @@ function stopAudio(isError = false) {
         try {
             mediaSource.endOfStream();
         } catch (e) {
-            console.error(`Error ending MediaSource: ${e.message}`);
+            log(`Error ending MediaSource: ${e.message}`, 'MEDIA');
         }
     }
     mediaSource = null;
@@ -662,32 +797,36 @@ function stopAudio(isError = false) {
     startBtn.dataset.connected = 'false';
 }
 
+// player.js - Part 4: UI Control and API Integration
+
 // Toggle connection
 function toggleConnection() {
     const isConnected = startBtn.dataset.connected === 'true';
     
     if (isConnected) {
-        console.log('User requested disconnect');
+        log('User requested disconnect', 'CONTROL');
         stopAudio();
     } else {
-        console.log('User requested connect');
+        log('User requested connect', 'CONTROL');
         startAudio();
     }
 }
 
 // Update now playing information
 async function updateNowPlaying() {
+    if (!isPlaying) return;
+    
     try {
         const response = await fetch('/api/now-playing');
         if (!response.ok) {
-            console.error(`Now playing API error: ${response.status}`);
+            log(`Now playing API error: ${response.status}`, 'API', true);
             return;
         }
         
         const data = await response.json();
         
         if (data.error) {
-            console.error(`Now playing error: ${data.error}`);
+            log(`Now playing error: ${data.error}`, 'API', true);
             currentTitle.textContent = 'No tracks available';
             currentArtist.textContent = 'Please add MP3 files to the server';
             currentAlbum.textContent = '';
@@ -699,7 +838,7 @@ async function updateNowPlaying() {
         const trackChanged = currentTitle.dataset.trackId !== newTrackId;
         
         if (trackChanged) {
-            console.log(`Track info changed to: "${data.title}" by "${data.artist}"`);
+            log(`Track info changed to: "${data.title}" by "${data.artist}"`, 'TRACK');
             
             // Update track ID
             currentTitle.dataset.trackId = newTrackId;
@@ -732,7 +871,7 @@ async function updateNowPlaying() {
         // Update page title
         document.title = `${data.title} - ${data.artist} | Rust Web Radio`;
     } catch (error) {
-        console.error(`Error fetching now playing: ${error.message}`);
+        log(`Error fetching now playing: ${error.message}`, 'API', true);
     }
 }
 

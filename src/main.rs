@@ -1,4 +1,4 @@
-// Replace main.rs with this version that properly starts the broadcast thread:
+// Updated main.rs with improved streaming integration
 
 extern crate rocket;
 
@@ -18,11 +18,12 @@ use crate::services::playlist;
 #[launch]
 fn rocket() -> rocket::Rocket<rocket::Build> {
     println!("============================================================");
-    println!("Starting Rust MP3 Web Radio (Single-Thread Architecture)");
+    println!("Starting Rust MP3 Web Radio (Improved Buffer Management)");
     println!("Music folder: {}", config::MUSIC_FOLDER.display());
+    println!("Chunk size: {}, Buffer size: {}", config::CHUNK_SIZE, config::BUFFER_SIZE);
     println!("============================================================");
 
-    // Initialize the stream manager 
+    // Initialize the stream manager with the new configuration values
     let stream_manager = StreamManager::new(
         &config::MUSIC_FOLDER,
         config::CHUNK_SIZE,
@@ -57,15 +58,16 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     
     // Start the broadcast thread only if we have tracks
     if has_tracks {
-        println!("Starting broadcast thread...");
+        println!("Starting broadcast thread with improved buffer management...");
         stream_manager.start_broadcast_thread();
     } else {
         println!("Not starting broadcast thread - no tracks available");
     }
 
-    // Start monitoring thread (simplified - just logs status)
+    // Start monitoring thread 
     let stream_manager_clone = stream_manager.clone();
     thread::spawn(move || {
+        println!("Starting track monitoring thread...");
         crate::services::playlist::track_switcher(stream_manager_clone);
     });
     
@@ -78,7 +80,7 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
             handlers::index,
             handlers::now_playing,
             handlers::get_stats,
-            handlers::stream_ws,  // WebSocket endpoint for real-time streaming
+            handlers::stream_ws,  // WebSocket endpoint with improved streaming
             handlers::static_files,
             handlers::diagnostic_page,
         ])
