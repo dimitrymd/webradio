@@ -1,4 +1,4 @@
-// Replace the entire src/services/streamer.rs with this improved single-threaded design:
+// Fixed streamer.rs with properly defined constants and improved buffer management
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -11,12 +11,13 @@ use parking_lot::Mutex;
 use log::{info, error, warn, debug};
 use tokio::sync::broadcast;
 use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU64, Ordering};
-// use id3::TagLike; // Removed unused import
 
-// Constants
+// Fixed missing constants
 const BROADCAST_CHUNK_SIZE: usize = 16384; // 16KB chunks
 const BROADCAST_RATE_LIMITER_MS: u64 = 10;
-const MAX_RECENT_CHUNKS_FOR_LIVE: usize = 50;
+const MAX_RECENT_CHUNKS: usize = 50; // Number of chunks to save for new clients
+const BROADCAST_BUFFER_SIZE: usize = 50; // Number of chunks to buffer ahead
+const MIN_BUFFER_CHUNKS: usize = 10; // Minimum chunks to buffer before starting playback
 
 #[derive(Clone)]
 pub struct StreamManager {
@@ -58,7 +59,7 @@ struct StreamManagerInner {
 
 // Complete StreamManager implementation with all required methods
 impl StreamManager {
-    pub fn new(music_folder: &Path, _chunk_size: usize, _buffer_size: usize, _cache_time: u64) -> Self {
+    pub fn new(music_folder: &Path, chunk_size: usize, buffer_size: usize, _cache_time: u64) -> Self {
         info!("Initializing StreamManager");
         
         // Larger buffer for smoother streaming
@@ -67,6 +68,7 @@ impl StreamManager {
         
         let inner = StreamManagerInner {
             music_folder: music_folder.to_path_buf(),
+            chunk_size,
             current_track_path: None,
             current_track_info: None,
             playback_position: 0,
@@ -74,6 +76,7 @@ impl StreamManager {
             id3_header: None,
             broadcast_tx: broadcast_tx.clone(),
             saved_chunks: VecDeque::with_capacity(MAX_RECENT_CHUNKS),
+            max_saved_chunks: MAX_RECENT_CHUNKS,
             broadcast_thread: None,
             should_stop: should_stop.clone(),
         };
@@ -197,17 +200,19 @@ impl StreamManager {
                 
                 // Move to next track
                 if let Some(index) = current_track_index {
-                    let next_index = (index + 1) % playlist.tracks.len();
-                    current_track_index = Some(next_index);
-                    info!("Moving to track index: {}", next_index);
-                    
-                    // Update playlist file to reflect current position
-                    let mut new_playlist = playlist.clone();
-                    new_playlist.current_track = next_index;
-                    crate::services::playlist::save_playlist(
-                        &new_playlist, 
-                        &crate::config::PLAYLIST_FILE
-                    );
+                    if !playlist.tracks.is_empty() {
+                        let next_index = (index + 1) % playlist.tracks.len();
+                        current_track_index = Some(next_index);
+                        info!("Moving to track index: {}", next_index);
+                        
+                        // Update playlist file to reflect current position
+                        let mut new_playlist = playlist.clone();
+                        new_playlist.current_track = next_index;
+                        crate::services::playlist::save_playlist(
+                            &new_playlist, 
+                            &crate::config::PLAYLIST_FILE
+                        );
+                    }
                 }
                 
                 // Brief pause between tracks
@@ -218,7 +223,6 @@ impl StreamManager {
         info!("Broadcast thread ending");
     }
     
-    // IMPORTANT: Fix the syntax by adding 'fn' keyword
     fn broadcast_single_track(
         inner: &Arc<Mutex<StreamManagerInner>>,
         file_path: &Path,
@@ -265,7 +269,7 @@ impl StreamManager {
         let bitrate = if track.duration > 0 && file_size > 0 {
             (file_size * 8) / track.duration
         } else {
-            128000
+            128000 // Default to 128kbps if we can't calculate
         };
         
         // Adaptive timing based on bitrate
@@ -377,9 +381,6 @@ impl StreamManager {
         }
     }
     
-    // These methods are referenced in handlers.rs but missing from implementation
-    // Add them here
-    
     // Connection management
     pub fn get_broadcast_receiver(&self) -> broadcast::Receiver<Vec<u8>> {
         self.broadcast_tx.subscribe()
@@ -445,7 +446,7 @@ impl StreamManager {
         }
     }
     
-    // Add the missing methods that caused the compilation errors
+    // Add the methods that caused the compilation errors
     pub fn get_receiver_count(&self) -> usize {
         self.broadcast_tx.receiver_count()
     }

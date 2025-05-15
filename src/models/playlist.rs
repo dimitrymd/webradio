@@ -1,5 +1,4 @@
 use serde::{Serialize, Deserialize};
-use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Track {

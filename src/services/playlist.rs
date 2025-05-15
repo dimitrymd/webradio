@@ -1,12 +1,8 @@
 use std::fs::{self, File};
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use rand::seq::SliceRandom;
-use rand::thread_rng;
+use std::io::Write;
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use crate::models::playlist::{Track, Playlist};
 use crate::services::streamer::StreamManager;

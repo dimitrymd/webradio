@@ -1,3 +1,5 @@
+// Fixed handlers.rs with improved WebSocket stream handling
+
 use rocket::http::{ContentType, Status};
 use rocket::State;
 use rocket::serde::json::Json;
@@ -99,7 +101,7 @@ pub async fn get_stats(stream_manager: &State<StreamManager>) -> Json<serde_json
     }))
 }
 
-// WebSocket handler for streaming audio - Fixed version with live join support
+// Improved WebSocket handler for streaming audio
 #[get("/stream")]
 pub fn stream_ws(ws: ws::WebSocket, stream_manager: &State<StreamManager>) -> ws::Channel<'static> {
     let stream_manager_clone = stream_manager.inner().clone();
@@ -145,34 +147,34 @@ pub fn stream_ws(ws: ws::WebSocket, stream_manager: &State<StreamManager>) -> ws
             }
         }
         
-        // Enhanced buffer management for smoother playback
-        let initial_chunks = saved_chunks.len();
-        let mut client_buffer_chunks = 0; // Track how many chunks we've sent to client
-
-        // Calculate recommended buffer size based on latency
-        // We want to ensure client has enough data to handle network jitter
-        const MIN_CLIENT_BUFFER: usize = 20;  // Minimum chunks to buffer for smooth playback
-        const MAX_CLIENT_BUFFER: usize = 200; // Maximum chunks to avoid excessive memory usage
+        // Send a small initial set of chunks to bootstrap playback
+        // Limit to just a few chunks (5-10) to avoid overwhelming client
+        const MAX_INITIAL_CHUNKS: usize = 10;
+        let initial_chunks_count = std::cmp::min(saved_chunks.len(), MAX_INITIAL_CHUNKS);
         
-        let mut chunk_queue: VecDeque<Vec<u8>> = VecDeque::from(saved_chunks);
-        let mut sent_chunks = 0;
+        for chunk in saved_chunks.iter().take(initial_chunks_count) {
+            // Skip empty chunks
+            if chunk.is_empty() {
+                continue;
+            }
+            
+            match stream.lock().await.send(ws::Message::Binary(chunk.clone())).await {
+                Ok(_) => {
+                    // Small delay between initial chunks
+                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                },
+                Err(_) => {
+                    stream_manager_clone.decrement_listener_count();
+                    return Ok(());
+                }
+            }
+        }
+        
+        // Main streaming loop - deliver audio data
         let mut consecutive_errors = 0;
         let max_consecutive_errors = 3;
         let mut last_activity = Instant::now();
         
-        println!("Client {} starting with {} buffered chunks", listener_id, initial_chunks);
-        
-        // Measure initial latency to calculate optimal buffer size
-        let latency_start = Instant::now();
-        if let Err(_) = stream.lock().await.send(ws::Message::Ping(vec![1,2,3,4])).await {
-            stream_manager_clone.decrement_listener_count();
-            return Ok(());
-        }
-        
-        // Dynamic buffer size based on conditions
-        let mut target_buffer_size = MIN_CLIENT_BUFFER;
-        
-        // Main streaming loop with improved buffering
         loop {
             // Check for timeout
             if last_activity.elapsed() > Duration::from_secs(30) {
@@ -180,146 +182,64 @@ pub fn stream_ws(ws: ws::WebSocket, stream_manager: &State<StreamManager>) -> ws
                 break;
             }
             
-            // Send buffered chunks first, respecting client-side buffer limits
-            if !chunk_queue.is_empty() && client_buffer_chunks < target_buffer_size {
-                let chunk = chunk_queue.pop_front().unwrap();
-                last_activity = Instant::now();
-                
-                if !chunk.is_empty() {
-                    match stream.lock().await.send(ws::Message::Binary(chunk)).await {
-                        Ok(_) => {
-                            sent_chunks += 1;
-                            client_buffer_chunks += 1;
-                            consecutive_errors = 0;
-                        },
-                        Err(_) => {
-                            consecutive_errors += 1;
-                            if consecutive_errors >= max_consecutive_errors {
-                                println!("Client {} too many errors", listener_id);
-                                break;
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-            
-            // If we have enough buffered on client, wait for more data or buffer to deplete
-            if client_buffer_chunks >= target_buffer_size {
-                // Receive new chunks with timeout - shorter timeout if we have a good buffer
-                let timeout_duration = if client_buffer_chunks > MIN_CLIENT_BUFFER {
-                    Duration::from_millis(100) // Quick check for more data
-                } else {
-                    Duration::from_millis(500) // Longer wait if buffer is low
-                };
-                
-                match tokio::time::timeout(timeout_duration, broadcast_rx.recv()).await {
-                    Ok(Ok(chunk)) => {
-                        // Successful receive, reset activity timer
-                        last_activity = Instant::now();
-                        
-                        // Check for special marker chunks
-                        if chunk.len() == 2 {
-                            let marker = (chunk[0], chunk[1]);
-                            match marker {
-                                (0xFF, 0xFE) => {
-                                    // Track transition - clear buffers
-                                    println!("Client {} track transition", listener_id);
-                                    chunk_queue.clear();
-                                    client_buffer_chunks = 0;
-                                    
-                                    // Get new track info
-                                    if let Some(new_info) = stream_manager_clone.get_track_info() {
-                                        if let Err(_) = stream.lock().await.send(ws::Message::Text(new_info)).await {
-                                            break;
-                                        }
-                                    }
-                                    
-                                    // Get new track data
-                                    let (new_id3, new_chunks) = stream_manager_clone.get_chunks_from_current_position();
-                                    
-                                    // Send new ID3
-                                    if let Some(id3) = new_id3 {
-                                        if let Err(_) = stream.lock().await.send(ws::Message::Binary(id3)).await {
-                                            break;
-                                        }
-                                    }
-                                    
-                                    // Queue new chunks
-                                    chunk_queue = VecDeque::from(new_chunks);
-                                    continue;
-                                },
-                                (0xFF, 0xFF) => {
-                                    // Track end
-                                    continue;
-                                },
-                                _ => {}
-                            }
-                        }
-                        
-                        // Add regular chunk to queue
-                        chunk_queue.push_back(chunk);
-                    },
-                    Ok(Err(e)) => {
-                        // Broadcast error handling
-                        if e.to_string().contains("lagged") {
-                            println!("Client {} broadcast lag, resubscribing", listener_id);
-                            broadcast_rx = stream_manager_clone.get_broadcast_receiver();
-                            
-                            // Get fresh chunks to resync
-                            let (_, fresh_chunks) = stream_manager_clone.get_chunks_from_current_position();
-                            chunk_queue = VecDeque::from(fresh_chunks);
-                            client_buffer_chunks = 0; // Reset buffer count
-                            
-                            // Adjust buffer size higher when we see lag
-                            target_buffer_size = (target_buffer_size * 3 / 2).min(MAX_CLIENT_BUFFER);
-                            println!("Client {} increasing buffer to {} chunks", listener_id, target_buffer_size);
-                        } else {
-                            consecutive_errors += 1;
-                            if consecutive_errors >= max_consecutive_errors {
-                                break;
-                            }
-                        }
-                    },
-                    Err(_) => {
-                        // Timeout is normal if we're well buffered
-                        // Estimate how many chunks client has consumed based on time
-                        let time_since_last_chunk = last_activity.elapsed();
-                        let consumed_chunks = (time_since_last_chunk.as_secs_f64() / 0.1).ceil() as usize; // Assume ~10 chunks per second
-                        
-                        if consumed_chunks > 0 && client_buffer_chunks > consumed_chunks {
-                            client_buffer_chunks -= consumed_chunks;
-                            // Gradually adjust buffer size based on connection stability
-                            if consecutive_errors == 0 && sent_chunks > 500 {
-                                // Connection seems stable, we can reduce buffer slightly
-                                target_buffer_size = target_buffer_size.saturating_sub(1).max(MIN_CLIENT_BUFFER);
-                            }
-                        }
-                        
-                        // Send ping to check connection
-                        if let Err(_) = stream.lock().await.send(ws::Message::Ping(vec![])).await {
+            // Receive chunks from broadcast
+            match tokio::time::timeout(Duration::from_millis(100), broadcast_rx.recv()).await {
+                Ok(Ok(chunk)) => {
+                    // Process received chunk
+                    last_activity = Instant::now();
+                    
+                    if let Err(_) = stream.lock().await.send(ws::Message::Binary(chunk)).await {
+                        consecutive_errors += 1;
+                        if consecutive_errors >= max_consecutive_errors {
                             break;
                         }
-                        
-                        if chunk_queue.is_empty() && client_buffer_chunks < MIN_CLIENT_BUFFER/2 {
-                            // We're running low on buffer and not getting data
-                            println!("Client {} buffer critically low: {} chunks", listener_id, client_buffer_chunks);
-                            
-                            // Try to get new chunks to refill buffer
-                            let (_, fresh_chunks) = stream_manager_clone.get_chunks_from_current_position();
-                            if !fresh_chunks.is_empty() {
-                                println!("Client {} refilling with {} new chunks", listener_id, fresh_chunks.len());
-                                chunk_queue = VecDeque::from(fresh_chunks);
-                            }
+                    } else {
+                        consecutive_errors = 0;
+                    }
+                },
+                Ok(Err(e)) => {
+                    // Broadcast error
+                    if e.to_string().contains("lagged") {
+                        println!("Client {} broadcast lag, resubscribing", listener_id);
+                        broadcast_rx = stream_manager_clone.get_broadcast_receiver();
+                    } else {
+                        consecutive_errors += 1;
+                        if consecutive_errors >= max_consecutive_errors {
+                            break;
                         }
                     }
+                },
+                Err(_) => {
+                    // Timeout
+                    if let Err(_) = stream.lock().await.send(ws::Message::Ping(vec![])).await {
+                        break;
+                    }
                 }
+            }
+            
+            // Process any messages from client
+            match stream.lock().await.next().await {
+                Some(Ok(ws::Message::Close(_))) => {
+                    println!("Client {} sent close", listener_id);
+                    break;
+                },
+                Some(Ok(ws::Message::Pong(_))) => {
+                    last_activity = Instant::now();
+                },
+                Some(Err(_)) => {
+                    consecutive_errors += 1;
+                    if consecutive_errors >= max_consecutive_errors {
+                        println!("Client {} too many message errors", listener_id);
+                        break;
+                    }
+                },
+                _ => {}
             }
         }
         
         // Cleanup
         stream_manager_clone.decrement_listener_count();
-        println!("Client {} disconnected after {} chunks", listener_id, sent_chunks);
+        println!("Client {} disconnected", listener_id);
         
         Ok(())
     }))
