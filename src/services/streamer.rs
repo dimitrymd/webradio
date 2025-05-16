@@ -494,30 +494,23 @@ impl StreamManager {
     // Set up a connection to feed MP3 data to the transcoder
     pub fn connect_transcoder(&self, transcoder: Arc<transcoder::TranscoderManager>) {
         let broadcast_tx = self.broadcast_tx.clone();
+        
+        // Subscribe to the broadcast channel to get MP3 chunks
+        let mut broadcast_rx = broadcast_tx.subscribe();
+        
+        // Create a clone of the transcoder Arc for the async task
         let transcoder_clone = transcoder.clone();
         
-        // Use a standard thread instead of tokio::spawn
-        thread::spawn(move || {
+        // Spawn a separate task to handle feeding data to the transcoder
+        tokio::spawn(async move {
             info!("Starting MP3 to transcoder feed");
             
-            // Get a receiver
-            let mut broadcast_rx = broadcast_tx.subscribe();
-            
-            // Process in a loop
-            loop {
-                // Use blocking receive instead of .await
-                match broadcast_rx.blocking_recv() {
-                    Ok(chunk) => {
-                        // Feed the chunk to the transcoder
-                        transcoder_clone.add_mp3_chunk(&chunk);
-                    },
-                    Err(e) => {
-                        error!("Error receiving from broadcast: {:?}", e);
-                        // Brief pause before retrying
-                        thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                }
+            while let Ok(chunk) = broadcast_rx.recv().await {
+                // Feed the chunk to the transcoder using the cloned Arc
+                transcoder_clone.add_mp3_chunk(&chunk);
             }
+            
+            info!("MP3 to transcoder feed stopped");
         });
     }
     
