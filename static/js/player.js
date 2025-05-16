@@ -1,5 +1,5 @@
 // player.js - Main entry point that loads all modules
-// ChillOut Radio player - Updated to use WebSockets for now-playing updates with 10s interval
+// ChillOut Radio player - Updated with iOS compatibility using Opus streaming
 
 // Load order: when this file is included, it loads all modules in correct order
 document.addEventListener('DOMContentLoaded', function() {
@@ -8,7 +8,8 @@ document.addEventListener('DOMContentLoaded', function() {
     if (typeof formatTime !== 'function' || 
         typeof startAudio !== 'function' || 
         typeof processQueue !== 'function' || 
-        typeof connectWebSocket !== 'function') {
+        typeof connectWebSocket !== 'function' ||
+        typeof checkMSECompatibility !== 'function') {
         
         console.error('[ERROR] Not all player modules are loaded. Please check script includes.');
         document.getElementById('status-message').textContent = 
@@ -21,5 +22,9 @@ document.addEventListener('DOMContentLoaded', function() {
     // Initialize player (function from player-core.js)
     initPlayer();
     
-    console.log('ChillOut Radio player ready');
+    const platformInfo = state.isIOS ? 
+        'iOS detected (using Opus stream)' : 
+        'Desktop platform (using MP3 stream)';
+    
+    console.log(`ChillOut Radio player ready - ${platformInfo}`);
 });

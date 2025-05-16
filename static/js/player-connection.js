@@ -1,4 +1,100 @@
-// player-connection.js - WebSocket connection and track info handling
+// player-connection.js update - Support Opus streams for iOS
+
+// Improved WebSocket connection with better error handling
+function connectWebSocket() {
+    // Clean up any existing connection
+    if (state.ws) {
+        try {
+            state.ws.close();
+        } catch (e) {
+            // Ignore close errors
+        }
+        state.ws = null;
+    }
+    
+    try {
+        // Determine WebSocket URL based on platform
+        const wsUrl = getWebSocketURL();
+        log(`Connecting to WebSocket: ${wsUrl}`, 'STREAM');
+        
+        // Create connection
+        state.ws = new WebSocket(wsUrl);
+        
+        // Set up event handlers
+        state.ws.onopen = () => {
+            log('WebSocket connection established', 'STREAM');
+            showStatus(`Connected to stream${state.isIOS ? ' (Opus format)' : ''}`);
+            startBtn.textContent = 'Disconnect';
+            startBtn.disabled = false;
+            startBtn.dataset.connected = 'true';
+            state.isPlaying = true;
+            
+            // Reset reconnect attempts on successful connection
+            state.reconnectAttempts = 0;
+            
+            // Request initial track info
+            try {
+                state.ws.send(JSON.stringify({ type: 'now_playing_request' }));
+                log('Requested initial track info', 'TRACK');
+            } catch (e) {
+                log(`Error requesting track info: ${e.message}`, 'TRACK', true);
+                // Fallback to API
+                fetchNowPlaying();
+            }
+            
+            // Start audio playback
+            if (state.audioElement.paused) {
+                const playPromise = state.audioElement.play();
+                playPromise.catch(e => {
+                    log(`Play error: ${e.message}`, 'AUDIO', true);
+                    if (e.name === 'NotAllowedError') {
+                        showStatus('Click play to start audio (browser requires user interaction)', true, false);
+                    }
+                });
+            }
+        };
+        
+        state.ws.onclose = (event) => {
+            log(`WebSocket closed: Code ${event.code}`, 'STREAM');
+            
+            // Only attempt reconnect if we're still supposed to be playing
+            if (state.isPlaying) {
+                // Use a brief delay to avoid hammering the server
+                setTimeout(() => {
+                    if (state.isPlaying) {
+                        showStatus('Connection closed. Reconnecting...', true, false);
+                        attemptReconnection();
+                    }
+                }, 1000);
+            }
+        };
+        
+        state.ws.onerror = (error) => {
+            log('WebSocket error', 'STREAM', true);
+            
+            // Don't immediately try to reconnect - wait for the close event
+            showStatus('Connection error', true, false);
+        };
+        
+        state.ws.onmessage = handleWebSocketMessage;
+        
+        // Set connection timeout (increased for slower connections)
+        // Make it longer for iOS due to potentially slower initial buffering of Opus
+        const timeoutDuration = state.isIOS ? 30000 : 20000;
+        state.connectionTimeout = setTimeout(() => {
+            if (state.ws && state.audioQueue.length === 0) {
+                log('Connection timeout - no data received', 'STREAM', true);
+                showStatus('Connection timeout. Reconnecting...', true, false);
+                attemptReconnection();
+            }
+        }, timeoutDuration);
+        
+    } catch (e) {
+        log(`WebSocket setup error: ${e.message}`, 'STREAM', true);
+        showStatus(`Connection error: ${e.message}`, true);
+        attemptReconnection();
+    }
+}
 
 // Process track info from WebSocket or API
 function updateTrackInfo(info) {
@@ -64,6 +160,26 @@ function handleWebSocketMessage(event) {
     if (event.data instanceof Blob) {
         // Handle non-text data (audio)
         event.data.arrayBuffer().then(buffer => {
+            // Special handling for Opus streams on iOS
+            if (state.isIOS) {
+                // For Opus, we don't need to check for special markers
+                // as they're included in the Ogg container format
+                
+                // Skip empty buffers
+                if (buffer.byteLength === 0) {
+                    return;
+                }
+                
+                // Add data to queue
+                state.audioQueue.push(buffer);
+                state.lastAudioChunkTime = Date.now();
+                
+                // Start processing if not already going
+                processQueue();
+                return;
+            }
+            
+            // Regular MP3 handling for non-iOS platforms
             // Check for special markers (2-byte control messages)
             if (buffer.byteLength === 2) {
                 const view = new Uint8Array(buffer);
@@ -184,101 +300,6 @@ async function fetchNowPlaying() {
         updateTrackInfo(data);
     } catch (error) {
         log(`Error fetching now playing: ${error.message}`, 'API', true);
-    }
-}
-
-// Improved WebSocket connection with better error handling
-function connectWebSocket() {
-    // Clean up any existing connection
-    if (state.ws) {
-        try {
-            state.ws.close();
-        } catch (e) {
-            // Ignore close errors
-        }
-        state.ws = null;
-    }
-    
-    try {
-        // Determine WebSocket URL
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/stream`;
-        log(`Connecting to WebSocket: ${wsUrl}`, 'STREAM');
-        
-        // Create connection
-        state.ws = new WebSocket(wsUrl);
-        
-        // Set up event handlers
-        state.ws.onopen = () => {
-            log('WebSocket connection established', 'STREAM');
-            showStatus('Connected to stream');
-            startBtn.textContent = 'Disconnect';
-            startBtn.disabled = false;
-            startBtn.dataset.connected = 'true';
-            state.isPlaying = true;
-            
-            // Reset reconnect attempts on successful connection
-            state.reconnectAttempts = 0;
-            
-            // Request initial track info
-            try {
-                state.ws.send(JSON.stringify({ type: 'now_playing_request' }));
-                log('Requested initial track info', 'TRACK');
-            } catch (e) {
-                log(`Error requesting track info: ${e.message}`, 'TRACK', true);
-                // Fallback to API
-                fetchNowPlaying();
-            }
-            
-            // Start audio playback
-            if (state.audioElement.paused) {
-                const playPromise = state.audioElement.play();
-                playPromise.catch(e => {
-                    log(`Play error: ${e.message}`, 'AUDIO', true);
-                    if (e.name === 'NotAllowedError') {
-                        showStatus('Click play to start audio (browser requires user interaction)', true, false);
-                    }
-                });
-            }
-        };
-        
-        state.ws.onclose = (event) => {
-            log(`WebSocket closed: Code ${event.code}`, 'STREAM');
-            
-            // Only attempt reconnect if we're still supposed to be playing
-            if (state.isPlaying) {
-                // Use a brief delay to avoid hammering the server
-                setTimeout(() => {
-                    if (state.isPlaying) {
-                        showStatus('Connection closed. Reconnecting...', true, false);
-                        attemptReconnection();
-                    }
-                }, 1000);
-            }
-        };
-        
-        state.ws.onerror = (error) => {
-            log('WebSocket error', 'STREAM', true);
-            
-            // Don't immediately try to reconnect - wait for the close event
-            showStatus('Connection error', true, false);
-        };
-        
-        state.ws.onmessage = handleWebSocketMessage;
-        
-        // Set connection timeout (increased for slower connections)
-        state.connectionTimeout = setTimeout(() => {
-            if (state.ws && state.audioQueue.length === 0) {
-                log('Connection timeout - no data received', 'STREAM', true);
-                showStatus('Connection timeout. Reconnecting...', true, false);
-                attemptReconnection();
-            }
-        }, 20000);
-        
-    } catch (e) {
-        log(`WebSocket setup error: ${e.message}`, 'STREAM', true);
-        showStatus(`Connection error: ${e.message}`, true);
-        attemptReconnection();
     }
 }
 

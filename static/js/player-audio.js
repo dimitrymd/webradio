@@ -1,4 +1,4 @@
-// player-audio.js - Audio playback and buffer handling
+// player-audio.js update - Add Opus support for iOS
 
 // Update the progress bar
 function updateProgressBar(position, duration) {
@@ -178,8 +178,11 @@ function recreateMediaSource() {
             log('New MediaSource opened', 'MEDIA');
             
             try {
-                // Create source buffer
-                state.sourceBuffer = state.mediaSource.addSourceBuffer('audio/mpeg');
+                // Create source buffer with the appropriate type based on platform
+                const mimeType = getSourceBufferType();
+                log(`Creating source buffer with MIME type: ${mimeType}`, 'MEDIA');
+                
+                state.sourceBuffer = state.mediaSource.addSourceBuffer(mimeType);
                 
                 // Setup error handler
                 state.sourceBuffer.addEventListener('error', (event) => {
@@ -272,6 +275,34 @@ function setupAudioListeners() {
             }
         }
     });
+
+    // iOS-specific handling for audio playback
+    if (state.isIOS) {
+        // Audio session management for iOS
+        state.audioElement.addEventListener('play', () => {
+            log('iOS audio play event', 'AUDIO');
+            
+            // Add special handling for iOS WebKit
+            if ('webkitAudioContext' in window) {
+                try {
+                    // Create silent audio context to keep audio session alive
+                    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                    log('Created WebKit audio context for iOS', 'AUDIO');
+                    
+                    // Resume audio context if needed (iOS policy)
+                    if (audioCtx.state === 'suspended') {
+                        audioCtx.resume().then(() => {
+                            log('WebKit audio context resumed', 'AUDIO');
+                        }).catch(e => {
+                            log(`Failed to resume audio context: ${e.message}`, 'AUDIO', true);
+                        });
+                    }
+                } catch (e) {
+                    log(`Error creating WebKit audio context: ${e.message}`, 'AUDIO', true);
+                }
+            }
+        });
+    }
 }
 
 // Set up MediaSource with error handling
@@ -285,8 +316,11 @@ function setupMediaSource() {
             log('MediaSource opened', 'MEDIA');
             
             try {
-                // Create source buffer for MP3
-                state.sourceBuffer = state.mediaSource.addSourceBuffer('audio/mpeg');
+                // Create source buffer with the appropriate MIME type
+                const mimeType = getSourceBufferType();
+                log(`Creating source buffer with MIME type: ${mimeType}`, 'MEDIA');
+                
+                state.sourceBuffer = state.mediaSource.addSourceBuffer(mimeType);
                 
                 // Add buffer monitoring event
                 state.sourceBuffer.addEventListener('updateend', () => {
@@ -329,4 +363,24 @@ function setupMediaSource() {
         showStatus(`Media error: ${e.message}`, true);
         startBtn.disabled = false;
     }
+}
+
+// Check MSE compatibility with the required format
+function checkMSECompatibility() {
+    if (!('MediaSource' in window)) {
+        return {
+            supported: false,
+            message: 'MediaSource API not supported'
+        };
+    }
+    
+    const mimeType = getSourceBufferType();
+    const isSupported = MediaSource.isTypeSupported(mimeType);
+    
+    return {
+        supported: isSupported,
+        message: isSupported ? 
+            `MSE supports ${mimeType}` : 
+            `MSE does not support ${mimeType}`
+    };
 }

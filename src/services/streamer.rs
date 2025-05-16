@@ -489,8 +489,28 @@ impl StreamManager {
             let _ = thread.join();
         }
     }
+
+    // Set up a connection to feed MP3 data to the transcoder
+    pub fn connect_transcoder(&self, transcoder: &services::transcoder::TranscoderManager) {
+        let inner_clone = self.inner.clone();
+        let broadcast_tx = self.broadcast_tx.clone();
+        
+        // Subscribe to the broadcast channel to get MP3 chunks
+        let mut broadcast_rx = broadcast_tx.subscribe();
+        
+        // Spawn a separate task to handle feeding data to the transcoder
+        tokio::spawn(async move {
+            info!("Starting MP3 to transcoder feed");
+            
+            while let Ok(chunk) = broadcast_rx.recv().await {
+                // Feed the chunk to the transcoder
+                transcoder.add_mp3_chunk(&chunk);
+            }
+            
+            info!("MP3 to transcoder feed stopped");
+        });
+    }
     
-    // Add the methods that provide stats
     pub fn get_receiver_count(&self) -> usize {
         self.broadcast_tx.receiver_count()
     }

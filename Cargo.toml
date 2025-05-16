@@ -22,3 +22,10 @@ rand = "0.8.5"
 chrono = "0.4.41"
 futures = "0.3.31"
 tokio-stream = "0.1.17"
+symphonia = { version = "0.5.3", features = ["mp3", "aac", "isomp4", "ogg"] }
+ogg = "0.9.0"
+opus = "0.3.0"
+audiopus = "0.3.0-rc.0"
+minimp3 = "0.5.1"
+hound = "3.5.1"         # WAV file support
+dasp = { version = "0.11.0", features = ["signal", "interpolate", "signal-window"] }

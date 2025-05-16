@@ -1,3 +1,4 @@
+// src/config.rs - Updated with transcoding support
 use std::path::PathBuf;
 use std::env;
 use lazy_static::lazy_static;
@@ -39,3 +40,9 @@ pub const HIGH_BITRATE_EXTRA_CHUNKS: usize = 30;  // Extra chunks for high bitra
 // WebSocket connection management
 pub const WS_PING_INTERVAL_MS: u64 = 5000;  // Send ping every 5 seconds
 pub const WS_TIMEOUT_SECS: u64 = 60;  // Client timeout after 60 seconds of inactivity
+
+// Transcoding configuration
+pub const ENABLE_TRANSCODING: bool = true;  // Enable/disable transcoding to Opus
+pub const OPUS_CHUNK_SIZE: usize = 1024 * 4;  // Smaller chunk size for Opus (4KB)
+pub const OPUS_BUFFER_SIZE: usize = 1024 * 128;  // Buffer size for Opus (128KB)
+pub const OPUS_INITIAL_CHUNKS_TO_SEND: usize = 40;  // Initial chunks for Opus streaming
