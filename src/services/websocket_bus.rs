@@ -240,62 +240,68 @@ impl WebSocketBus {
     }
 
     // Start the broadcast loop in its own task
+    // This method is used externally but doesn't spawn a task directly
     pub fn start_broadcast_loop(self: Arc<Self>) {
-        tokio::spawn(async move {
-            info!("Starting WebSocket broadcast loop");
-            
-            // Get broadcast receiver from StreamManager
-            let stream_manager = self.stream_manager.clone();
-            let mut broadcast_rx = stream_manager.get_broadcast_receiver();
-            
-            // Set up ping timer
-            let ping_interval = tokio::time::Duration::from_millis(crate::config::WS_PING_INTERVAL_MS);
-            let mut ping_timer = tokio::time::interval(ping_interval);
-            
-            // Set up health check timer
-            let health_check_interval = tokio::time::Duration::from_secs(10); // Check every 10 seconds
-            let mut health_check_timer = tokio::time::interval(health_check_interval);
-            
-            loop {
-                tokio::select! {
-                    // Handle ping timer
-                    _ = ping_timer.tick() => {
-                        // Send ping to all clients
-                        self.ping_clients();
-                    }
-                    
-                    // Handle health check timer
-                    _ = health_check_timer.tick() => {
-                        // Perform health check
-                        self.perform_health_check();
-                    }
-                    
-                    // Receive chunks from broadcast
-                    chunk_result = broadcast_rx.recv() => {
-                        match chunk_result {
-                            Ok(chunk) => {
-                                // Broadcast the chunk to all clients
-                                let client_count = self.get_client_count();
-                                if client_count > 0 {
-                                    let message = ws::Message::Binary(chunk);
-                                    self.broadcast(message);
-                                }
-                            },
-                            Err(e) => {
-                                // Handle broadcast errors
-                                if e.to_string().contains("lagged") {
-                                    warn!("Broadcast receiver lagged, resubscribing");
-                                    broadcast_rx = stream_manager.get_broadcast_receiver();
-                                } else {
-                                    error!("Broadcast error: {}", e);
-                                    // Brief pause before retrying
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                }
+        // This method is now just a placeholder that does nothing
+        // We'll use start_broadcast_loop_impl directly from the Rocket fairing
+        info!("WebSocket broadcast loop will be started by Rocket runtime");
+    }
+
+    // The actual implementation that will be called from within Rocket's context
+    pub async fn start_broadcast_loop_impl(self: Arc<Self>) {
+        info!("Starting WebSocket broadcast loop in Rocket runtime context");
+        
+        // Get broadcast receiver from StreamManager
+        let stream_manager = self.stream_manager.clone();
+        let mut broadcast_rx = stream_manager.get_broadcast_receiver();
+        
+        // Set up ping timer
+        let ping_interval = tokio::time::Duration::from_millis(crate::config::WS_PING_INTERVAL_MS);
+        let mut ping_timer = tokio::time::interval(ping_interval);
+        
+        // Set up health check timer
+        let health_check_interval = tokio::time::Duration::from_secs(10); // Check every 10 seconds
+        let mut health_check_timer = tokio::time::interval(health_check_interval);
+        
+        loop {
+            tokio::select! {
+                // Handle ping timer
+                _ = ping_timer.tick() => {
+                    // Send ping to all clients
+                    self.ping_clients();
+                }
+                
+                // Handle health check timer
+                _ = health_check_timer.tick() => {
+                    // Perform health check
+                    self.perform_health_check();
+                }
+                
+                // Receive chunks from broadcast
+                chunk_result = broadcast_rx.recv() => {
+                    match chunk_result {
+                        Ok(chunk) => {
+                            // Broadcast the chunk to all clients
+                            let client_count = self.get_client_count();
+                            if client_count > 0 {
+                                let message = ws::Message::Binary(chunk);
+                                self.broadcast(message);
+                            }
+                        },
+                        Err(e) => {
+                            // Handle broadcast errors
+                            if e.to_string().contains("lagged") {
+                                warn!("Broadcast receiver lagged, resubscribing");
+                                broadcast_rx = stream_manager.get_broadcast_receiver();
+                            } else {
+                                error!("Broadcast error: {}", e);
+                                // Brief pause before retrying
+                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                             }
                         }
                     }
                 }
             }
-        });
+        }
     }
 }

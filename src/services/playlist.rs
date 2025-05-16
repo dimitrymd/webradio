@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 use crate::models::playlist::{Track, Playlist};
 use crate::services::streamer::StreamManager;
@@ -255,7 +256,7 @@ pub fn rescan_and_update_durations(playlist_file: &Path, music_folder: &Path) {
 }
 
 // Fixed track_switcher function with proper access to StreamManager
-pub fn track_switcher(stream_manager: StreamManager) {
+pub fn track_switcher(stream_manager: Arc<StreamManager>) {
     // The broadcast thread now handles all track switching internally
     // This function is now just a monitoring function
     

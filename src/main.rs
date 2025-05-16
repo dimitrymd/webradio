@@ -69,9 +69,8 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     // Create WebSocket bus for optimized handling
     let websocket_bus = Arc::new(WebSocketBus::new(stream_manager.clone()));
     
-    // Start WebSocket broadcast loop in a separate task
-    println!("Starting WebSocket broadcast loop...");
-    websocket_bus.clone().start_broadcast_loop();
+    // Don't start the WebSocket broadcast loop here; it will be started by Rocket
+    // We'll set up a Rocket fairing to start it when the Rocket runtime is available
     
     // Start monitoring thread to handle track switching
     let stream_manager_for_monitor = stream_manager.clone();
@@ -86,6 +85,7 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     rocket::build()
         .manage(stream_manager.clone())
         .manage(websocket_bus.clone())
+        .attach(WebSocketFairing)  // Add a custom fairing to start the WebSocket broadcast loop
         .mount("/", routes![
             handlers::index,
             handlers::now_playing,
@@ -100,4 +100,37 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
             handlers::service_unavailable,
         ])
         .attach(Template::fairing())
+}
+
+use rocket::{fairing::{Fairing, Info, Kind}, Rocket, Build};
+
+// Fairing to start the WebSocket broadcast loop within Rocket's runtime context
+struct WebSocketFairing;
+
+#[rocket::async_trait]
+impl Fairing for WebSocketFairing {
+    fn info(&self) -> Info {
+        Info {
+            name: "WebSocket Broadcast Loop",
+            kind: Kind::Ignite
+        }
+    }
+
+    async fn on_ignite(&self, rocket: Rocket<Build>) -> rocket::fairing::Result {
+        // Get the WebSocketBus from managed state
+        if let Some(websocket_bus) = rocket.state::<Arc<WebSocketBus>>() {
+            println!("Starting WebSocket broadcast loop from Rocket runtime...");
+            
+            // Clone the bus and start the broadcast loop
+            let bus = websocket_bus.clone();
+            tokio::spawn(async move {
+                // Start the WebSocket broadcasting
+                bus.start_broadcast_loop_impl().await;
+            });
+        } else {
+            println!("WARNING: Could not find WebSocketBus in Rocket state");
+        }
+        
+        Ok(rocket)
+    }
 }
