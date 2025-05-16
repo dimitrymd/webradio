@@ -152,6 +152,9 @@ pub fn stream_ws(
             }
         });
         
+        // Create a stream manager reference for handling client requests
+        let stream_manager = websocket_bus.get_stream_manager();
+        
         // Process incoming messages from client
         while let Some(result) = stream.next().await {
             match result {
@@ -167,6 +170,44 @@ pub fn stream_ws(
                     // Handle text commands from client
                     log::debug!("Client {} sent message: {}", client_id, text);
                     websocket_bus.update_client_activity(client_id);
+                    
+                    // Try to parse the message as JSON
+                    if let Ok(request) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(req_type) = request.get("type").and_then(|t| t.as_str()) {
+                            match req_type {
+                                "now_playing_request" => {
+                                    // Get current track info
+                                    let track_info = get_now_playing_data(&stream_manager);
+                                    
+                                    // Format as a response message
+                                    let response = serde_json::json!({
+                                        "type": "now_playing",
+                                        "track": track_info
+                                    });
+                                    
+                                    // Send response to this client only
+                                    if let Ok(response_str) = serde_json::to_string(&response) {
+                                        websocket_bus.send_to_client(
+                                            client_id, 
+                                            ws::Message::Text(response_str)
+                                        );
+                                    }
+                                },
+                                "ping" => {
+                                    // Client is checking connection - respond with pong
+                                    websocket_bus.send_to_client(
+                                        client_id,
+                                        ws::Message::Text(r#"{"type":"pong"}"#.to_string())
+                                    );
+                                },
+                                _ => {
+                                    log::debug!("Unknown request type: {}", req_type);
+                                }
+                            }
+                        }
+                    } else {
+                        log::debug!("Non-JSON message from client {}: {}", client_id, text);
+                    }
                 },
                 Err(e) => {
                     log::error!("WebSocket error from client {}: {}", client_id, e);
@@ -185,6 +226,64 @@ pub fn stream_ws(
         
         Ok(())
     }))
+}
+
+// Helper function to get now playing data - this would be added to handlers.rs
+fn get_now_playing_data(stream_manager: &Arc<StreamManager>) -> serde_json::Value {
+    // Get the actual current track from the stream manager's state
+    let track_info = stream_manager.get_track_info();
+    let playback_position = stream_manager.get_playback_position();
+    let active_listeners = stream_manager.get_active_listeners();
+    let current_bitrate = stream_manager.get_current_bitrate();
+    
+    // If we have track info from the stream manager, parse and use it
+    if let Some(track_json) = track_info {
+        if let Ok(mut track_value) = serde_json::from_str::<serde_json::Value>(&track_json) {
+            if let serde_json::Value::Object(ref mut map) = track_value {
+                map.insert(
+                    "active_listeners".to_string(), 
+                    serde_json::Value::Number(serde_json::Number::from(active_listeners))
+                );
+                map.insert(
+                    "playback_position".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(playback_position))
+                );
+                map.insert(
+                    "bitrate".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(current_bitrate / 1000))
+                );
+            }
+            return track_value;
+        }
+    }
+    
+    // Fallback to playlist if stream manager doesn't have current info
+    let track = playlist::get_current_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER);
+    
+    match track {
+        Some(track) => {
+            let mut track_json = serde_json::to_value(track).unwrap_or_default();
+            if let serde_json::Value::Object(ref mut map) = track_json {
+                map.insert(
+                    "active_listeners".to_string(), 
+                    serde_json::Value::Number(serde_json::Number::from(active_listeners))
+                );
+                map.insert(
+                    "playback_position".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(playback_position))
+                );
+                map.insert(
+                    "bitrate".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(current_bitrate / 1000))
+                );
+            }
+            
+            track_json
+        },
+        None => serde_json::json!({
+            "error": "No tracks available"
+        })
+    }
 }
 
 #[get("/diag")]

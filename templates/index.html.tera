@@ -153,6 +153,13 @@
             border-radius: 50%;
             cursor: pointer;
         }
+        
+        .footer {
+            text-align: center;
+            margin-top: 20px;
+            font-size: 14px;
+            color: #888;
+        }
     </style>
 </head>
 <body>
@@ -191,10 +198,15 @@
         <div class="status-message" id="status-message" style="display: none;"></div>
 
         <div class="footer">
-            <p>Streaming your favorite chill music from Public Domain 24/7</p>
+            <p>Streaming your favorite chill music 24/7</p>
         </div>
     </div>
 
+    <!-- Player module scripts - order matters -->
+    <script src="/static/js/player-core.js"></script>
+    <script src="/static/js/player-audio.js"></script>
+    <script src="/static/js/player-connection.js"></script>
+    <script src="/static/js/player-control.js"></script>
     <script src="/static/js/player.js"></script>
 </body>
 </html>

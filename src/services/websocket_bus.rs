@@ -39,6 +39,10 @@ impl WebSocketBus {
         }
     }
 
+    pub fn get_stream_manager(&self) -> Arc<StreamManager> {
+        self.stream_manager.clone()
+    }
+
     // Add a new client connection
     pub fn add_client(&self) -> (usize, mpsc::UnboundedReceiver<ws::Message>) {
         let client_id = self.client_counter.fetch_add(1, Ordering::SeqCst);
@@ -98,6 +102,56 @@ impl WebSocketBus {
             }
         } else {
             false
+        }
+    }
+
+    pub fn broadcast_text(&self, text: &str) {
+        let message = ws::Message::Text(text.to_string());
+        let clients = self.clients.lock();
+        
+        // Send the message to each client
+        for (client_id, client) in clients.iter() {
+            if let Err(e) = client.tx.send(message.clone()) {
+                error!("Error broadcasting text to client {}: {}", client_id, e);
+            }
+        }
+    }
+
+    pub fn broadcast_now_playing(&self) {
+        // Get track info from stream manager
+        let track_info = self.stream_manager.get_track_info();
+        let playback_position = self.stream_manager.get_playback_position();
+        let active_listeners = self.get_active_listeners();
+        let current_bitrate = self.stream_manager.get_current_bitrate();
+        
+        if let Some(track_json) = track_info {
+            if let Ok(mut track_value) = serde_json::from_str::<serde_json::Value>(&track_json) {
+                if let serde_json::Value::Object(ref mut map) = track_value {
+                    map.insert(
+                        "active_listeners".to_string(), 
+                        serde_json::Value::Number(serde_json::Number::from(active_listeners))
+                    );
+                    map.insert(
+                        "playback_position".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(playback_position))
+                    );
+                    map.insert(
+                        "bitrate".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(current_bitrate / 1000))
+                    );
+                }
+                
+                // Create the now playing message
+                let now_playing_message = serde_json::json!({
+                    "type": "now_playing",
+                    "track": track_value
+                });
+                
+                // Broadcast to all clients
+                if let Ok(message_text) = serde_json::to_string(&now_playing_message) {
+                    self.broadcast_text(&message_text);
+                }
+            }
         }
     }
 
@@ -249,59 +303,71 @@ impl WebSocketBus {
 
     // The actual implementation that will be called from within Rocket's context
     pub async fn start_broadcast_loop_impl(self: Arc<Self>) {
-        info!("Starting WebSocket broadcast loop in Rocket runtime context");
-        
-        // Get broadcast receiver from StreamManager
-        let stream_manager = self.stream_manager.clone();
-        let mut broadcast_rx = stream_manager.get_broadcast_receiver();
-        
-        // Set up ping timer
-        let ping_interval = tokio::time::Duration::from_millis(crate::config::WS_PING_INTERVAL_MS);
-        let mut ping_timer = tokio::time::interval(ping_interval);
-        
-        // Set up health check timer
-        let health_check_interval = tokio::time::Duration::from_secs(10); // Check every 10 seconds
-        let mut health_check_timer = tokio::time::interval(health_check_interval);
-        
-        loop {
-            tokio::select! {
-                // Handle ping timer
-                _ = ping_timer.tick() => {
-                    // Send ping to all clients
-                    self.ping_clients();
-                }
-                
-                // Handle health check timer
-                _ = health_check_timer.tick() => {
-                    // Perform health check
-                    self.perform_health_check();
-                }
-                
-                // Receive chunks from broadcast
-                chunk_result = broadcast_rx.recv() => {
-                    match chunk_result {
-                        Ok(chunk) => {
-                            // Broadcast the chunk to all clients
-                            let client_count = self.get_client_count();
-                            if client_count > 0 {
-                                let message = ws::Message::Binary(chunk);
-                                self.broadcast(message);
-                            }
-                        },
-                        Err(e) => {
-                            // Handle broadcast errors
-                            if e.to_string().contains("lagged") {
-                                warn!("Broadcast receiver lagged, resubscribing");
-                                broadcast_rx = stream_manager.get_broadcast_receiver();
-                            } else {
-                                error!("Broadcast error: {}", e);
-                                // Brief pause before retrying
-                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        tokio::spawn(async move {
+            info!("Starting WebSocket broadcast loop");
+            
+            // Get broadcast receiver from StreamManager
+            let stream_manager = self.stream_manager.clone();
+            let mut broadcast_rx = stream_manager.get_broadcast_receiver();
+            
+            // Set up ping timer
+            let ping_interval = tokio::time::Duration::from_millis(crate::config::WS_PING_INTERVAL_MS);
+            let mut ping_timer = tokio::time::interval(ping_interval);
+            
+            // Set up health check timer
+            let health_check_interval = tokio::time::Duration::from_secs(10); // Check every 10 seconds
+            let mut health_check_timer = tokio::time::interval(health_check_interval);
+            
+            // Set up now playing update timer - 10 seconds interval
+            let now_playing_interval = tokio::time::Duration::from_secs(10);
+            let mut now_playing_timer = tokio::time::interval(now_playing_interval);
+            
+            loop {
+                tokio::select! {
+                    // Handle ping timer
+                    _ = ping_timer.tick() => {
+                        // Send ping to all clients
+                        self.ping_clients();
+                    }
+                    
+                    // Handle health check timer
+                    _ = health_check_timer.tick() => {
+                        // Perform health check
+                        self.perform_health_check();
+                    }
+                    
+                    // Handle now playing update timer
+                    _ = now_playing_timer.tick() => {
+                        // Broadcast now playing update
+                        self.broadcast_now_playing();
+                    }
+                    
+                    // Receive chunks from broadcast
+                    chunk_result = broadcast_rx.recv() => {
+                        match chunk_result {
+                            Ok(chunk) => {
+                                // Broadcast the chunk to all clients
+                                let client_count = self.get_client_count();
+                                if client_count > 0 {
+                                    let message = ws::Message::Binary(chunk);
+                                    self.broadcast(message);
+                                }
+                            },
+                            Err(e) => {
+                                // Handle broadcast errors
+                                if e.to_string().contains("lagged") {
+                                    warn!("Broadcast receiver lagged, resubscribing");
+                                    broadcast_rx = stream_manager.get_broadcast_receiver();
+                                } else {
+                                    error!("Broadcast error: {}", e);
+                                    // Brief pause before retrying
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                }
                             }
                         }
                     }
                 }
             }
-        }
+        });
     }
 }
