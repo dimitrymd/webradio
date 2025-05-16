@@ -1,4 +1,4 @@
-// Improved streamer.rs with better buffer management and consistent config
+// Updated streamer.rs for better integration with WebSocketBus
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -41,7 +41,7 @@ struct StreamManagerInner {
     // Reference to broadcast sender
     broadcast_tx: broadcast::Sender<Vec<u8>>,
     
-    // Recent chunks for new clients - increased capacity
+    // Recent chunks for new clients
     saved_chunks: VecDeque<Vec<u8>>,
     max_saved_chunks: usize,
     
@@ -55,13 +55,13 @@ struct StreamManagerInner {
     current_bitrate: u64,
 }
 
-// Improved StreamManager implementation with better buffering
+// Improved StreamManager implementation with better support for WebSocketBus
 impl StreamManager {
     pub fn new(music_folder: &Path, chunk_size: usize, buffer_size: usize, _cache_time: u64) -> Self {
         info!("Initializing StreamManager with chunk_size={}, buffer_size={}", chunk_size, buffer_size);
         
-        // Larger buffer for smoother streaming (1000 -> 2000)
-        let (broadcast_tx, _) = broadcast::channel(2000);
+        // Larger buffer for smoother streaming
+        let (broadcast_tx, _) = broadcast::channel(2000); 
         let should_stop = Arc::new(AtomicBool::new(false));
         
         let inner = StreamManagerInner {
@@ -474,10 +474,6 @@ impl StreamManager {
         self.inner.lock().current_bitrate
     }
     
-    pub fn inner(&self) -> &Self {
-        self
-    }
-    
     pub fn stop_broadcasting(&self) {
         info!("Stopping broadcast");
         
@@ -494,7 +490,7 @@ impl StreamManager {
         }
     }
     
-    // Add the methods that caused the compilation errors
+    // Add the methods that provide stats
     pub fn get_receiver_count(&self) -> usize {
         self.broadcast_tx.receiver_count()
     }

@@ -1,10 +1,11 @@
-// Updated main.rs with improved streaming integration
+// Updated main.rs with optimized WebSocket handling
 
 extern crate rocket;
 
 use rocket_dyn_templates::Template;
 use rocket::{launch, routes, catchers};
 use std::thread;
+use std::sync::Arc;
 
 mod config;
 mod handlers;
@@ -13,23 +14,24 @@ mod services;
 mod utils;
 
 use crate::services::streamer::StreamManager;
+use crate::services::websocket_bus::WebSocketBus;
 use crate::services::playlist;
 
 #[launch]
 fn rocket() -> rocket::Rocket<rocket::Build> {
     println!("============================================================");
-    println!("Starting Rust MP3 Web Radio (Improved Buffer Management)");
+    println!("Starting Rust MP3 Web Radio (Optimized WebSocket Architecture)");
     println!("Music folder: {}", config::MUSIC_FOLDER.display());
     println!("Chunk size: {}, Buffer size: {}", config::CHUNK_SIZE, config::BUFFER_SIZE);
     println!("============================================================");
 
-    // Initialize the stream manager with the new configuration values
-    let stream_manager = StreamManager::new(
+    // Initialize the stream manager with the configuration values
+    let stream_manager = Arc::new(StreamManager::new(
         &config::MUSIC_FOLDER,
         config::CHUNK_SIZE,
         config::BUFFER_SIZE,
         config::STREAM_CACHE_TIME,
-    );
+    ));
     
     // Rescan and update durations before starting
     println!("Checking and updating track durations...");
@@ -58,29 +60,37 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     
     // Start the broadcast thread only if we have tracks
     if has_tracks {
-        println!("Starting broadcast thread with improved buffer management...");
+        println!("Starting broadcast thread...");
         stream_manager.start_broadcast_thread();
     } else {
         println!("Not starting broadcast thread - no tracks available");
     }
 
-    // Start monitoring thread 
-    let stream_manager_clone = stream_manager.clone();
+    // Create WebSocket bus for optimized handling
+    let websocket_bus = Arc::new(WebSocketBus::new(stream_manager.clone()));
+    
+    // Start WebSocket broadcast loop in a separate task
+    println!("Starting WebSocket broadcast loop...");
+    websocket_bus.clone().start_broadcast_loop();
+    
+    // Start monitoring thread to handle track switching
+    let stream_manager_for_monitor = stream_manager.clone();
     thread::spawn(move || {
         println!("Starting track monitoring thread...");
-        crate::services::playlist::track_switcher(stream_manager_clone);
+        crate::services::playlist::track_switcher(stream_manager_for_monitor.clone());
     });
     
     println!("Server initialization complete, starting web server...");
     
     // Build and launch the Rocket instance
     rocket::build()
-        .manage(stream_manager)
+        .manage(stream_manager.clone())
+        .manage(websocket_bus.clone())
         .mount("/", routes![
             handlers::index,
             handlers::now_playing,
             handlers::get_stats,
-            handlers::stream_ws,  // WebSocket endpoint with improved streaming
+            handlers::stream_ws,  // Optimized WebSocket endpoint
             handlers::static_files,
             handlers::diagnostic_page,
         ])
