@@ -1,5 +1,4 @@
-// Updated main.rs with transcoder support
-
+// Final updated main.rs for clean implementation
 extern crate rocket;
 
 use rocket_dyn_templates::Template;
@@ -12,7 +11,6 @@ mod handlers;
 mod models;
 mod services;
 mod utils;
-mod transcoder;
 
 use crate::services::streamer::StreamManager;
 use crate::services::websocket_bus::WebSocketBus;
@@ -36,11 +34,11 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         config::STREAM_CACHE_TIME,
     ));
     
-    // Initialize the transcoder for iOS
-    let mut transcoder = TranscoderManager::new(
+    // Initialize the transcoder for iOS and immediately wrap in Arc
+    let transcoder = Arc::new(TranscoderManager::new(
         config::OPUS_BUFFER_SIZE,
         config::OPUS_CHUNK_SIZE,
-    );
+    ));
     
     // Rescan and update durations before starting
     println!("Checking and updating track durations...");
@@ -82,11 +80,12 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         // Also start transcoder if enabled
         if config::ENABLE_TRANSCODING {
             println!("Starting MP3 to Opus transcoder...");
-            transcoder.start_transcoding();
+            // Use the new method that works on shared references
+            transcoder.start_transcoding_shared();
             
             // Connect the stream manager to feed MP3 data to the transcoder
             println!("Connecting stream manager to transcoder...");
-            stream_manager.connect_transcoder(&transcoder);
+            stream_manager.connect_transcoder(transcoder.clone());
         }
     } else {
         println!("Not starting broadcast thread - no tracks available");
@@ -99,16 +98,13 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         crate::services::playlist::track_switcher(stream_manager_for_monitor.clone());
     });
     
-    // Create a reference to the transcoder for the handler
-    let transcoder_arc = Arc::new(transcoder);
-    
     println!("Server initialization complete, starting web server...");
     
     // Build and launch the Rocket instance
     rocket::build()
         .manage(stream_manager.clone())
         .manage(websocket_bus.clone())
-        .manage(transcoder_arc.clone())
+        .manage(transcoder.clone())
         .mount("/", routes![
             handlers::index,
             handlers::now_playing,

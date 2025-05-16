@@ -1,22 +1,20 @@
-// src/transcoder/mod.rs
+// Complete updated safe implementation for transcoder/mod.rs
 
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::Cursor;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use log::{info, warn, error, debug};
 use tokio::sync::broadcast;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use symphonia::core::audio::{SampleBuffer, Signal};
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
-use symphonia::core::formats::FormatOptions;
-use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
-use ogg::writing::PacketWriter;
-use audiopus::{Encoder as OpusEncoder, Application as OpusApplication, Channels, Error as OpusError};
+// Use minimp3 instead of Symphonia
+use minimp3::{Decoder as MP3Decoder, Frame as MP3Frame, Error as MP3Error};
+use ogg::writing::{PacketWriter, PacketWriteEndInfo};
+use audiopus::{Application as OpusApplication, SampleRate, Bitrate};
+use audiopus::coder::Encoder as OpusEncoder;
+use audiopus::Channels;
 
 use crate::config;
 
@@ -35,7 +33,7 @@ pub struct TranscoderManager {
     opus_broadcast_tx: Arc<broadcast::Sender<Vec<u8>>>,
     is_transcoding: Arc<AtomicBool>,
     should_stop: Arc<AtomicBool>,
-    transcoder_thread: Option<thread::JoinHandle<()>>,
+    transcoder_thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
     buffer_size: usize,
     chunk_size: usize,
 }
@@ -50,7 +48,7 @@ impl TranscoderManager {
             opus_broadcast_tx: Arc::new(opus_broadcast_tx),
             is_transcoding: Arc::new(AtomicBool::new(false)),
             should_stop: Arc::new(AtomicBool::new(false)),
-            transcoder_thread: None,
+            transcoder_thread: Arc::new(Mutex::new(None)),
             buffer_size,
             chunk_size,
         }
@@ -92,12 +90,17 @@ impl TranscoderManager {
         chunks
     }
     
-    pub fn start_transcoding(&mut self) {
-        if self.transcoder_thread.is_some() {
-            warn!("Transcoder thread already running");
-            return;
+    pub fn start_transcoding_shared(&self) {
+        // Check if already running
+        {
+            let thread_guard = self.transcoder_thread.lock();
+            if thread_guard.is_some() {
+                warn!("Transcoder thread already running");
+                return;
+            }
         }
         
+        // Clone all the necessary Arc fields for the new thread
         let mp3_buffer = self.mp3_buffer.clone();
         let opus_buffer = self.opus_buffer.clone();
         let opus_broadcast_tx = self.opus_broadcast_tx.clone();
@@ -108,6 +111,7 @@ impl TranscoderManager {
         info!("Starting transcoder thread");
         is_transcoding.store(true, Ordering::SeqCst);
         
+        // Spawn the thread
         let thread_handle = thread::spawn(move || {
             Self::transcoding_loop(
                 mp3_buffer,
@@ -119,7 +123,14 @@ impl TranscoderManager {
             );
         });
         
-        self.transcoder_thread = Some(thread_handle);
+        // Update the thread field through the Mutex
+        let mut thread_guard = self.transcoder_thread.lock();
+        *thread_guard = Some(thread_handle);
+    }
+    
+    // Original method kept for backward compatibility
+    pub fn start_transcoding(&mut self) {
+        self.start_transcoding_shared();
     }
     
     fn transcoding_loop(
@@ -134,13 +145,25 @@ impl TranscoderManager {
         
         // Create opus encoder
         let mut opus_encoder = match OpusEncoder::new(
-            OPUS_SAMPLE_RATE,
+            // Convert u32 to SampleRate enum
+            match OPUS_SAMPLE_RATE {
+                8000 => SampleRate::Hz8000,
+                12000 => SampleRate::Hz12000,
+                16000 => SampleRate::Hz16000,
+                24000 => SampleRate::Hz24000,
+                48000 => SampleRate::Hz48000,
+                _ => {
+                    error!("Unsupported sample rate: {}", OPUS_SAMPLE_RATE);
+                    is_transcoding.store(false, Ordering::SeqCst);
+                    return;
+                }
+            },
             Channels::Stereo,
             OpusApplication::Audio,
         ) {
-            Ok(encoder) => {
+            Ok(mut encoder) => {
                 // Set bitrate
-                if let Err(e) = encoder.set_bitrate(audiopus::Bitrate::Bits(OPUS_BITRATE)) {
+                if let Err(e) = encoder.set_bitrate(Bitrate::BitsPerSecond(OPUS_BITRATE)) {
                     error!("Failed to set Opus bitrate: {:?}", e);
                 }
                 encoder
@@ -152,66 +175,61 @@ impl TranscoderManager {
             }
         };
         
-        // Create Ogg packet writer for headers
-        let mut ogg_packet_writer = match PacketWriter::new() {
-            Ok(writer) => writer,
-            Err(e) => {
-                error!("Failed to create Ogg packet writer: {:?}", e);
-                is_transcoding.store(false, Ordering::SeqCst);
-                return;
-            }
-        };
-        
-        // Generate and broadcast Opus/Ogg headers
+        // Generate Opus headers
         let opus_id_header = generate_opus_id_header();
         let opus_comment_header = generate_opus_comment_header();
         
-        // Write header packets
+        // Set up headers with Ogg container
         let mut header_buffer = Vec::new();
-        if let Err(e) = ogg_packet_writer.write_packet(
-            opus_id_header.as_slice(), 
-            true, // bos (beginning of stream)
-            false // eos (end of stream)
-        ) {
-            error!("Failed to write Opus ID header: {:?}", e);
+        {
+            // Scope for first header writer
+            let mut ogg_buffer = Vec::new();
+            let mut ogg_writer = PacketWriter::new(&mut ogg_buffer);
+            
+            // Write ID header
+            if let Err(e) = ogg_writer.write_packet(
+                &opus_id_header,
+                0,
+                PacketWriteEndInfo::EndPage,
+                0,
+            ) {
+                error!("Failed to write Opus ID header: {:?}", e);
+            }
+            
+            // Add to header buffer
+            header_buffer.extend_from_slice(&ogg_buffer);
         }
         
-        if let Err(e) = ogg_packet_writer.write_packet(
-            opus_comment_header.as_slice(),
-            false, // bos
-            false  // eos
-        ) {
-            error!("Failed to write Opus comment header: {:?}", e);
+        {
+            // Scope for second header writer
+            let mut ogg_buffer = Vec::new();
+            let mut ogg_writer = PacketWriter::new(&mut ogg_buffer);
+            
+            // Write comment header
+            if let Err(e) = ogg_writer.write_packet(
+                &opus_comment_header,
+                0,
+                PacketWriteEndInfo::NormalPacket,
+                0,
+            ) {
+                error!("Failed to write Opus comment header: {:?}", e);
+            }
+            
+            // Add to header buffer
+            header_buffer.extend_from_slice(&ogg_buffer);
         }
         
-        // Get header data
-        header_buffer.extend_from_slice(&ogg_packet_writer.inner_mut());
-        
-        // Add headers to opus buffer
+        // Add headers to opus buffer and broadcast
         {
             let mut opus_buf = opus_buffer.lock();
             opus_buf.clear();
             opus_buf.extend_from_slice(&header_buffer);
         }
         
-        // Broadcast headers
         let _ = opus_broadcast_tx.send(header_buffer);
         
-        // Create a new packet writer for audio data
-        let mut ogg_packet_writer = match PacketWriter::new() {
-            Ok(writer) => writer,
-            Err(e) => {
-                error!("Failed to create Ogg packet writer for audio: {:?}", e);
-                is_transcoding.store(false, Ordering::SeqCst);
-                return;
-            }
-        };
-        
-        // Main transcoding loop
+        // Main processing loop
         let mut last_process_time = Instant::now();
-        let mut decoder_initialized = false;
-        let mut symphonia_decoder = None;
-        let mut symphonia_format = None;
         
         while !should_stop.load(Ordering::SeqCst) {
             // Get a copy of the current MP3 buffer
@@ -226,194 +244,83 @@ impl TranscoderManager {
                 buffer.clone()
             };
             
-            // Initialize decoder if needed
-            if !decoder_initialized {
-                // Create media source
-                let source = Cursor::new(mp3_data.clone());
-                let mss = MediaSourceStream::new(Box::new(source), Default::default());
-                
-                // Create a hint to help the format registry guess the format
-                let mut hint = Hint::new();
-                hint.with_extension("mp3");
-                
-                // Use the default options for metadata and format readers
-                let format_opts = FormatOptions::default();
-                let metadata_opts = MetadataOptions::default();
-                let decoder_opts = DecoderOptions::default();
-                
-                // Probe the media source
-                match symphonia::default::get_probe().format(&hint, mss, &format_opts, &metadata_opts) {
-                    Ok(probed) => {
-                        // Get the format reader
-                        let format = probed.format;
+            // Use minimp3 decoder with safety checks
+            debug!("Creating MP3 decoder for buffer of size: {}", mp3_data.len());
+            let mut decoder = MP3Decoder::new(Cursor::new(mp3_data));
+            
+            // Accumulation buffer for Ogg data
+            let mut pending_ogg_data = Vec::new();
+            
+            // Process MP3 frames
+            let mut frames_processed = 0;
+            loop {
+                match decoder.next_frame() {
+                    Ok(frame) => {
+                        debug!("Decoded MP3 frame: sample rate: {}, channels: {}, samples: {}", 
+                              frame.sample_rate, frame.channels, frame.data.len());
                         
-                        // Get the default track
-                        let track = match format.default_track() {
-                            Some(track) => track,
-                            None => {
-                                error!("No default track found in MP3 data");
-                                thread::sleep(Duration::from_millis(500));
-                                continue;
-                            }
-                        };
-                        
-                        // Create a decoder for the track
-                        match symphonia::default::get_codecs().make(&track.codec_params, &decoder_opts) {
-                            Ok(dec) => {
-                                symphonia_decoder = Some(dec);
-                                symphonia_format = Some(format);
-                                decoder_initialized = true;
-                                debug!("Decoder initialized successfully");
-                            },
-                            Err(e) => {
-                                error!("Failed to create decoder: {:?}", e);
-                                thread::sleep(Duration::from_millis(500));
-                                continue;
-                            }
+                        // Validate the frame before processing
+                        if !is_valid_mp3_frame(&frame) {
+                            debug!("Skipping invalid frame");
+                            continue;
                         }
+                        
+                        // Process the frame safely
+                        process_mp3_frame_safely(&frame, &mut opus_encoder, &mut pending_ogg_data);
+                        frames_processed += 1;
+                    },
+                    Err(MP3Error::Eof) => {
+                        // Reached end of buffer, this is normal
+                        debug!("Reached end of MP3 buffer after processing {} frames", frames_processed);
+                        break;
                     },
                     Err(e) => {
-                        error!("Failed to probe MP3 data: {:?}", e);
-                        thread::sleep(Duration::from_millis(500));
-                        continue;
+                        // Handle other errors
+                        error!("MP3 decoding error: {:?}", e);
+                        // If we've processed some frames, we can continue
+                        if frames_processed > 0 {
+                            debug!("Continuing after error, processed {} frames", frames_processed);
+                        } else {
+                            // If we haven't processed any frames, pause before retrying
+                            thread::sleep(Duration::from_millis(100));
+                        }
+                        break;
                     }
                 }
             }
             
-            // Process audio with the initialized decoder
-            if decoder_initialized && symphonia_decoder.is_some() && symphonia_format.is_some() {
-                let decoder = symphonia_decoder.as_mut().unwrap();
-                let format = symphonia_format.as_mut().unwrap();
+            // Process accumulated Ogg data
+            if !pending_ogg_data.is_empty() && 
+               (last_process_time.elapsed() > Duration::from_millis(100) || pending_ogg_data.len() > chunk_size * 2) {
                 
-                // Read and decode packets
-                match format.next_packet() {
-                    Ok(packet) => {
-                        // Decode the packet
-                        match decoder.decode(&packet) {
-                            Ok(decoded) => {
-                                // Get the decoded audio buffer
-                                let spec = *decoded.spec();
-                                let duration = decoded.capacity() as u64;
-                                
-                                // Create a sample buffer for the decoded audio
-                                let mut sample_buf = SampleBuffer::<f32>::new(duration, spec);
-                                
-                                // Copy the decoded audio to the sample buffer
-                                sample_buf.copy_interleaved_ref(decoded);
-                                let samples = sample_buf.samples();
-                                
-                                // Convert to i16 samples for Opus
-                                let mut i16_samples = Vec::with_capacity(samples.len());
-                                for &sample in samples {
-                                    let i16_sample = (sample * 32767.0).round() as i16;
-                                    i16_samples.push(i16_sample);
-                                }
-                                
-                                // Encode to Opus
-                                for chunk in i16_samples.chunks(OPUS_FRAME_SIZE * OPUS_CHANNELS as usize) {
-                                    if chunk.len() < OPUS_FRAME_SIZE * OPUS_CHANNELS as usize {
-                                        // Pad with zeros if needed
-                                        let mut padded_chunk = Vec::from(chunk);
-                                        padded_chunk.resize(OPUS_FRAME_SIZE * OPUS_CHANNELS as usize, 0);
-                                        
-                                        // Encode
-                                        let mut opus_data = vec![0u8; 4000]; // Buffer for opus data
-                                        match opus_encoder.encode(&padded_chunk, &mut opus_data) {
-                                            Ok(bytes_written) => {
-                                                opus_data.truncate(bytes_written);
-                                                
-                                                // Write to Ogg container
-                                                if let Err(e) = ogg_packet_writer.write_packet(
-                                                    &opus_data, 
-                                                    false, // bos
-                                                    false  // eos
-                                                ) {
-                                                    error!("Failed to write Opus packet: {:?}", e);
-                                                }
-                                            },
-                                            Err(e) => {
-                                                error!("Failed to encode Opus frame: {:?}", e);
-                                            }
-                                        }
-                                    } else {
-                                        // Encode full-sized chunk
-                                        let mut opus_data = vec![0u8; 4000]; // Buffer for opus data
-                                        match opus_encoder.encode(chunk, &mut opus_data) {
-                                            Ok(bytes_written) => {
-                                                opus_data.truncate(bytes_written);
-                                                
-                                                // Write to Ogg container
-                                                if let Err(e) = ogg_packet_writer.write_packet(
-                                                    &opus_data, 
-                                                    false, // bos
-                                                    false  // eos
-                                                ) {
-                                                    error!("Failed to write Opus packet: {:?}", e);
-                                                }
-                                            },
-                                            Err(e) => {
-                                                error!("Failed to encode Opus frame: {:?}", e);
-                                            }
-                                        }
-                                    }
-                                }
-                            },
-                            Err(e) => {
-                                error!("Failed to decode packet: {:?}", e);
-                            }
-                        }
-                    },
-                    Err(symphonia::core::errors::Error::IoError(_)) |
-                    Err(symphonia::core::errors::Error::ResetRequired) => {
-                        // Need to reset the decoder - recreate next iteration
-                        decoder_initialized = false;
-                        symphonia_decoder = None;
-                        symphonia_format = None;
-                        debug!("Decoder reset required");
-                        continue;
-                    },
-                    Err(e) => {
-                        error!("Failed to get next packet: {:?}", e);
-                        // Brief pause to avoid tight loop on repeated errors
-                        thread::sleep(Duration::from_millis(10));
+                // Add to opus buffer
+                {
+                    let mut opus_buf = opus_buffer.lock();
+                    opus_buf.extend_from_slice(&pending_ogg_data);
+                    
+                    // Cap buffer size
+                    if opus_buf.len() > config::BUFFER_SIZE {
+                        let excess = opus_buf.len() - config::BUFFER_SIZE;
+                        opus_buf.drain(0..excess);
                     }
                 }
                 
-                // Get the Ogg data and broadcast in chunks
-                if last_process_time.elapsed() > Duration::from_millis(100) {
-                    let ogg_data = ogg_packet_writer.inner().to_vec();
-                    
-                    if !ogg_data.is_empty() {
-                        // Add to opus buffer
-                        {
-                            let mut opus_buf = opus_buffer.lock();
-                            opus_buf.extend_from_slice(&ogg_data);
-                            
-                            // Cap buffer size
-                            if opus_buf.len() > config::BUFFER_SIZE {
-                                let excess = opus_buf.len() - config::BUFFER_SIZE;
-                                opus_buf.drain(0..excess);
-                            }
-                        }
-                        
-                        // Broadcast in chunks
-                        for chunk in ogg_data.chunks(chunk_size) {
-                            let _ = opus_broadcast_tx.send(chunk.to_vec());
-                        }
-                        
-                        // Reset the packet writer to avoid excessive memory usage
-                        ogg_packet_writer = match PacketWriter::new() {
-                            Ok(writer) => writer,
-                            Err(e) => {
-                                error!("Failed to create new Ogg packet writer: {:?}", e);
-                                break;
-                            }
-                        };
-                    }
-                    
-                    last_process_time = Instant::now();
+                // Broadcast in chunks
+                for chunk in pending_ogg_data.chunks(chunk_size) {
+                    let _ = opus_broadcast_tx.send(chunk.to_vec());
                 }
+                
+                debug!("Broadcast {} bytes of Opus data in {} chunks", 
+                      pending_ogg_data.len(), 
+                      (pending_ogg_data.len() + chunk_size - 1) / chunk_size);
+                
+                // Reset
+                pending_ogg_data.clear();
+                last_process_time = Instant::now();
             }
+            
+            // Short pause to avoid tight loop
+            thread::sleep(Duration::from_millis(50));
         }
         
         info!("Transcoder thread exiting");
@@ -425,7 +332,7 @@ impl TranscoderManager {
         
         self.should_stop.store(true, Ordering::SeqCst);
         
-        if let Some(thread) = self.transcoder_thread.take() {
+        if let Some(thread) = self.transcoder_thread.lock().take() {
             if let Err(e) = thread.join() {
                 error!("Error joining transcoder thread: {:?}", e);
             }
@@ -438,6 +345,125 @@ impl TranscoderManager {
 impl Drop for TranscoderManager {
     fn drop(&mut self) {
         self.stop_transcoding();
+    }
+}
+
+// Helper function to validate MP3 frames before processing
+fn is_valid_mp3_frame(frame: &MP3Frame) -> bool {
+    // Check if the frame data is empty
+    if frame.data.is_empty() {
+        debug!("Empty frame data");
+        return false;
+    }
+    
+    // Check if the frame has the expected number of channels
+    // Fixed: Convert frame.channels to usize for comparison
+    if frame.channels as usize != OPUS_CHANNELS {
+        debug!("Invalid frame channels: got {}, expected {}", 
+               frame.channels, OPUS_CHANNELS as i32);
+        return false;
+    }
+    
+    // Check if the frame has enough samples
+    let min_samples = OPUS_FRAME_SIZE * frame.channels as usize;
+    if frame.data.len() < min_samples / 4 {  // Allow at least 1/4 of a frame
+        debug!("Frame too small: {} samples, need at least {}", 
+               frame.data.len(), min_samples / 4);
+        return false;
+    }
+    
+    // Check for anomalies in sample rate
+    if frame.sample_rate != OPUS_SAMPLE_RATE as i32 && 
+       frame.sample_rate != 44100 && 
+       frame.sample_rate != 22050 &&
+       frame.sample_rate != 32000 {
+        debug!("Unusual sample rate: {}", frame.sample_rate);
+        // We'll still process it, just log the warning
+    }
+    
+    true
+}
+
+// Helper function to safely process each MP3 frame
+fn process_mp3_frame_safely(
+    frame: &MP3Frame, 
+    opus_encoder: &mut OpusEncoder,
+    pending_ogg_data: &mut Vec<u8>
+) {
+    // The MP3 frame data contains i16 samples
+    let i16_samples = &frame.data;
+    
+    // Calculate the Opus frame size in samples based on channels
+    let opus_frame_samples = OPUS_FRAME_SIZE * OPUS_CHANNELS as usize;
+    
+    // Process in chunks of opus_frame_samples
+    for chunk_start in (0..i16_samples.len()).step_by(opus_frame_samples) {
+        // Calculate end, ensuring we don't go past the end of the array
+        let chunk_end = std::cmp::min(chunk_start + opus_frame_samples, i16_samples.len());
+        let chunk_len = chunk_end - chunk_start;
+        
+        // Skip chunks that are too small
+        if chunk_len < opus_frame_samples / 4 {  // At least 1/4 of a full frame
+            continue;
+        }
+        
+        // Create a chunk, padding if necessary
+        let chunk = if chunk_len < opus_frame_samples {
+            // Need to pad
+            let mut padded = i16_samples[chunk_start..chunk_end].to_vec();
+            padded.resize(opus_frame_samples, 0);
+            padded
+        } else {
+            // Full chunk, no padding needed
+            i16_samples[chunk_start..chunk_end].to_vec()
+        };
+        
+        // Process the chunk
+        process_single_chunk(&chunk, opus_encoder, pending_ogg_data);
+    }
+}
+
+// Helper function to process a single chunk of audio samples
+fn process_single_chunk(
+    chunk: &[i16],
+    opus_encoder: &mut OpusEncoder,
+    pending_ogg_data: &mut Vec<u8>
+) {
+    // Safety check
+    if chunk.len() != OPUS_FRAME_SIZE * OPUS_CHANNELS as usize {
+        error!("Invalid chunk size: got {}, expected {}", 
+               chunk.len(), OPUS_FRAME_SIZE * OPUS_CHANNELS as usize);
+        return;
+    }
+    
+    // Encode to Opus
+    let mut opus_data = vec![0u8; 4000];
+    match opus_encoder.encode(chunk, &mut opus_data) {
+        Ok(bytes_written) => {
+            opus_data.truncate(bytes_written);
+            
+            // For each chunk, create a separate Ogg writer
+            let mut chunk_ogg_buffer = Vec::new();
+            let mut chunk_writer = PacketWriter::new(&mut chunk_ogg_buffer);
+            
+            match chunk_writer.write_packet(
+                &opus_data,
+                0,
+                PacketWriteEndInfo::NormalPacket,
+                OPUS_FRAME_SIZE as u64,
+            ) {
+                Ok(_) => {
+                    // Add to pending Ogg data
+                    pending_ogg_data.extend_from_slice(&chunk_ogg_buffer);
+                },
+                Err(e) => {
+                    error!("Failed to write Opus packet: {:?}", e);
+                }
+            }
+        },
+        Err(e) => {
+            error!("Failed to encode Opus frame: {:?}", e);
+        }
     }
 }
 

@@ -12,6 +12,7 @@ use log::{info, error, warn, debug};
 use tokio::sync::broadcast;
 use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU64, Ordering};
 
+use crate::services::transcoder;
 use crate::config;
 
 #[derive(Clone)]
@@ -491,23 +492,32 @@ impl StreamManager {
     }
 
     // Set up a connection to feed MP3 data to the transcoder
-    pub fn connect_transcoder(&self, transcoder: &services::transcoder::TranscoderManager) {
-        let inner_clone = self.inner.clone();
+    pub fn connect_transcoder(&self, transcoder: Arc<transcoder::TranscoderManager>) {
         let broadcast_tx = self.broadcast_tx.clone();
+        let transcoder_clone = transcoder.clone();
         
-        // Subscribe to the broadcast channel to get MP3 chunks
-        let mut broadcast_rx = broadcast_tx.subscribe();
-        
-        // Spawn a separate task to handle feeding data to the transcoder
-        tokio::spawn(async move {
+        // Use a standard thread instead of tokio::spawn
+        thread::spawn(move || {
             info!("Starting MP3 to transcoder feed");
             
-            while let Ok(chunk) = broadcast_rx.recv().await {
-                // Feed the chunk to the transcoder
-                transcoder.add_mp3_chunk(&chunk);
-            }
+            // Get a receiver
+            let mut broadcast_rx = broadcast_tx.subscribe();
             
-            info!("MP3 to transcoder feed stopped");
+            // Process in a loop
+            loop {
+                // Use blocking receive instead of .await
+                match broadcast_rx.blocking_recv() {
+                    Ok(chunk) => {
+                        // Feed the chunk to the transcoder
+                        transcoder_clone.add_mp3_chunk(&chunk);
+                    },
+                    Err(e) => {
+                        error!("Error receiving from broadcast: {:?}", e);
+                        // Brief pause before retrying
+                        thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            }
         });
     }
     
