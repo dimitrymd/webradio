@@ -1,4 +1,4 @@
-// static/js/player-connection.js - Complete file
+// static/js/player-connection.js - Updated with better buffering and error handling
 
 // Improved WebSocket connection with better error handling
 function connectWebSocket() {
@@ -45,15 +45,23 @@ function connectWebSocket() {
                 fetchNowPlaying();
             }
             
-            // Start audio playback
+            // Start audio playback with boost for initial buffering
             if (state.audioElement.paused) {
-                const playPromise = state.audioElement.play();
-                playPromise.catch(e => {
-                    log(`Play error: ${e.message}`, 'AUDIO', true);
-                    if (e.name === 'NotAllowedError') {
-                        showStatus('Click play to start audio (browser requires user interaction)', true, false);
-                    }
-                });
+                // First wait to build up some buffer
+                setTimeout(() => {
+                    const playPromise = state.audioElement.play();
+                    playPromise.catch(e => {
+                        log(`Play error: ${e.message}`, 'AUDIO', true);
+                        if (e.name === 'NotAllowedError') {
+                            showStatus('Click play to start audio (browser requires user interaction)', true, false);
+                        }
+                    });
+                    
+                    // After playback starts, boost buffer
+                    playPromise.then(() => {
+                        boostInitialBuffer();
+                    });
+                }, 100);
             }
         };
         
@@ -68,7 +76,7 @@ function connectWebSocket() {
                         showStatus('Connection closed. Reconnecting...', true, false);
                         attemptReconnection();
                     }
-                }, 1000);
+                }, 500); // Reduced from 1000ms to 500ms
             }
         };
         
@@ -98,7 +106,7 @@ function connectWebSocket() {
     }
 }
 
-// Handle WebSocket messages
+// Handle WebSocket messages with improved buffering
 function handleWebSocketMessage(event) {
     // Clear connection timeout if set
     if (state.connectionTimeout) {
@@ -143,21 +151,26 @@ function handleWebSocketMessage(event) {
         // Process text data (track info or other commands)
         try {
             const data = JSON.parse(event.data);
-            updateTrackInfo(data);
+            handleTrackInfoUpdate(data);
         } catch (e) {
             log(`Non-JSON message: ${event.data}`, 'STREAM');
         }
     }
 }
 
-// Process track info from WebSocket or API
-function updateTrackInfo(info) {
+// Enhanced track info handling for mid-stream joins and position info
+function handleTrackInfoUpdate(info) {
     try {
         // Check for error message
         if (info.error) {
             showStatus(`Server error: ${info.error}`, true);
             return;
         }
+        
+        // Check if this is a mid-stream join
+        const midStreamJoin = info.mid_stream_join === true;
+        const position = info.playback_position || 0;
+        const percentage = info.percentage || 0;
         
         // Store track ID for change detection
         const newTrackId = info.path;
@@ -177,6 +190,17 @@ function updateTrackInfo(info) {
         // Update progress
         if (info.duration) {
             if (currentDuration) currentDuration.textContent = formatTime(info.duration);
+            
+            // When joining mid-stream, immediately set the progress bar
+            if (midStreamJoin && percentage > 0) {
+                // Update progress bar to current position
+                updateProgressBar(position, info.duration);
+                
+                // Store last known position
+                state.lastKnownPosition = position;
+                
+                log(`Joined stream at position ${position}s (${percentage}%)`, 'TRACK');
+            }
         }
         
         if (info.playback_position !== undefined) {
@@ -202,7 +226,7 @@ function updateTrackInfo(info) {
     }
 }
 
-// Connection health monitoring
+// Improved connection health monitoring
 function checkConnectionHealth() {
     // Skip for direct streaming mode
     if (state.usingDirectStream) return;
@@ -256,6 +280,12 @@ function checkConnectionHealth() {
             fetchNowPlaying();
         }
     }
+    
+    // Check buffer health periodically
+    if (now - state.performanceMetrics.lastBufferCheck > 10000) { // Every 10 seconds
+        log(`Buffer health check: ${bufferHealth.ahead.toFixed(1)}s ahead, ${state.audioQueue.length} chunks queued, ${state.bufferUnderflows} underflows`, 'HEALTH');
+        state.performanceMetrics.lastBufferCheck = now;
+    }
 }
 
 // Fetch now playing info via API (fallback method)
@@ -268,13 +298,13 @@ async function fetchNowPlaying() {
         }
         
         const data = await response.json();
-        updateTrackInfo(data);
+        handleTrackInfoUpdate(data);
     } catch (error) {
         log(`Error fetching now playing: ${error.message}`, 'API', true);
     }
 }
 
-// Attempt reconnection with exponential backoff
+// Improved reconnection with reduced backoff for faster recovery
 function attemptReconnection() {
     // Skip for direct streaming mode
     if (state.usingDirectStream) return;
@@ -295,9 +325,11 @@ function attemptReconnection() {
     // Increment attempts
     state.reconnectAttempts++;
     
-    // Calculate delay with exponential backoff and a bit of randomness
-    const baseDelay = Math.min(500 * Math.pow(1.3, state.reconnectAttempts - 1), 8000);
-    const jitter = Math.random() * 1000; // Add up to 1 second of jitter
+    // Calculate delay with more gentle exponential backoff and less jitter
+    const baseDelay = Math.min(config.RECONNECT_DELAY_BASE * 
+                         Math.pow(config.RECONNECT_BACKOFF_FACTOR, state.reconnectAttempts - 1), 
+                         5000); // Cap at 5 seconds
+    const jitter = Math.random() * 500; // Reduced jitter
     const delay = baseDelay + jitter;
     
     log(`Reconnection attempt ${state.reconnectAttempts}/${state.maxReconnectAttempts} in ${(delay/1000).toFixed(1)}s`, 'CONTROL');
@@ -322,94 +354,10 @@ function attemptReconnection() {
     }, delay);
 }
 
-
-function handleTrackInfoUpdate(info) {
-    // Check if this is a mid-stream join
-    const midStreamJoin = info.mid_stream_join === true;
-    const position = info.playback_position || 0;
-    const percentage = info.percentage || 0;
-    
-    // Update UI with current track info
-    currentTitle.textContent = info.title || 'Unknown Title';
-    currentArtist.textContent = info.artist || 'Unknown Artist';
-    currentAlbum.textContent = info.album || 'Unknown Album';
-    
-    // Update progress bar immediately
-    if (info.duration) {
-        currentDuration.textContent = formatTime(info.duration);
-        
-        // When joining mid-stream, immediately set the progress bar
-        if (midStreamJoin && percentage > 0) {
-            // Update progress bar to current position
-            updateProgressBar(position, info.duration);
-            
-            // Store last known position
-            state.lastKnownPosition = position;
-            
-            log(`Joined stream at position ${position}s (${percentage}%)`, 'TRACK');
-        }
-    }
-    
-    // Update listener count
-    if (info.active_listeners !== undefined) {
-        listenerCount.textContent = `Listeners: ${info.active_listeners}`;
-    }
-    
-    // Store track ID for change detection
-    state.currentTrackId = info.path;
-    
-    // Update page title
-    document.title = `${info.title} - ${info.artist} | ChillOut Radio`;
-    
-    // Update last track info time
-    state.lastTrackInfoTime = Date.now();
-}
-function handleTrackInfoUpdate(info) {
-    // Check if this is a mid-stream join
-    const midStreamJoin = info.mid_stream_join === true;
-    const position = info.playback_position || 0;
-    const percentage = info.percentage || 0;
-    
-    // Update UI with current track info
-    currentTitle.textContent = info.title || 'Unknown Title';
-    currentArtist.textContent = info.artist || 'Unknown Artist';
-    currentAlbum.textContent = info.album || 'Unknown Album';
-    
-    // Update progress bar immediately
-    if (info.duration) {
-        currentDuration.textContent = formatTime(info.duration);
-        
-        // When joining mid-stream, immediately set the progress bar
-        if (midStreamJoin && percentage > 0) {
-            // Update progress bar to current position
-            updateProgressBar(position, info.duration);
-            
-            // Store last known position
-            state.lastKnownPosition = position;
-            
-            log(`Joined stream at position ${position}s (${percentage}%)`, 'TRACK');
-        }
-    }
-    
-    // Update listener count
-    if (info.active_listeners !== undefined) {
-        listenerCount.textContent = `Listeners: ${info.active_listeners}`;
-    }
-    
-    // Store track ID for change detection
-    state.currentTrackId = info.path;
-    
-    // Update page title
-    document.title = `${info.title} - ${info.artist} | ChillOut Radio`;
-    
-    // Update last track info time
-    state.lastTrackInfoTime = Date.now();
-}
-
 // Make functions available to other modules
 window.connectWebSocket = connectWebSocket;
 window.handleWebSocketMessage = handleWebSocketMessage;
-window.updateTrackInfo = updateTrackInfo;
+window.handleTrackInfoUpdate = handleTrackInfoUpdate;
 window.checkConnectionHealth = checkConnectionHealth;
 window.fetchNowPlaying = fetchNowPlaying;
 window.attemptReconnection = attemptReconnection;

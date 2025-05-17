@@ -1,5 +1,7 @@
+// static/js/player.js - Updated with improved initialization
+
 // player.js - Main entry point that loads all modules
-// ChillOut Radio player - Updated with iOS compatibility using Opus streaming
+// ChillOut Radio player - Updated with iOS compatibility and improved buffering
 
 // Load order: when this file is included, it loads all modules in correct order
 document.addEventListener('DOMContentLoaded', function() {
@@ -9,7 +11,8 @@ document.addEventListener('DOMContentLoaded', function() {
         typeof startAudio !== 'function' || 
         typeof processQueue !== 'function' || 
         typeof connectWebSocket !== 'function' ||
-        typeof checkMSECompatibility !== 'function') {
+        typeof checkMSECompatibility !== 'function' ||
+        typeof boostInitialBuffer !== 'function') {
         
         console.error('[ERROR] Not all player modules are loaded. Please check script includes.');
         document.getElementById('status-message').textContent = 
@@ -22,9 +25,17 @@ document.addEventListener('DOMContentLoaded', function() {
     // Initialize player (function from player-core.js)
     initPlayer();
     
-    const platformInfo = state.isIOS ? 
-        'iOS detected (using Opus stream)' : 
-        'Desktop platform (using MP3 stream)';
+    // Detect platform for optimized experience
+    const platform = detectPlatform();
     
-    console.log(`ChillOut Radio player ready - ${platformInfo}`);
+    // Apply platform-specific optimizations
+    optimizeMobileSettings();
+    
+    // Log initialization
+    const platformInfo = platform.isIOS ? 
+        'iOS detected (using direct stream)' : 
+        (platform.isMobile ? 'Mobile platform detected' : 'Desktop platform detected');
+    
+    console.log(`ChillOut Radio player initialized - ${platformInfo}`);
+    console.log('Buffering optimizations enabled for smoother playback');
 });

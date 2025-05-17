@@ -230,18 +230,12 @@ pub fn stream_ws(
 }
 
 #[get("/direct-stream")]
-pub async fn direct_stream(stream_manager: &State<Arc<StreamManager>>) -> rocket::response::Response<'static> {
+pub async fn direct_stream(stream_manager: &State<Arc<StreamManager>>) -> Result<(rocket::http::ContentType, Vec<u8>), Status> {
     use rocket::http::{ContentType, Status};
-    use rocket::response::Response;
-    use std::io::Cursor;
     
     // Check if streaming is active
     if !stream_manager.is_streaming() {
-        return Response::build()
-            .status(Status::ServiceUnavailable)
-            .header(ContentType::Plain)
-            .sized_body(0, Cursor::new("Streaming not active"))
-            .finalize();
+        return Err(Status::ServiceUnavailable);
     }
     
     // Get the current playback position information
@@ -257,7 +251,7 @@ pub async fn direct_stream(stream_manager: &State<Arc<StreamManager>>) -> rocket
         let target_chunk_index = (total_chunks as f32 * (position_percentage as f32 / 100.0)) as usize;
         
         // Start a few chunks before current position (if possible)
-        let buffer_chunks = 10; // Number of chunks before current position
+        let buffer_chunks = 20; // Increased from 10 for smoother start
         let start_index = if target_chunk_index > buffer_chunks {
             target_chunk_index - buffer_chunks
         } else {
@@ -284,14 +278,8 @@ pub async fn direct_stream(stream_manager: &State<Arc<StreamManager>>) -> rocket
         response_data.extend_from_slice(chunk);
     }
     
-    // Return the response with appropriate headers
-    Response::build()
-        .status(Status::Ok)
-        .header(ContentType::new("audio", "mpeg"))
-        .header(rocket::http::Header::new("Accept-Ranges", "bytes"))
-        .header(rocket::http::Header::new("Cache-Control", "no-cache"))
-        .sized_body(response_data.len(), Cursor::new(response_data))
-        .finalize()
+    // Return the response with the appropriate Content-Type
+    Ok((ContentType::new("audio", "mpeg"), response_data))
 }
 
 // Helper function to get now playing data - this would be added to handlers.rs

@@ -1,4 +1,4 @@
-// src/services/websocket_bus.rs - Improved WebSocket handling
+// src/services/websocket_bus.rs - Complete updated file with buffering improvements
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,10 +12,10 @@ use log::{info, error, debug, warn};
 use crate::services::streamer::StreamManager;
 
 // Improved constants for better client experience
-const IMPROVED_INITIAL_CHUNKS_TO_SEND: usize = 75;  // Send more data initially
-const CHUNK_SEND_DELAY_MS: u64 = 1;                 // Small delay between chunks
-const CLIENT_PING_INTERVAL_MS: u64 = 5000;          // More frequent pings
-const CLIENT_HEALTH_CHECK_INTERVAL_SECS: u64 = 10;  // More frequent health checks
+const IMPROVED_INITIAL_CHUNKS_TO_SEND: usize = 150;  // Increased for better initial buffering
+const CHUNK_SEND_DELAY_MS: u64 = 0;                 // Removed delay between chunks for faster transmission
+const CLIENT_PING_INTERVAL_MS: u64 = 2000;          // More frequent pings for better connection monitoring
+const CLIENT_HEALTH_CHECK_INTERVAL_SECS: u64 = 5;   // More frequent health checks
 
 // A client connection with metadata
 struct ClientConnection {
@@ -252,8 +252,7 @@ impl WebSocketBus {
                 return false;
             }
             
-            // Short pause to let client process header
-            time::sleep(Duration::from_millis(10)).await;
+            // No pause - we want to send data as quickly as possible
         }
         
         // Calculate which chunks to send based on current position
@@ -266,8 +265,8 @@ impl WebSocketBus {
             let total_chunks = saved_chunks.len();
             let target_chunk_index = (total_chunks as f32 * (playback_percentage as f32 / 100.0)) as usize;
             
-            // Start a few chunks before current position (if possible)
-            let buffer_chunks = 10; // Number of chunks before current position
+            // Start more chunks before current position (increased buffer)
+            let buffer_chunks = 20; // Increased from 10
             let start_index = if target_chunk_index > buffer_chunks {
                 target_chunk_index - buffer_chunks
             } else {
@@ -290,15 +289,13 @@ impl WebSocketBus {
             debug!("Sending {} initial chunks to client {}", chunks_to_send.len(), client_id);
         }
         
-        // Send the selected chunks
+        // Send the selected chunks in one burst without delays
         for chunk in &chunks_to_send {
             if !chunk.is_empty() {
-                if !self.send_to_client(client_id, ws::Message::Binary(chunk.to_vec())) {
+                if !self.send_to_client(client_id, ws::Message::Binary(chunk.clone())) {
                     return false;
                 }
-                
-                // Small delay between chunks to avoid overwhelming the client
-                time::sleep(Duration::from_millis(CHUNK_SEND_DELAY_MS)).await;
+                // No delay - send as fast as possible
             }
         }
         
@@ -315,7 +312,7 @@ impl WebSocketBus {
         true
     }
 
-    // Broadcast a message to all clients with better flow control
+    // Broadcast a message to all clients with improved flow control
     pub fn broadcast(&self, message: ws::Message) {
         let clients = self.clients.lock();
         
@@ -334,10 +331,10 @@ impl WebSocketBus {
                 // Adjust sending based on estimated client buffer
                 let buffer_level = client.buffer_level;
                 
-                // Throttle sending for clients with very high buffer
-                if buffer_level > IMPROVED_INITIAL_CHUNKS_TO_SEND * 2 {
-                    // Skip every other chunk for clients with very high buffer
-                    if client.chunks_sent % 2 != 0 {
+                // Throttle sending for clients with very high buffer - less aggressive throttling
+                if buffer_level > IMPROVED_INITIAL_CHUNKS_TO_SEND * 3 {
+                    // Skip every third chunk for clients with very high buffer
+                    if client.chunks_sent % 3 != 0 {
                         continue;
                     }
                 }

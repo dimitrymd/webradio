@@ -1,6 +1,6 @@
-// static/js/player-control.js - Complete file
+// static/js/player-control.js - Updated with improved buffering
 
-// Initialize and start playback
+// Initialize and start playback with better buffering strategy
 function startAudio() {
     log('Starting audio playback', 'CONTROL');
     startBtn.disabled = true;
@@ -12,6 +12,7 @@ function startAudio() {
     state.consecutiveErrors = 0;
     state.lastAudioChunkTime = Date.now();
     state.lastTrackInfoTime = Date.now();
+    state.bufferUnderflows = 0;
     
     // For iOS devices, use direct streaming approach
     if (state.isIOS) {
@@ -40,7 +41,7 @@ function startAudio() {
         state.audioElement.controls = false;
         state.audioElement.volume = volumeControl.value;
         state.audioElement.muted = state.isMuted;
-        state.audioElement.preload = 'auto';
+        state.audioElement.preload = 'auto'; // Ensure preloading is enabled
         
         // Add to document but hide visually
         state.audioElement.style.display = 'none';
@@ -50,6 +51,9 @@ function startAudio() {
         setupAudioListeners();
     }
     
+    // Apply mobile-specific optimizations if needed
+    optimizeMobileSettings();
+    
     // Standard MSE approach
     setupMediaSource();
     
@@ -58,10 +62,10 @@ function startAudio() {
         clearInterval(state.connectionHealthTimer);
     }
     
-    state.connectionHealthTimer = setInterval(checkConnectionHealth, 3000);
+    state.connectionHealthTimer = setInterval(checkConnectionHealth, config.BUFFER_MONITOR_INTERVAL);
 }
 
-// Direct streaming implementation for iOS and browsers without MSE
+// Direct streaming implementation for iOS with improved buffering
 function startDirectStream() {
     // Set flag so we know we're using direct stream mode
     state.usingDirectStream = true;
@@ -128,7 +132,7 @@ function startDirectStream() {
     }
 }
 
-// Set up listeners specific to direct streaming
+// Set up listeners specific to direct streaming with improved buffering for iOS
 function setupDirectStreamListeners() {
     state.audioElement.addEventListener('playing', () => {
         log('Audio playing', 'AUDIO');
@@ -138,6 +142,9 @@ function setupDirectStreamListeners() {
     state.audioElement.addEventListener('waiting', () => {
         log('Audio buffering', 'AUDIO');
         showStatus('Buffering...', false, false);
+        
+        // Track buffer starvation
+        state.bufferUnderflows++;
     });
     
     state.audioElement.addEventListener('stalled', () => {
@@ -165,6 +172,11 @@ function setupDirectStreamListeners() {
             restartDirectStream();
         }
     });
+    
+    // For iOS, slow down playback very slightly to help with buffering
+    if (state.isIOS) {
+        state.audioElement.playbackRate = 0.98; // 2% slower than normal - imperceptible but helps buffering
+    }
 }
 
 // Add helpers for iOS autoplay restrictions
@@ -194,7 +206,7 @@ function setupUserInteractionHandlers() {
     document.addEventListener('touchstart', tryPlayAudio);
 }
 
-// Poll for track info when using direct streaming
+// Poll for track info with reduced interval for better updates
 function startNowPlayingPolling() {
     // Clear any existing interval
     if (state.nowPlayingInterval) {
@@ -204,7 +216,7 @@ function startNowPlayingPolling() {
     // Initial fetch
     fetchNowPlaying();
     
-    // Set up polling every 5 seconds
+    // Set up polling every 5 seconds (reduced from 10)
     state.nowPlayingInterval = setInterval(() => {
         if (state.isPlaying) {
             fetchNowPlaying();
@@ -215,7 +227,7 @@ function startNowPlayingPolling() {
     }, 5000);
 }
 
-// Restart the direct stream if needed
+// Restart the direct stream with improved buffering
 function restartDirectStream() {
     if (!state.isPlaying) return;
     

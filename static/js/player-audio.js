@@ -1,4 +1,4 @@
-// static/js/player-audio.js - Complete file
+// static/js/player-audio.js - Updated for better buffering
 
 // Update the progress bar
 function updateProgressBar(position, duration) {
@@ -12,14 +12,15 @@ function updateProgressBar(position, duration) {
     }
 }
 
-// Get current buffer health metrics
+// Improved buffer health metrics for better diagnostics
 function getBufferHealth() {
     if (!state.sourceBuffer || !state.audioElement || state.sourceBuffer.buffered.length === 0) {
         return {
             current: 0,
             ahead: 0,
             duration: 0,
-            underflow: true
+            underflow: true,
+            utilization: 0
         };
     }
     
@@ -29,15 +30,28 @@ function getBufferHealth() {
     const totalBuffered = state.sourceBuffer.buffered.end(state.sourceBuffer.buffered.length - 1) - 
                          state.sourceBuffer.buffered.start(0);
     
+    // Calculate buffer utilization percentage
+    const utilization = (bufferAhead / config.MAX_BUFFER_SIZE) * 100;
+    
+    // Track buffer health for performance metrics
+    state.lastBufferHealth = bufferAhead;
+    
+    // Add to performance metrics
+    state.performanceMetrics.avgBufferSize = 
+        (state.performanceMetrics.avgBufferSize * state.performanceMetrics.bufferSamples + bufferAhead) / 
+        (state.performanceMetrics.bufferSamples + 1);
+    state.performanceMetrics.bufferSamples += 1;
+    
     return {
         current: currentTime,
         ahead: bufferAhead,
         duration: totalBuffered,
-        underflow: bufferAhead < config.AUDIO_STARVATION_THRESHOLD
+        underflow: bufferAhead < config.AUDIO_STARVATION_THRESHOLD,
+        utilization: utilization
     };
 }
 
-// Process audio data queue
+// Improved process queue function for more efficient buffering
 function processQueue() {
     // Skip for direct streaming mode
     if (state.usingDirectStream) return;
@@ -52,10 +66,10 @@ function processQueue() {
     const bufferHealth = getBufferHealth();
     const queueSizeInChunks = state.audioQueue.length;
     
-    // If we have a very high buffer, slow down processing
-    if (bufferHealth.ahead > config.TARGET_BUFFER_SIZE * 1.5 && queueSizeInChunks > 5) {
+    // If we have a very high buffer, slow down processing but be less aggressive
+    if (bufferHealth.ahead > config.TARGET_BUFFER_SIZE * 2 && queueSizeInChunks > 10) {
         // We have plenty of buffer, so delay processing to avoid excess memory usage
-        setTimeout(processQueue, 100);
+        setTimeout(processQueue, 200);  // Increased from 100ms to 200ms
         return;
     }
     
@@ -68,9 +82,9 @@ function processQueue() {
         // Reset consecutive errors since we successfully processed data
         state.consecutiveErrors = 0;
         
-        // Log buffer status occasionally
+        // Log buffer status occasionally or if there's a potential issue
         if (queueSizeInChunks % 50 === 0 || bufferHealth.underflow) {
-            log(`Buffer health: ${bufferHealth.ahead.toFixed(1)}s ahead, ${queueSizeInChunks} chunks queued`, 'BUFFER');
+            log(`Buffer health: ${bufferHealth.ahead.toFixed(1)}s ahead, ${queueSizeInChunks} chunks queued, utilization: ${bufferHealth.utilization.toFixed(1)}%`, 'BUFFER');
         }
         
         // Set up callback for when this append completes
@@ -84,8 +98,8 @@ function processQueue() {
                     // Buffer is low, process next chunk immediately
                     processQueue();
                 } else {
-                    // Normal processing with a small delay to reduce CPU load
-                    setTimeout(processQueue, 5);  // Small delay instead of 0
+                    // Normal processing with reduced delay
+                    setTimeout(processQueue, 1);  // Minimal delay
                 }
             }
         }, { once: true });
@@ -99,8 +113,8 @@ function processQueue() {
             // More strategic buffer management for quota errors
             handleQuotaExceededError();
         } else {
-            // For other errors, try again soon with backoff
-            const retryDelay = Math.min(50 * state.consecutiveErrors, 1000);
+            // For other errors, try again soon with reduced backoff
+            const retryDelay = Math.min(25 * state.consecutiveErrors, 500); // Reduced max delay
             setTimeout(processQueue, retryDelay);
             
             // If we've had many consecutive errors, try recreation
@@ -112,7 +126,7 @@ function processQueue() {
     }
 }
 
-// Handle quota exceeded errors with smarter buffer management
+// Improved quota exceeded error handling
 function handleQuotaExceededError() {
     try {
         if (state.sourceBuffer && state.sourceBuffer.buffered.length > 0) {
@@ -121,23 +135,23 @@ function handleQuotaExceededError() {
             // Only remove data that's definitely been played
             const safeRemovalPoint = Math.max(
                 state.sourceBuffer.buffered.start(0),
-                currentTime - 2  // Keep 2 seconds before current position
+                currentTime - 5  // Keep 5 seconds before current position (increased from 2)
             );
             
             // Calculate how much we need to remove
             const removalEnd = Math.min(
-                safeRemovalPoint + 5,  // Remove 5 seconds of audio
+                safeRemovalPoint + 10,  // Remove 10 seconds of audio (increased from 5)
                 currentTime - 1  // But never too close to current playback position
             );
             
             if (removalEnd > safeRemovalPoint) {
-                log(`Clearing buffer segment ${safeRemovalPoint.toFixed(1)}-${removalEnd.toFixed(1)}s`, 'BUFFER');
+                log(`Clearing buffer segment ${safeRemovalPoint.toFixed(1)}-${removalEnd.toFixed(1)}s to free memory`, 'BUFFER');
                 state.sourceBuffer.remove(safeRemovalPoint, removalEnd);
                 
                 // Continue after buffer clear
                 state.sourceBuffer.addEventListener('updateend', function onClearEnd() {
                     state.sourceBuffer.removeEventListener('updateend', onClearEnd);
-                    setTimeout(processQueue, 50);
+                    setTimeout(processQueue, 10); // Reduced delay (was 50ms)
                 }, { once: true });
                 return;
             }
@@ -157,11 +171,11 @@ function recreateMediaSource() {
     // Skip for direct streaming mode
     if (state.usingDirectStream) return;
     
-    log('Recreating MediaSource', 'MEDIA');
+    log('Recreating MediaSource to recover from errors', 'MEDIA');
     
     try {
-        // Preserve some audio data to continue playback
-        const savedQueue = state.audioQueue.slice(-50); // Keep only the last 50 chunks
+        // Preserve more audio data to continue playback
+        const savedQueue = state.audioQueue.slice(-100); // Keep more chunks (increased from 50)
         state.audioQueue = []; // Clear the queue
         
         // Clean up old MediaSource
@@ -195,10 +209,10 @@ function recreateMediaSource() {
                     log(`SourceBuffer error: ${event.message || 'Unknown error'}`, 'MEDIA', true);
                 });
                 
-                // Restore queue and continue
+                // Restore queue and continue with minimal delay
                 state.audioQueue = savedQueue;
                 state.consecutiveErrors = 0;
-                setTimeout(processQueue, 100);
+                setTimeout(processQueue, 50);
             } catch (e) {
                 log(`Error creating source buffer: ${e.message}`, 'MEDIA', true);
                 attemptReconnection();
@@ -222,7 +236,7 @@ function recreateMediaSource() {
     }
 }
 
-// Set up audio element event listeners
+// Enhanced audio element event listeners with better mobile support
 function setupAudioListeners() {
     state.audioElement.addEventListener('playing', () => {
         log('Audio playing', 'AUDIO');
@@ -232,6 +246,14 @@ function setupAudioListeners() {
     state.audioElement.addEventListener('waiting', () => {
         log('Audio buffering', 'AUDIO');
         showStatus('Buffering...', false, false);
+        
+        // On buffer starvation, immediately process queue if possible
+        if (state.audioQueue.length > 0 && !state.sourceBuffer.updating) {
+            processQueue(); // Process queue immediately when buffer starves
+        }
+        
+        // Track buffer underflows for diagnostics
+        state.bufferUnderflows++;
     });
     
     state.audioElement.addEventListener('stalled', () => {
@@ -247,7 +269,7 @@ function setupAudioListeners() {
         if (state.isPlaying) {
             // Don't react to errors too frequently
             const now = Date.now();
-            if (now - state.lastErrorTime > 10000) { // At most one error response per 10 seconds
+            if (now - state.lastErrorTime > 5000) { // Reduced from 10 seconds to 5 seconds
                 state.lastErrorTime = now;
                 showStatus('Audio error - attempting to recover', true, false);
                 
@@ -267,13 +289,13 @@ function setupAudioListeners() {
         }
     });
     
-    // Add new timeupdate listener to monitor buffer health dynamically
+    // Add new timeupdate listener to monitor buffer health more frequently
     state.audioElement.addEventListener('timeupdate', () => {
         // Skip for direct streaming mode
         if (state.usingDirectStream) return;
         
-        // Check buffer health on time updates (but not too frequently - skip most updates)
-        if (Math.random() < 0.05) { // Only check ~5% of time updates to reduce overhead
+        // Check buffer health on time updates (increased frequency)
+        if (Math.random() < 0.1) { // Increased from 0.05 to 0.1 (10% of updates)
             const bufferHealth = getBufferHealth();
             if (bufferHealth.underflow) {
                 log(`Buffer underfull during playback: ${bufferHealth.ahead.toFixed(2)}s ahead`, 'AUDIO');
@@ -284,9 +306,36 @@ function setupAudioListeners() {
             }
         }
     });
+    
+    // Optimize for mobile
+    if (state.isMobile) {
+        log('Setting up mobile-optimized audio listeners', 'AUDIO');
+        
+        // More aggressive stalled/waiting event handling for mobile
+        state.audioElement.addEventListener('waiting', () => {
+            log('Mobile device audio waiting, immediate buffer check', 'AUDIO');
+            if (state.audioQueue.length > 0 && !state.sourceBuffer.updating) {
+                processQueue(); // Process queue immediately
+            }
+        }, { passive: true }); // Using passive event for better performance
+        
+        // Add playbackRate adjustment when buffers are low on mobile
+        setInterval(() => {
+            if (state.audioElement && !state.audioElement.paused) {
+                const bufferHealth = getBufferHealth();
+                if (bufferHealth.ahead < config.MIN_BUFFER_SIZE) {
+                    // Low buffer, slow down playback slightly to build buffer
+                    state.audioElement.playbackRate = 0.97;
+                } else {
+                    // Normal buffer, use almost normal speed
+                    state.audioElement.playbackRate = 0.99;
+                }
+            }
+        }, 2000);
+    }
 }
 
-// Set up MediaSource with error handling
+// Set up MediaSource with improved error handling and buffering
 function setupMediaSource() {
     try {
         // Create MediaSource
@@ -303,17 +352,17 @@ function setupMediaSource() {
                 
                 state.sourceBuffer = state.mediaSource.addSourceBuffer(mimeType);
                 
-                // Add buffer monitoring event
+                // Add improved buffer monitoring
                 state.sourceBuffer.addEventListener('updateend', () => {
                     // Check how much we've buffered after each update
                     if (state.sourceBuffer && state.sourceBuffer.buffered.length > 0 && state.audioElement) {
                         const bufferHealth = getBufferHealth();
                         
-                        // If buffer is getting very large, trim it
+                        // If buffer is getting very large, trim it but keep more data
                         if (bufferHealth.duration > config.MAX_BUFFER_SIZE) {
                             const currentTime = state.audioElement.currentTime;
-                            const trimPoint = Math.max(state.sourceBuffer.buffered.start(0), currentTime - 10);
-                            log(`Trimming buffer: ${trimPoint.toFixed(2)}s to current time - 10`, 'BUFFER');
+                            const trimPoint = Math.max(state.sourceBuffer.buffered.start(0), currentTime - 20); // Keep 20 seconds behind
+                            log(`Trimming buffer: ${trimPoint.toFixed(2)}s to current time - 20s (was too large)`, 'BUFFER');
                             try {
                                 state.sourceBuffer.remove(state.sourceBuffer.buffered.start(0), trimPoint);
                             } catch (e) {
@@ -353,3 +402,4 @@ window.updateProgressBar = updateProgressBar;
 window.setupMediaSource = setupMediaSource;
 window.recreateMediaSource = recreateMediaSource;
 window.setupAudioListeners = setupAudioListeners;
+window.handleQuotaExceededError = handleQuotaExceededError;
