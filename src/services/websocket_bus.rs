@@ -1,5 +1,4 @@
-// New file: websocket_bus.rs
-// Provides a centralized message bus for WebSocket connections
+// src/services/websocket_bus.rs - Improved WebSocket handling
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -7,9 +6,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use parking_lot::Mutex;
 use rocket_ws as ws;
 use tokio::sync::mpsc;
+use tokio::time::{self, Duration};
 use log::{info, error, debug, warn};
 
 use crate::services::streamer::StreamManager;
+
+// Improved constants for better client experience
+const IMPROVED_INITIAL_CHUNKS_TO_SEND: usize = 75;  // Send more data initially
+const CHUNK_SEND_DELAY_MS: u64 = 1;                 // Small delay between chunks
+const CLIENT_PING_INTERVAL_MS: u64 = 5000;          // More frequent pings
+const CLIENT_HEALTH_CHECK_INTERVAL_SECS: u64 = 10;  // More frequent health checks
 
 // A client connection with metadata
 struct ClientConnection {
@@ -18,6 +24,8 @@ struct ClientConnection {
     chunks_sent: usize,
     id3_header_sent: bool,
     initial_chunks_sent: bool,
+    buffer_level: usize,       // Track client buffer level
+    connection_quality: u8,    // 0-100 quality indicator
 }
 
 // WebSocketBus manages all client connections
@@ -55,6 +63,8 @@ impl WebSocketBus {
             chunks_sent: 0,
             id3_header_sent: false,
             initial_chunks_sent: false,
+            buffer_level: 0,
+            connection_quality: 100, // Assume good quality initially
         };
         
         // Add to clients map
@@ -81,22 +91,28 @@ impl WebSocketBus {
         }
     }
 
-    // Send a message to a specific client
+    // Send a message to a specific client with improved error handling
     pub fn send_to_client(&self, client_id: usize, message: ws::Message) -> bool {
         let mut clients = self.clients.lock();
         if let Some(client) = clients.get_mut(&client_id) {
             client.last_activity = std::time::Instant::now();
             
-            // Track message type
+            // Track message type for buffer management
             if let ws::Message::Binary(_) = &message {
                 client.chunks_sent += 1;
+                client.buffer_level += 1;
             }
             
-            // Send the message
+            // Try sending with better error handling
             match client.tx.send(message) {
-                Ok(_) => true,
+                Ok(_) => {
+                    // Successfully sent
+                    true
+                },
                 Err(e) => {
                     error!("Failed to send to client {}: {}", client_id, e);
+                    // Mark connection quality as poor
+                    client.connection_quality = 0;
                     false
                 }
             }
@@ -109,11 +125,20 @@ impl WebSocketBus {
         let message = ws::Message::Text(text.to_string());
         let clients = self.clients.lock();
         
-        // Send the message to each client
+        // Send the message to each client with error tracking
+        let mut failed_clients = Vec::new();
+        
         for (client_id, client) in clients.iter() {
             if let Err(e) = client.tx.send(message.clone()) {
                 error!("Error broadcasting text to client {}: {}", client_id, e);
+                failed_clients.push(*client_id);
             }
+        }
+        
+        // Don't remove clients here to avoid deadlock
+        // They'll be removed in the health check
+        if !failed_clients.is_empty() {
+            warn!("Failed to send text message to {} clients", failed_clients.len());
         }
     }
 
@@ -123,6 +148,7 @@ impl WebSocketBus {
         let playback_position = self.stream_manager.get_playback_position();
         let active_listeners = self.get_active_listeners();
         let current_bitrate = self.stream_manager.get_current_bitrate();
+        let playback_percentage = self.stream_manager.get_playback_percentage();
         
         if let Some(track_json) = track_info {
             if let Ok(mut track_value) = serde_json::from_str::<serde_json::Value>(&track_json) {
@@ -138,6 +164,10 @@ impl WebSocketBus {
                     map.insert(
                         "bitrate".to_string(),
                         serde_json::Value::Number(serde_json::Number::from(current_bitrate / 1000))
+                    );
+                    map.insert(
+                        "percentage".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(playback_percentage))
                     );
                 }
                 
@@ -155,8 +185,8 @@ impl WebSocketBus {
         }
     }
 
-    // Send initial setup data to a new client
-    pub fn send_initial_data(&self, client_id: usize) -> bool {
+    // Improved initial data sending with better buffering
+    pub async fn send_initial_data(&self, client_id: usize) -> bool {
         let stream_manager = &self.stream_manager;
         let track_info = stream_manager.get_track_info();
         let (id3_header, saved_chunks) = stream_manager.get_chunks_from_current_position();
@@ -183,10 +213,13 @@ impl WebSocketBus {
             if !self.send_to_client(client_id, ws::Message::Binary(id3)) {
                 return false;
             }
+            
+            // Short pause to let client process header
+            time::sleep(Duration::from_millis(10)).await;
         }
         
-        // Send initial chunks
-        let initial_chunks = std::cmp::min(saved_chunks.len(), crate::config::INITIAL_CHUNKS_TO_SEND);
+        // Send more initial chunks for smoother start
+        let initial_chunks = std::cmp::min(saved_chunks.len(), IMPROVED_INITIAL_CHUNKS_TO_SEND);
         debug!("Sending {} initial chunks to client {}", initial_chunks, client_id);
         
         for chunk in saved_chunks.iter().take(initial_chunks) {
@@ -194,6 +227,9 @@ impl WebSocketBus {
                 if !self.send_to_client(client_id, ws::Message::Binary(chunk.clone())) {
                     return false;
                 }
+                
+                // Small delay between chunks to avoid overwhelming the client
+                time::sleep(Duration::from_millis(CHUNK_SEND_DELAY_MS)).await;
             }
         }
         
@@ -202,18 +238,42 @@ impl WebSocketBus {
             let mut clients = self.clients.lock();
             if let Some(client) = clients.get_mut(&client_id) {
                 client.initial_chunks_sent = true;
+                // Set initial buffer level
+                client.buffer_level = initial_chunks;
             }
         }
         
         true
     }
 
-    // Broadcast a message to all clients
+    // Broadcast a message to all clients with better flow control
     pub fn broadcast(&self, message: ws::Message) {
         let clients = self.clients.lock();
         
-        // Send the message to each client
+        // Calculate message size for buffer tracking
+        let msg_size = match &message {
+            ws::Message::Binary(data) => data.len(),
+            _ => 0,
+        };
+        
+        let is_binary = matches!(message, ws::Message::Binary(_));
+        
+        // Send the message to each client with better flow control
         for (client_id, client) in clients.iter() {
+            // Update buffer level if it's audio data
+            if is_binary && msg_size > 0 {
+                // Adjust sending based on estimated client buffer
+                let buffer_level = client.buffer_level;
+                
+                // Throttle sending for clients with very high buffer
+                if buffer_level > IMPROVED_INITIAL_CHUNKS_TO_SEND * 2 {
+                    // Skip every other chunk for clients with very high buffer
+                    if client.chunks_sent % 2 != 0 {
+                        continue;
+                    }
+                }
+            }
+            
             if let Err(e) = client.tx.send(message.clone()) {
                 error!("Error broadcasting to client {}: {}", client_id, e);
                 // Note: We don't remove clients here to avoid deadlock
@@ -227,7 +287,7 @@ impl WebSocketBus {
         self.clients.lock().len()
     }
 
-    // Periodically check client health
+    // Improved health check with buffer management
     pub fn perform_health_check(&self) {
         let now = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(crate::config::WS_TIMEOUT_SECS);
@@ -240,6 +300,19 @@ impl WebSocketBus {
                 .map(|(id, _)| *id)
                 .collect()
         };
+        
+        // Update buffer levels for all clients
+        {
+            let mut clients = self.clients.lock();
+            for (_, client) in clients.iter_mut() {
+                // Simulate buffer consumption - client has played some audio
+                if client.buffer_level > 0 {
+                    // Reduce buffer by a reasonable amount based on time passed
+                    let buffer_reduction = client.buffer_level / 10 + 1;
+                    client.buffer_level = client.buffer_level.saturating_sub(buffer_reduction);
+                }
+            }
+        }
         
         // Remove timed-out clients
         for client_id in clients_to_remove {
@@ -294,14 +367,13 @@ impl WebSocketBus {
     }
 
     // Start the broadcast loop in its own task
-    // This method is used externally but doesn't spawn a task directly
     pub fn start_broadcast_loop(self: Arc<Self>) {
         // This method is now just a placeholder that does nothing
         // We'll use start_broadcast_loop_impl directly from the Rocket fairing
         info!("WebSocket broadcast loop will be started by Rocket runtime");
     }
 
-    // The actual implementation that will be called from within Rocket's context
+    // The actual implementation with improved client handling
     pub async fn start_broadcast_loop_impl(self: Arc<Self>) {
         tokio::spawn(async move {
             info!("Starting WebSocket broadcast loop");
@@ -310,15 +382,15 @@ impl WebSocketBus {
             let stream_manager = self.stream_manager.clone();
             let mut broadcast_rx = stream_manager.get_broadcast_receiver();
             
-            // Set up ping timer
-            let ping_interval = tokio::time::Duration::from_millis(crate::config::WS_PING_INTERVAL_MS);
+            // Set up ping timer with more frequent pings
+            let ping_interval = tokio::time::Duration::from_millis(CLIENT_PING_INTERVAL_MS);
             let mut ping_timer = tokio::time::interval(ping_interval);
             
-            // Set up health check timer
-            let health_check_interval = tokio::time::Duration::from_secs(10); // Check every 10 seconds
+            // Set up health check timer with more frequent checks
+            let health_check_interval = tokio::time::Duration::from_secs(CLIENT_HEALTH_CHECK_INTERVAL_SECS);
             let mut health_check_timer = tokio::time::interval(health_check_interval);
             
-            // Set up now playing update timer - 10 seconds interval
+            // Set up now playing update timer
             let now_playing_interval = tokio::time::Duration::from_secs(10);
             let mut now_playing_timer = tokio::time::interval(now_playing_interval);
             
@@ -326,23 +398,20 @@ impl WebSocketBus {
                 tokio::select! {
                     // Handle ping timer
                     _ = ping_timer.tick() => {
-                        // Send ping to all clients
                         self.ping_clients();
                     }
                     
                     // Handle health check timer
                     _ = health_check_timer.tick() => {
-                        // Perform health check
                         self.perform_health_check();
                     }
                     
                     // Handle now playing update timer
                     _ = now_playing_timer.tick() => {
-                        // Broadcast now playing update
                         self.broadcast_now_playing();
                     }
                     
-                    // Receive chunks from broadcast
+                    // Receive chunks from broadcast with better error handling
                     chunk_result = broadcast_rx.recv() => {
                         match chunk_result {
                             Ok(chunk) => {
@@ -354,9 +423,10 @@ impl WebSocketBus {
                                 }
                             },
                             Err(e) => {
-                                // Handle broadcast errors
+                                // Handle broadcast errors more robustly
                                 if e.to_string().contains("lagged") {
                                     warn!("Broadcast receiver lagged, resubscribing");
+                                    // Get a fresh receiver and continue
                                     broadcast_rx = stream_manager.get_broadcast_receiver();
                                 } else {
                                     error!("Broadcast error: {}", e);

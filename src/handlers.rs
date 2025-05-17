@@ -134,8 +134,9 @@ pub fn stream_ws(
         // Add client to the bus
         let (client_id, mut msg_rx) = websocket_bus.add_client();
         
-        // Send initial data to the client
-        if !websocket_bus.send_initial_data(client_id) {
+        // Send initial data to the client - fixed by making it blocking
+        // Fix this line to avoid the "cannot apply unary operator" error
+        if websocket_bus.send_initial_data(client_id).await == false {
             websocket_bus.remove_client(client_id);
             return Ok(());
         }
