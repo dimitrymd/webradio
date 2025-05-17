@@ -119,6 +119,7 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
             handlers::get_stats,
             handlers::stream_ws,  // MP3 streaming
             handlers::stream_opus_ws,  // Opus streaming for iOS
+            handlers::direct_stream,
             handlers::static_files,
             handlers::diagnostic_page,
         ])

@@ -239,6 +239,8 @@ impl StreamManager {
         info!("Broadcast thread ending");
     }
     
+    // Complete fixed broadcast_single_track function
+
     fn broadcast_single_track(
         inner: &Arc<Mutex<StreamManagerInner>>,
         file_path: &Path,
@@ -288,11 +290,12 @@ impl StreamManager {
             inner_lock.playback_bytes_position = 0;
         }
         
-        // Improved adaptive timing based on bitrate and network conditions
+        // More aggressive adaptive timing with less delay
         let bytes_per_second = bitrate / 8;
         let chunk_size = IMPROVED_READ_CHUNK_SIZE;
-        let chunk_duration_ms = (chunk_size as f64 * 1000.0) / bytes_per_second as f64;
-        let target_delay = Duration::from_millis(chunk_duration_ms as u64);
+        // Reduce delay to send data faster than real-time for better buffering
+        let chunk_duration_ms = (chunk_size as f64 * 800.0) / bytes_per_second as f64; // 20% faster than real-time
+        let target_delay = Duration::from_millis((chunk_duration_ms as u64).max(1).min(50)); // Cap between 1-50ms
         
         info!("Bitrate: {}kbps, chunk delay: {}ms", bitrate/1000, target_delay.as_millis());
         
@@ -311,9 +314,10 @@ impl StreamManager {
         let mut bytes_processed = 0;
         let mut chunks_sent = 0;
         
-        // Fill initial buffer more extensively for smoother start
+        // Fill initial buffer more aggressively 
         info!("Pre-buffering {} chunks...", IMPROVED_MIN_BUFFER_CHUNKS);
-        while chunk_buffer.len() < IMPROVED_MIN_BUFFER_CHUNKS {
+        let min_buffer_chunks = IMPROVED_MIN_BUFFER_CHUNKS * 2; // Double the minimum buffer
+        while chunk_buffer.len() < min_buffer_chunks {
             match file.read(&mut buffer) {
                 Ok(0) => break, // EOF
                 Ok(n) => {
@@ -355,7 +359,7 @@ impl StreamManager {
             
             // Initial prebuffering - wait until we have a good buffer
             if is_prebuffering {
-                if chunk_buffer.len() >= IMPROVED_MIN_BUFFER_CHUNKS {
+                if chunk_buffer.len() >= min_buffer_chunks {
                     info!("Initial buffer filled with {} chunks, starting playback", chunk_buffer.len());
                     is_prebuffering = false;
                 } else if file_finished {
@@ -388,9 +392,32 @@ impl StreamManager {
                     // Broadcast
                     let _ = inner_lock.broadcast_tx.send(chunk);
                     
+                    // If we're running behind, send multiple chunks to catch up
+                    let send_time = Instant::now();
+                    let elapsed_since_last = send_time.duration_since(last_send_time);
+                    if elapsed_since_last > target_delay.mul_f32(2.0) && chunk_buffer.len() > 10 {
+                        // We're falling behind, send a burst of chunks to catch up
+                        let catch_up_chunks = (elapsed_since_last.as_millis() / target_delay.as_millis())
+                            .min(10) as usize; // Cap at 10 chunks max
+                        
+                        for _ in 0..catch_up_chunks {
+                            if let Some(catch_up_chunk) = chunk_buffer.pop_front() {
+                                // Fix: Store length before sending (more efficient)
+                                let chunk_len = catch_up_chunk.len();
+                                let _ = inner_lock.broadcast_tx.send(catch_up_chunk);
+                                inner_lock.playback_bytes_position += chunk_len as u64;
+                                chunks_sent += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        
+                        warn!("Sent burst of {} extra chunks to catch up", catch_up_chunks);
+                    }
+                    
                     if chunks_sent % 100 == 0 {
                         info!("Sent {} chunks, buffer: {}, pos: {}s", 
-                             chunks_sent, chunk_buffer.len(), elapsed);
+                            chunks_sent, chunk_buffer.len(), elapsed);
                     }
                 }
                 
@@ -404,10 +431,10 @@ impl StreamManager {
                     let sleep_time = target_delay - elapsed_since_last;
                     thread::sleep(sleep_time);
                 } else if target_delay.as_millis() > 0 && 
-                         elapsed_since_last.as_millis() > target_delay.as_millis() * 2 {
+                        elapsed_since_last.as_millis() > target_delay.as_millis() * 2 {
                     // If we're significantly behind schedule, log a warning
                     warn!("Sending chunks too slowly: {:?} elapsed vs {:?} target", 
-                         elapsed_since_last, target_delay);
+                        elapsed_since_last, target_delay);
                 }
                 
                 // Update last send time AFTER sleeping for better timing accuracy
@@ -431,7 +458,7 @@ impl StreamManager {
             
             // Pre-buffer the next track while waiting
             if file_finished && !should_stop.load(Ordering::SeqCst) {
-                if let Some(next_track) = try_get_next_track(&inner) {
+                if let Some(next_track) = Self::try_get_next_track(&inner) {
                     info!("Pre-buffering next track: {}", next_track.title);
                     
                     // Get next track path
@@ -455,8 +482,9 @@ impl StreamManager {
                         }
                         
                         // Store for use when this track ends
+                        let chunks_count = next_chunks.len();
                         *inner.lock().next_track_buffer.lock() = next_chunks;
-                        info!("Pre-buffered {} chunks from next track", next_chunks.len());
+                        info!("Pre-buffered {} chunks from next track", chunks_count);
                     }
                 }
             }

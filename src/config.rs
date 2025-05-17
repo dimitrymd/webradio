@@ -15,16 +15,17 @@ lazy_static! {
 }
 
 // Stream configuration - unified constants
-pub const CHUNK_SIZE: usize = 1024 * 16;  // Chunk size for streaming (16 KB)
-pub const BUFFER_SIZE: usize = 1024 * 256;  // Increased buffer size (256 KB)
+pub const CHUNK_SIZE: usize = 1024 * 32;  // Increased from 16KB to 32KB
+pub const BUFFER_SIZE: usize = 1024 * 512;  // Doubled from 256KB to 512KB
 pub const STREAM_CACHE_TIME: u64 = 60;  // Seconds to cache stream chunks
 
 // Buffer management - now centralized in config
-pub const MAX_RECENT_CHUNKS: usize = 100;  // Increased: Number of chunks to save for new clients
-pub const INITIAL_CHUNKS_TO_SEND: usize = 30;  // Increased: Number of chunks to send on connection
-pub const BROADCAST_BUFFER_SIZE: usize = 64;  // Increased: Size of buffer for broadcasting
-pub const MIN_BUFFER_CHUNKS: usize = 20;  // Increased: Minimum chunks to buffer before playback
+pub const MAX_RECENT_CHUNKS: usize = 200;  // Increased: Number of chunks to save for new clients
+pub const INITIAL_CHUNKS_TO_SEND: usize = 60;  // Increased: Number of chunks to send on connection
+pub const BROADCAST_BUFFER_SIZE: usize = 128;  // Increased: Size of buffer for broadcasting
+pub const MIN_BUFFER_CHUNKS: usize = 40;  // Increased: Minimum chunks to buffer before playback
 pub const UNDERRUN_RECOVERY_DELAY_MS: u64 = 10;  // Reduced: Delay during buffer underruns
+
 
 // Server configuration
 pub const PORT: u16 = 8000;

@@ -1,4 +1,4 @@
-// player-core.js update - Add iOS detection and configuration
+// static/js/player-core.js - Complete file
 
 // Elements
 const startBtn = document.getElementById('start-btn');
@@ -41,7 +41,10 @@ const state = {
     
     // Platform detection
     isIOS: false,
-    isIOSChrome: false
+    
+    // Direct streaming
+    usingDirectStream: false,
+    nowPlayingInterval: null
 };
 
 // Configuration constants
@@ -52,54 +55,61 @@ const config = {
     BUFFER_MONITOR_INTERVAL: 3000,  // Check buffer every 3 seconds
     NO_DATA_TIMEOUT: 20,            // Timeout for no data in seconds
     AUDIO_STARVATION_THRESHOLD: 2,  // Seconds of buffer left before action needed
-    NOW_PLAYING_INTERVAL: 10000     // Check now playing every 10 seconds (changed from 2s)
+    NOW_PLAYING_INTERVAL: 10000     // Check now playing every 10 seconds
 };
 
-// Detect iOS platform
+// Enhanced platform detection function
 function detectIOSPlatform() {
     const ua = window.navigator.userAgent;
+    
+    // More comprehensive iOS detection
     const iOS = /iPad|iPhone|iPod/.test(ua) || 
                 (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-    const isIOSChrome = iOS && /CriOS/.test(ua);
     
+    // Store in state
     state.isIOS = iOS;
-    state.isIOSChrome = isIOSChrome;
     
     if (iOS) {
         log(`Detected iOS device: ${ua}`, 'PLATFORM');
+        log('iOS device detected - will use direct streaming instead of MSE', 'PLATFORM');
         
-        // Additional iOS-specific settings
-        config.MIN_BUFFER_SIZE = 5;  // Increase minimum buffer for iOS
-        config.TARGET_BUFFER_SIZE = 15;  // Increase target buffer for iOS
-        
-        if (isIOSChrome) {
-            log('Using Chrome on iOS', 'PLATFORM');
-        } else {
-            log('Using Safari on iOS', 'PLATFORM');
-        }
+        // Enable debug mode for iOS to help troubleshoot
+        state.debugMode = true;
     }
+    
+    return iOS;
 }
 
 // Get the appropriate WebSocket URL based on platform
 function getWebSocketURL() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
-    
-    // Use Opus stream for iOS devices
-    if (state.isIOS) {
-        return `${protocol}//${host}/stream-opus`;
-    } else {
-        return `${protocol}//${host}/stream`;
-    }
+    return `${protocol}//${host}/stream`;
 }
 
-// Get MIME type for source buffer based on platform
+// Get MIME type for source buffer
 function getSourceBufferType() {
-    if (state.isIOS) {
-        return 'audio/ogg; codecs=opus';
-    } else {
-        return 'audio/mpeg';
+    return 'audio/mpeg';
+}
+
+// Check MSE compatibility
+function checkMSECompatibility() {
+    if (!('MediaSource' in window)) {
+        return {
+            supported: false,
+            message: 'MediaSource API not supported'
+        };
     }
+    
+    const mimeType = getSourceBufferType();
+    const isSupported = MediaSource.isTypeSupported(mimeType);
+    
+    return {
+        supported: isSupported,
+        message: isSupported ? 
+            `MSE supports ${mimeType}` : 
+            `MSE does not support ${mimeType}`
+    };
 }
 
 // Utility functions
@@ -120,6 +130,8 @@ function log(message, category = 'INFO', isError = false) {
 function showStatus(message, isError = false, autoHide = true) {
     log(`Status: ${message}`, 'UI', isError);
     
+    if (!statusMessage) return;
+    
     statusMessage.textContent = message;
     statusMessage.style.display = 'block';
     statusMessage.style.borderLeftColor = isError ? '#e74c3c' : '#4a90e2';
@@ -136,70 +148,61 @@ function initPlayer() {
     // Detect iOS platform
     detectIOSPlatform();
     
-    // Update UI if on iOS
-    if (state.isIOS) {
-        // Add iOS indicator to player UI
-        const playerEl = document.querySelector('.player');
-        const iosIndicator = document.createElement('div');
-        iosIndicator.className = 'ios-indicator';
-        iosIndicator.textContent = 'iOS Mode (Opus Stream)';
-        iosIndicator.style.textAlign = 'center';
-        iosIndicator.style.padding = '5px';
-        iosIndicator.style.margin = '5px 0';
-        iosIndicator.style.backgroundColor = '#e8f7ff';
-        iosIndicator.style.color = '#0066cc';
-        iosIndicator.style.borderRadius = '5px';
-        iosIndicator.style.fontSize = '14px';
-        
-        // Insert after player title
-        const logo = playerEl.querySelector('.logo');
-        if (logo && logo.nextSibling) {
-            playerEl.insertBefore(iosIndicator, logo.nextSibling);
-        } else {
-            playerEl.appendChild(iosIndicator);
-        }
+    // Set up event listeners
+    if (startBtn) {
+        startBtn.addEventListener('click', toggleConnection);
     }
     
-    // Set up event listeners
-    startBtn.addEventListener('click', toggleConnection);
+    if (muteBtn) {
+        muteBtn.addEventListener('click', function() {
+            state.isMuted = !state.isMuted;
+            
+            if (state.audioElement) {
+                state.audioElement.muted = state.isMuted;
+            }
+            
+            muteBtn.textContent = state.isMuted ? 'Unmute' : 'Mute';
+        });
+    }
     
-    muteBtn.addEventListener('click', function() {
-        state.isMuted = !state.isMuted;
+    if (volumeControl) {
+        volumeControl.addEventListener('input', function() {
+            if (state.audioElement) {
+                state.audioElement.volume = this.value;
+            }
+            
+            try {
+                localStorage.setItem('radioVolume', this.value);
+            } catch (e) {
+                // Ignore storage errors
+            }
+        });
         
-        if (state.audioElement) {
-            state.audioElement.muted = state.isMuted;
-        }
-        
-        muteBtn.textContent = state.isMuted ? 'Unmute' : 'Mute';
-    });
-    
-    volumeControl.addEventListener('input', function() {
-        if (state.audioElement) {
-            state.audioElement.volume = this.value;
-        }
-        
+        // Load saved volume from localStorage
         try {
-            localStorage.setItem('radioVolume', this.value);
+            const savedVolume = localStorage.getItem('radioVolume');
+            if (savedVolume !== null) {
+                volumeControl.value = savedVolume;
+            }
         } catch (e) {
             // Ignore storage errors
         }
-    });
-    
-    // Load saved volume from localStorage
-    try {
-        const savedVolume = localStorage.getItem('radioVolume');
-        if (savedVolume !== null) {
-            volumeControl.value = savedVolume;
-        }
-    } catch (e) {
-        // Ignore storage errors
     }
     
     // Fetch initial track info
     fetchNowPlaying();
     
-    log(`ChillOut Radio player initialized (iOS: ${state.isIOS})`, 'INIT');
+    log(`Web Radio player initialized (iOS: ${state.isIOS})`, 'INIT');
 }
+
+// Export functions for other modules
+window.formatTime = formatTime;
+window.log = log;
+window.showStatus = showStatus;
+window.getWebSocketURL = getWebSocketURL;
+window.getSourceBufferType = getSourceBufferType;
+window.checkMSECompatibility = checkMSECompatibility;
+window.detectIOSPlatform = detectIOSPlatform;
 
 // Entry point
 document.addEventListener('DOMContentLoaded', initPlayer);

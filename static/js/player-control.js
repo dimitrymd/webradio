@@ -1,4 +1,4 @@
-// player-control.js update - Support iOS playback control
+// static/js/player-control.js - Complete file
 
 // Initialize and start playback
 function startAudio() {
@@ -13,6 +13,13 @@ function startAudio() {
     state.lastAudioChunkTime = Date.now();
     state.lastTrackInfoTime = Date.now();
     
+    // For iOS devices, use direct streaming approach
+    if (state.isIOS) {
+        log('Using direct streaming for iOS device', 'CONTROL');
+        startDirectStream();
+        return;
+    }
+    
     // Check browser support
     if (!('WebSocket' in window)) {
         showStatus('Your browser does not support WebSockets', true);
@@ -20,11 +27,10 @@ function startAudio() {
         return;
     }
     
-    // Compatibility check for MediaSource
-    const mseSupport = checkMSECompatibility();
-    if (!mseSupport.supported) {
-        showStatus(`Media error: ${mseSupport.message}`, true);
-        startBtn.disabled = false;
+    // Regular MSE check
+    if (!('MediaSource' in window)) {
+        log('MediaSource API not supported, falling back to direct streaming', 'CONTROL');
+        startDirectStream();
         return;
     }
     
@@ -36,14 +42,6 @@ function startAudio() {
         state.audioElement.muted = state.isMuted;
         state.audioElement.preload = 'auto';
         
-        // iOS-specific audio attributes
-        if (state.isIOS) {
-            // These attributes help with iOS audio playback
-            state.audioElement.setAttribute('playsinline', '');
-            state.audioElement.setAttribute('webkit-playsinline', '');
-            state.audioElement.setAttribute('autoplay', '');
-        }
-        
         // Add to document but hide visually
         state.audioElement.style.display = 'none';
         document.body.appendChild(state.audioElement);
@@ -52,7 +50,7 @@ function startAudio() {
         setupAudioListeners();
     }
     
-    // Set up MediaSource
+    // Standard MSE approach
     setupMediaSource();
     
     // Start connection health check timer
@@ -60,45 +58,220 @@ function startAudio() {
         clearInterval(state.connectionHealthTimer);
     }
     
-    // iOS devices need more frequent health checks
-    const healthCheckInterval = state.isIOS ? 
-        config.BUFFER_MONITOR_INTERVAL / 2 : // More frequent for iOS
-        config.BUFFER_MONITOR_INTERVAL;
-        
-    state.connectionHealthTimer = setInterval(checkConnectionHealth, healthCheckInterval);
+    state.connectionHealthTimer = setInterval(checkConnectionHealth, 3000);
+}
+
+// Direct streaming implementation for iOS and browsers without MSE
+function startDirectStream() {
+    // Set flag so we know we're using direct stream mode
+    state.usingDirectStream = true;
+    state.isPlaying = true;
     
-    // Special handling for iOS
-    if (state.isIOS) {
-        // Create a user interaction event handler to start audio on iOS
-        // iOS requires user interaction to start audio
-        const unlockAudio = () => {
-            log('User interaction detected - attempting to unlock audio', 'AUDIO');
+    // Create audio element if needed
+    if (!state.audioElement) {
+        state.audioElement = new Audio();
+        state.audioElement.controls = false;
+        state.audioElement.volume = volumeControl.value;
+        state.audioElement.muted = state.isMuted;
+        
+        // Critical for iOS
+        state.audioElement.setAttribute('playsinline', '');
+        state.audioElement.setAttribute('webkit-playsinline', '');
+        
+        // Add to document but hide visually
+        state.audioElement.style.display = 'none';
+        document.body.appendChild(state.audioElement);
+        
+        // Set up basic audio listeners
+        setupDirectStreamListeners();
+    }
+    
+    // Create a direct stream URL with timestamp to prevent caching
+    const timestamp = new Date().getTime();
+    const streamUrl = `/direct-stream?t=${timestamp}`;
+    
+    log(`Connecting to direct stream: ${streamUrl}`, 'CONTROL');
+    
+    // Set the source 
+    state.audioElement.src = streamUrl;
+    
+    // Try to play - this will likely require user interaction on iOS
+    const playPromise = state.audioElement.play();
+    
+    // Handle play promise (modern browsers return a promise from play())
+    if (playPromise !== undefined) {
+        playPromise.then(() => {
+            log('Direct stream playback started successfully', 'AUDIO');
+            showStatus('Streaming started');
             
-            // Try to play audio
-            if (state.audioElement && state.audioElement.paused) {
-                state.audioElement.play()
-                    .then(() => {
-                        log('Audio unlocked on iOS', 'AUDIO');
-                    })
-                    .catch(e => {
-                        log(`Failed to unlock audio: ${e.message}`, 'AUDIO', true);
-                    });
+            // Update UI
+            startBtn.textContent = 'Disconnect';
+            startBtn.disabled = false;
+            startBtn.dataset.connected = 'true';
+            
+            // Start polling for track info
+            startNowPlayingPolling();
+            
+        }).catch(e => {
+            log(`Error starting direct stream: ${e.message}`, 'AUDIO', true);
+            
+            if (e.name === 'NotAllowedError') {
+                showStatus('Tap play button to start audio (iOS requires user interaction)', true, false);
+                setupUserInteractionHandlers();
+            } else {
+                showStatus(`Playback error: ${e.message}`, true);
+                stopDirectStream();
             }
             
-            // Remove the event listeners once we've tried to unlock
-            document.removeEventListener('touchstart', unlockAudio);
-            document.removeEventListener('touchend', unlockAudio);
-            document.removeEventListener('click', unlockAudio);
-        };
-        
-        // Add interaction event listeners
-        document.addEventListener('touchstart', unlockAudio, { once: true });
-        document.addEventListener('touchend', unlockAudio, { once: true });
-        document.addEventListener('click', unlockAudio, { once: true });
-        
-        // Show a message to instruct the user
-        showStatus('Tap anywhere to enable audio on iOS', false, false);
+            startBtn.disabled = false;
+        });
     }
+}
+
+// Set up listeners specific to direct streaming
+function setupDirectStreamListeners() {
+    state.audioElement.addEventListener('playing', () => {
+        log('Audio playing', 'AUDIO');
+        showStatus('Audio playing');
+    });
+    
+    state.audioElement.addEventListener('waiting', () => {
+        log('Audio buffering', 'AUDIO');
+        showStatus('Buffering...', false, false);
+    });
+    
+    state.audioElement.addEventListener('stalled', () => {
+        log('Audio stalled', 'AUDIO');
+        showStatus('Stream stalled - buffering', true, false);
+    });
+    
+    state.audioElement.addEventListener('error', (e) => {
+        const errorCode = e.target.error ? e.target.error.code : 'unknown';
+        log(`Audio error (code ${errorCode})`, 'AUDIO', true);
+        
+        // Only attempt recovery if we're trying to play
+        if (state.isPlaying) {
+            showStatus('Audio error - attempting to recover', true, false);
+            restartDirectStream();
+        }
+    });
+    
+    state.audioElement.addEventListener('ended', () => {
+        log('Audio ended', 'AUDIO');
+        // If we're still supposed to be playing, try to restart
+        if (state.isPlaying) {
+            log('Audio ended unexpectedly, restarting', 'AUDIO', true);
+            showStatus('Audio ended - reconnecting', true, false);
+            restartDirectStream();
+        }
+    });
+}
+
+// Add helpers for iOS autoplay restrictions
+function setupUserInteractionHandlers() {
+    // Function to try playing audio when user interacts with the page
+    const tryPlayAudio = function() {
+        if (state.audioElement && state.audioElement.paused && state.isPlaying) {
+            log('User interaction detected - trying to play audio', 'AUDIO');
+            
+            state.audioElement.play()
+                .then(() => {
+                    log('Audio started after user interaction', 'AUDIO');
+                    showStatus('Playback started');
+                    
+                    // Remove these listeners once successful
+                    document.removeEventListener('click', tryPlayAudio);
+                    document.removeEventListener('touchstart', tryPlayAudio);
+                })
+                .catch(e => {
+                    log(`Still failed to play: ${e.message}`, 'AUDIO', true);
+                });
+        }
+    };
+    
+    // Add the listeners
+    document.addEventListener('click', tryPlayAudio);
+    document.addEventListener('touchstart', tryPlayAudio);
+}
+
+// Poll for track info when using direct streaming
+function startNowPlayingPolling() {
+    // Clear any existing interval
+    if (state.nowPlayingInterval) {
+        clearInterval(state.nowPlayingInterval);
+    }
+    
+    // Initial fetch
+    fetchNowPlaying();
+    
+    // Set up polling every 5 seconds
+    state.nowPlayingInterval = setInterval(() => {
+        if (state.isPlaying) {
+            fetchNowPlaying();
+        } else {
+            clearInterval(state.nowPlayingInterval);
+            state.nowPlayingInterval = null;
+        }
+    }, 5000);
+}
+
+// Restart the direct stream if needed
+function restartDirectStream() {
+    if (!state.isPlaying) return;
+    
+    log('Restarting direct stream', 'CONTROL');
+    
+    // Create a new timestamp to avoid caching
+    const timestamp = new Date().getTime();
+    const streamUrl = `/direct-stream?t=${timestamp}`;
+    
+    // Stop the current playback
+    state.audioElement.pause();
+    state.audioElement.currentTime = 0;
+    
+    // Set new source and play
+    state.audioElement.src = streamUrl;
+    
+    // Try to play
+    const playPromise = state.audioElement.play();
+    if (playPromise !== undefined) {
+        playPromise.catch(e => {
+            log(`Error restarting stream: ${e.message}`, 'AUDIO', true);
+            
+            if (e.name === 'NotAllowedError') {
+                showStatus('Tap to restart audio', true, false);
+                setupUserInteractionHandlers();
+            }
+        });
+    }
+}
+
+// Stop direct streaming
+function stopDirectStream() {
+    log('Stopping direct stream', 'CONTROL');
+    
+    state.isPlaying = false;
+    state.usingDirectStream = false;
+    
+    // Stop polling for track info
+    if (state.nowPlayingInterval) {
+        clearInterval(state.nowPlayingInterval);
+        state.nowPlayingInterval = null;
+    }
+    
+    // Stop audio playback
+    if (state.audioElement) {
+        state.audioElement.pause();
+        state.audioElement.src = '';
+        state.audioElement.load();
+    }
+    
+    // Reset UI
+    startBtn.textContent = 'Connect';
+    startBtn.disabled = false;
+    startBtn.dataset.connected = 'false';
+    
+    showStatus('Disconnected from stream');
 }
 
 // Stop audio playback and disconnect
@@ -107,7 +280,13 @@ function stopAudio(isError = false) {
     
     state.isPlaying = false;
     
-    // Clear all timers
+    // If using direct streaming approach
+    if (state.usingDirectStream) {
+        stopDirectStream();
+        return;
+    }
+    
+    // Standard MSE cleanup
     if (state.connectionHealthTimer) {
         clearInterval(state.connectionHealthTimer);
         state.connectionHealthTimer = null;
@@ -171,27 +350,17 @@ function toggleConnection() {
         stopAudio();
     } else {
         log('User requested connect', 'CONTROL');
-        
-        // For iOS devices, we need to use a different approach
-        if (state.isIOS) {
-            log('Starting audio for iOS device', 'CONTROL');
-            
-            // iOS sometimes needs user interaction to start audio
-            // This may now be handled by the touchstart/click handlers in startAudio()
-            // but we'll keep this explicit approach too
-            const startAudioWithUserInteraction = () => {
-                startAudio();
-                document.removeEventListener('click', startAudioWithUserInteraction);
-            };
-            
-            // Add a one-time click handler to start audio
-            document.addEventListener('click', startAudioWithUserInteraction, { once: true });
-            
-            // Also directly start audio (this might work if we already had user interaction)
-            startAudio();
-        } else {
-            // Non-iOS devices can just start directly
-            startAudio();
-        }
+        startAudio();
     }
 }
+
+// Make functions available to other modules
+window.startAudio = startAudio;
+window.stopAudio = stopAudio;
+window.toggleConnection = toggleConnection;
+window.startDirectStream = startDirectStream;
+window.stopDirectStream = stopDirectStream;
+window.setupUserInteractionHandlers = setupUserInteractionHandlers;
+window.setupDirectStreamListeners = setupDirectStreamListeners;
+window.restartDirectStream = restartDirectStream;
+window.startNowPlayingPolling = startNowPlayingPolling;

@@ -1,4 +1,4 @@
-// player-audio.js update - Add Opus support for iOS
+// static/js/player-audio.js - Complete file
 
 // Update the progress bar
 function updateProgressBar(position, duration) {
@@ -39,6 +39,9 @@ function getBufferHealth() {
 
 // Process audio data queue
 function processQueue() {
+    // Skip for direct streaming mode
+    if (state.usingDirectStream) return;
+    
     // Exit conditions - ensure all necessary components are ready
     if (state.audioQueue.length === 0 || !state.sourceBuffer || !state.mediaSource || 
         state.mediaSource.readyState !== 'open' || state.sourceBuffer.updating) {
@@ -151,6 +154,9 @@ function handleQuotaExceededError() {
 
 // Recreate the MediaSource to recover from serious errors
 function recreateMediaSource() {
+    // Skip for direct streaming mode
+    if (state.usingDirectStream) return;
+    
     log('Recreating MediaSource', 'MEDIA');
     
     try {
@@ -178,7 +184,7 @@ function recreateMediaSource() {
             log('New MediaSource opened', 'MEDIA');
             
             try {
-                // Create source buffer with the appropriate type based on platform
+                // Create source buffer with the appropriate type
                 const mimeType = getSourceBufferType();
                 log(`Creating source buffer with MIME type: ${mimeType}`, 'MEDIA');
                 
@@ -263,6 +269,9 @@ function setupAudioListeners() {
     
     // Add new timeupdate listener to monitor buffer health dynamically
     state.audioElement.addEventListener('timeupdate', () => {
+        // Skip for direct streaming mode
+        if (state.usingDirectStream) return;
+        
         // Check buffer health on time updates (but not too frequently - skip most updates)
         if (Math.random() < 0.05) { // Only check ~5% of time updates to reduce overhead
             const bufferHealth = getBufferHealth();
@@ -275,34 +284,6 @@ function setupAudioListeners() {
             }
         }
     });
-
-    // iOS-specific handling for audio playback
-    if (state.isIOS) {
-        // Audio session management for iOS
-        state.audioElement.addEventListener('play', () => {
-            log('iOS audio play event', 'AUDIO');
-            
-            // Add special handling for iOS WebKit
-            if ('webkitAudioContext' in window) {
-                try {
-                    // Create silent audio context to keep audio session alive
-                    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-                    log('Created WebKit audio context for iOS', 'AUDIO');
-                    
-                    // Resume audio context if needed (iOS policy)
-                    if (audioCtx.state === 'suspended') {
-                        audioCtx.resume().then(() => {
-                            log('WebKit audio context resumed', 'AUDIO');
-                        }).catch(e => {
-                            log(`Failed to resume audio context: ${e.message}`, 'AUDIO', true);
-                        });
-                    }
-                } catch (e) {
-                    log(`Error creating WebKit audio context: ${e.message}`, 'AUDIO', true);
-                }
-            }
-        });
-    }
 }
 
 // Set up MediaSource with error handling
@@ -365,22 +346,10 @@ function setupMediaSource() {
     }
 }
 
-// Check MSE compatibility with the required format
-function checkMSECompatibility() {
-    if (!('MediaSource' in window)) {
-        return {
-            supported: false,
-            message: 'MediaSource API not supported'
-        };
-    }
-    
-    const mimeType = getSourceBufferType();
-    const isSupported = MediaSource.isTypeSupported(mimeType);
-    
-    return {
-        supported: isSupported,
-        message: isSupported ? 
-            `MSE supports ${mimeType}` : 
-            `MSE does not support ${mimeType}`
-    };
-}
+// Make functions available to other modules
+window.processQueue = processQueue;
+window.getBufferHealth = getBufferHealth;
+window.updateProgressBar = updateProgressBar;
+window.setupMediaSource = setupMediaSource;
+window.recreateMediaSource = recreateMediaSource;
+window.setupAudioListeners = setupAudioListeners;

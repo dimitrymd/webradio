@@ -1,7 +1,10 @@
-// player-connection.js update - Support Opus streams for iOS
+// static/js/player-connection.js - Complete file
 
 // Improved WebSocket connection with better error handling
 function connectWebSocket() {
+    // Skip for direct streaming mode
+    if (state.usingDirectStream) return;
+    
     // Clean up any existing connection
     if (state.ws) {
         try {
@@ -23,7 +26,7 @@ function connectWebSocket() {
         // Set up event handlers
         state.ws.onopen = () => {
             log('WebSocket connection established', 'STREAM');
-            showStatus(`Connected to stream${state.isIOS ? ' (Opus format)' : ''}`);
+            showStatus('Connected to stream');
             startBtn.textContent = 'Disconnect';
             startBtn.disabled = false;
             startBtn.dataset.connected = 'true';
@@ -79,8 +82,7 @@ function connectWebSocket() {
         state.ws.onmessage = handleWebSocketMessage;
         
         // Set connection timeout (increased for slower connections)
-        // Make it longer for iOS due to potentially slower initial buffering of Opus
-        const timeoutDuration = state.isIOS ? 30000 : 20000;
+        const timeoutDuration = 20000;
         state.connectionTimeout = setTimeout(() => {
             if (state.ws && state.audioQueue.length === 0) {
                 log('Connection timeout - no data received', 'STREAM', true);
@@ -93,6 +95,58 @@ function connectWebSocket() {
         log(`WebSocket setup error: ${e.message}`, 'STREAM', true);
         showStatus(`Connection error: ${e.message}`, true);
         attemptReconnection();
+    }
+}
+
+// Handle WebSocket messages
+function handleWebSocketMessage(event) {
+    // Clear connection timeout if set
+    if (state.connectionTimeout) {
+        clearTimeout(state.connectionTimeout);
+        state.connectionTimeout = null;
+    }
+    
+    // Process binary audio data
+    if (event.data instanceof Blob) {
+        // Handle non-text data (audio)
+        event.data.arrayBuffer().then(buffer => {
+            // Skip empty buffers
+            if (buffer.byteLength === 0) {
+                return;
+            }
+            
+            // Check for special markers (2-byte control messages)
+            if (buffer.byteLength === 2) {
+                const view = new Uint8Array(buffer);
+                if (view[0] === 0xFF && view[1] === 0xFE) {
+                    log('Track transition marker received', 'STREAM');
+                    // For track transitions, just keep processing
+                    return;
+                }
+                if (view[0] === 0xFF && view[1] === 0xFF) {
+                    log('Track end marker received', 'STREAM');
+                    return;
+                }
+            }
+            
+            // Add data to queue
+            state.audioQueue.push(buffer);
+            state.lastAudioChunkTime = Date.now();
+            
+            // Start processing if not already going
+            processQueue();
+            
+        }).catch(e => {
+            log(`Error processing binary data: ${e.message}`, 'STREAM', true);
+        });
+    } else {
+        // Process text data (track info or other commands)
+        try {
+            const data = JSON.parse(event.data);
+            updateTrackInfo(data);
+        } catch (e) {
+            log(`Non-JSON message: ${event.data}`, 'STREAM');
+        }
     }
 }
 
@@ -116,13 +170,13 @@ function updateTrackInfo(info) {
         }
         
         // Update UI
-        currentTitle.textContent = info.title || 'Unknown Title';
-        currentArtist.textContent = info.artist || 'Unknown Artist';
-        currentAlbum.textContent = info.album || 'Unknown Album';
+        if (currentTitle) currentTitle.textContent = info.title || 'Unknown Title';
+        if (currentArtist) currentArtist.textContent = info.artist || 'Unknown Artist';
+        if (currentAlbum) currentAlbum.textContent = info.album || 'Unknown Album';
         
         // Update progress
         if (info.duration) {
-            currentDuration.textContent = formatTime(info.duration);
+            if (currentDuration) currentDuration.textContent = formatTime(info.duration);
         }
         
         if (info.playback_position !== undefined) {
@@ -131,12 +185,12 @@ function updateTrackInfo(info) {
         }
         
         // Update listener count
-        if (info.active_listeners !== undefined) {
+        if (info.active_listeners !== undefined && listenerCount) {
             listenerCount.textContent = `Listeners: ${info.active_listeners}`;
         }
         
         // Store track ID in DOM for future comparison
-        currentTitle.dataset.trackId = info.path;
+        if (currentTitle) currentTitle.dataset.trackId = info.path;
         
         // Update page title
         document.title = `${info.title} - ${info.artist} | ChillOut Radio`;
@@ -148,87 +202,11 @@ function updateTrackInfo(info) {
     }
 }
 
-// Handle WebSocket messages
-function handleWebSocketMessage(event) {
-    // Clear connection timeout if set
-    if (state.connectionTimeout) {
-        clearTimeout(state.connectionTimeout);
-        state.connectionTimeout = null;
-    }
-    
-    // Process binary audio data
-    if (event.data instanceof Blob) {
-        // Handle non-text data (audio)
-        event.data.arrayBuffer().then(buffer => {
-            // Special handling for Opus streams on iOS
-            if (state.isIOS) {
-                // For Opus, we don't need to check for special markers
-                // as they're included in the Ogg container format
-                
-                // Skip empty buffers
-                if (buffer.byteLength === 0) {
-                    return;
-                }
-                
-                // Add data to queue
-                state.audioQueue.push(buffer);
-                state.lastAudioChunkTime = Date.now();
-                
-                // Start processing if not already going
-                processQueue();
-                return;
-            }
-            
-            // Regular MP3 handling for non-iOS platforms
-            // Check for special markers (2-byte control messages)
-            if (buffer.byteLength === 2) {
-                const view = new Uint8Array(buffer);
-                if (view[0] === 0xFF && view[1] === 0xFE) {
-                    log('Track transition marker received', 'STREAM');
-                    // For track transitions, just keep processing
-                    return;
-                }
-                if (view[0] === 0xFF && view[1] === 0xFF) {
-                    log('Track end marker received', 'STREAM');
-                    return;
-                }
-            }
-            
-            // Skip empty buffers
-            if (buffer.byteLength === 0) {
-                return;
-            }
-            
-            // Add data to queue
-            state.audioQueue.push(buffer);
-            state.lastAudioChunkTime = Date.now();
-            
-            // Start processing if not already going
-            processQueue();
-            
-        }).catch(e => {
-            log(`Error processing binary data: ${e.message}`, 'STREAM', true);
-        });
-    } else {
-        // Process text data (track info or other commands)
-        try {
-            const data = JSON.parse(event.data);
-            
-            // Check message type
-            if (data.type === 'now_playing') {
-                updateTrackInfo(data.track);
-            } else {
-                // Default treatment as track info
-                updateTrackInfo(data);
-            }
-        } catch (e) {
-            log(`Non-JSON message: ${event.data}`, 'STREAM');
-        }
-    }
-}
-
-// Improved connection health monitoring
+// Connection health monitoring
 function checkConnectionHealth() {
+    // Skip for direct streaming mode
+    if (state.usingDirectStream) return;
+    
     if (!state.isPlaying) return;
     
     const now = Date.now();
@@ -258,13 +236,6 @@ function checkConnectionHealth() {
                     log(`Error sending ping: ${e.message}`, 'HEALTH', true);
                 }
             }
-        }
-    } else {
-        // Log buffer state for monitoring
-        if (bufferHealth.ahead < config.AUDIO_STARVATION_THRESHOLD) {
-            log(`WARNING: Low buffer - ${bufferHealth.ahead.toFixed(1)}s ahead, ${state.audioQueue.length} chunks queued`, 'HEALTH');
-        } else if (state.debugMode) {
-            log(`Buffer health: ${bufferHealth.ahead.toFixed(1)}s ahead, ${state.audioQueue.length} chunks queued`, 'HEALTH');
         }
     }
     
@@ -305,6 +276,9 @@ async function fetchNowPlaying() {
 
 // Attempt reconnection with exponential backoff
 function attemptReconnection() {
+    // Skip for direct streaming mode
+    if (state.usingDirectStream) return;
+    
     // Don't try to reconnect if we're not supposed to be playing
     if (!state.isPlaying) return;
     
@@ -347,3 +321,11 @@ function attemptReconnection() {
         }
     }, delay);
 }
+
+// Make functions available to other modules
+window.connectWebSocket = connectWebSocket;
+window.handleWebSocketMessage = handleWebSocketMessage;
+window.updateTrackInfo = updateTrackInfo;
+window.checkConnectionHealth = checkConnectionHealth;
+window.fetchNowPlaying = fetchNowPlaying;
+window.attemptReconnection = attemptReconnection;
