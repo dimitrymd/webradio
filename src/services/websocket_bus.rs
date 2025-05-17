@@ -189,6 +189,12 @@ impl WebSocketBus {
     pub async fn send_initial_data(&self, client_id: usize) -> bool {
         let stream_manager = &self.stream_manager;
         let track_info = stream_manager.get_track_info();
+        
+        // Get current track info and playback position
+        let current_position = stream_manager.get_playback_position();
+        let playback_percentage = stream_manager.get_playback_percentage();
+        
+        // Get the ID3 header and the most recent chunks
         let (id3_header, saved_chunks) = stream_manager.get_chunks_from_current_position();
         
         // Mark client as having received ID3 header
@@ -201,10 +207,42 @@ impl WebSocketBus {
             }
         }
         
-        // Send track info
+        // Send track info with current position
         if let Some(info) = track_info {
-            if !self.send_to_client(client_id, ws::Message::Text(info)) {
-                return false;
+            if let Ok(mut track_value) = serde_json::from_str::<serde_json::Value>(&info) {
+                // Add current position info to the track data
+                if let serde_json::Value::Object(ref mut map) = track_value {
+                    map.insert(
+                        "playback_position".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(current_position))
+                    );
+                    map.insert(
+                        "percentage".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(playback_percentage))
+                    );
+                    // Add flag to indicate this is a mid-stream join
+                    map.insert(
+                        "mid_stream_join".to_string(),
+                        serde_json::Value::Bool(current_position > 0)
+                    );
+                }
+                
+                // Convert to string and send
+                if let Ok(modified_info) = serde_json::to_string(&track_value) {
+                    if !self.send_to_client(client_id, ws::Message::Text(modified_info)) {
+                        return false;
+                    }
+                } else {
+                    // Fall back to original info if serialization fails
+                    if !self.send_to_client(client_id, ws::Message::Text(info)) {
+                        return false;
+                    }
+                }
+            } else {
+                // If parsing failed, send original info
+                if !self.send_to_client(client_id, ws::Message::Text(info)) {
+                    return false;
+                }
             }
         }
         
@@ -218,13 +256,44 @@ impl WebSocketBus {
             time::sleep(Duration::from_millis(10)).await;
         }
         
-        // Send more initial chunks for smoother start
-        let initial_chunks = std::cmp::min(saved_chunks.len(), IMPROVED_INITIAL_CHUNKS_TO_SEND);
-        debug!("Sending {} initial chunks to client {}", initial_chunks, client_id);
+        // Calculate which chunks to send based on current position
+        // We need to find chunks that are close to the current playback position
+        let mut chunks_to_send = Vec::new();
         
-        for chunk in saved_chunks.iter().take(initial_chunks) {
+        if playback_percentage > 0 && !saved_chunks.is_empty() {
+            // Estimate which chunk corresponds to current position
+            // We want to start a bit before current position to avoid choppy start
+            let total_chunks = saved_chunks.len();
+            let target_chunk_index = (total_chunks as f32 * (playback_percentage as f32 / 100.0)) as usize;
+            
+            // Start a few chunks before current position (if possible)
+            let buffer_chunks = 10; // Number of chunks before current position
+            let start_index = if target_chunk_index > buffer_chunks {
+                target_chunk_index - buffer_chunks
+            } else {
+                0
+            };
+            
+            // Select the chunks to send
+            let max_initial_chunks = IMPROVED_INITIAL_CHUNKS_TO_SEND;
+            let end_index = std::cmp::min(start_index + max_initial_chunks, total_chunks);
+            
+            // Take chunks from calculated position, not from the beginning
+            chunks_to_send = saved_chunks[start_index..end_index].to_vec();
+            
+            debug!("Sending chunks from position {}% (index {}-{} of {})", 
+                  playback_percentage, start_index, end_index, total_chunks);
+        } else {
+            // If we can't determine position, send initial chunks as before
+            let initial_chunks = std::cmp::min(saved_chunks.len(), IMPROVED_INITIAL_CHUNKS_TO_SEND);
+            chunks_to_send = saved_chunks.iter().take(initial_chunks).cloned().collect();
+            debug!("Sending {} initial chunks to client {}", chunks_to_send.len(), client_id);
+        }
+        
+        // Send the selected chunks
+        for chunk in chunks_to_send {
             if !chunk.is_empty() {
-                if !self.send_to_client(client_id, ws::Message::Binary(chunk.clone())) {
+                if !self.send_to_client(client_id, ws::Message::Binary(chunk)) {
                     return false;
                 }
                 
@@ -239,7 +308,7 @@ impl WebSocketBus {
             if let Some(client) = clients.get_mut(&client_id) {
                 client.initial_chunks_sent = true;
                 // Set initial buffer level
-                client.buffer_level = initial_chunks;
+                client.buffer_level = chunks_to_send.len();
             }
         }
         

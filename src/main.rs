@@ -1,3 +1,4 @@
+// Main.rs modified to include the direct-stream route
 // Updated main.rs with safer transcoder implementation
 extern crate rocket;
 
@@ -117,9 +118,9 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
             handlers::index,
             handlers::now_playing,
             handlers::get_stats,
-            handlers::stream_ws,  // MP3 streaming
-            handlers::stream_opus_ws,  // Opus streaming for iOS
-            handlers::direct_stream,
+            handlers::stream_ws,        // MP3 streaming via WebSocket
+            handlers::stream_opus_ws,   // Opus streaming for iOS
+            handlers::direct_stream,    // Direct HTTP streaming
             handlers::static_files,
             handlers::diagnostic_page,
         ])

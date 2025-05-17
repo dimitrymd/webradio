@@ -135,6 +135,45 @@ impl StreamManager {
         inner.broadcast_thread = Some(thread_handle);
         self.is_streaming.store(true, Ordering::SeqCst);
     }
+
+    pub fn get_chunks_from_current_position(&self) -> (Option<Vec<u8>>, Vec<Vec<u8>>) {
+        let guard = self.inner.lock();
+        let header = guard.id3_header.clone();
+        let saved_chunks: Vec<Vec<u8>> = guard.saved_chunks.iter().cloned().collect();
+        (header, saved_chunks)
+    }
+
+    pub fn get_chunks_from_playback_position(&self, start_percentage: u8) -> (Option<Vec<u8>>, Vec<Vec<u8>>) {
+        let guard = self.inner.lock();
+        let header = guard.id3_header.clone();
+        let saved_chunks = &guard.saved_chunks;
+        
+        // If there are no saved chunks or the percentage is 0, return all chunks
+        if saved_chunks.is_empty() || start_percentage == 0 {
+            return (header, saved_chunks.iter().cloned().collect());
+        }
+        
+        // Calculate the chunk index that corresponds to the current playback position
+        let total_chunks = saved_chunks.len();
+        let target_index = (total_chunks as f32 * (start_percentage as f32 / 100.0)) as usize;
+        
+        // Start a few chunks earlier to ensure smooth playback
+        let buffer_chunks = 5;
+        let start_index = if target_index > buffer_chunks {
+            target_index - buffer_chunks
+        } else {
+            0
+        };
+        
+        // Get chunks from the calculated index to the end
+        let relevant_chunks: Vec<Vec<u8>> = saved_chunks
+            .iter()
+            .skip(start_index)
+            .cloned()
+            .collect();
+        
+        (header, relevant_chunks)
+    }    
     
     fn broadcast_thread_loop(
         inner: Arc<Mutex<StreamManagerInner>>,
@@ -532,13 +571,6 @@ impl StreamManager {
         self.broadcast_tx.subscribe()
     }
     
-    pub fn get_chunks_from_current_position(&self) -> (Option<Vec<u8>>, Vec<Vec<u8>>) {
-        let guard = self.inner.lock();
-        let header = guard.id3_header.clone();
-        let saved_chunks: Vec<Vec<u8>> = guard.saved_chunks.iter().cloned().collect();
-        (header, saved_chunks)
-    }
-    
     pub fn get_track_info(&self) -> Option<String> {
         self.inner.lock().current_track_info.clone()
     }
@@ -645,6 +677,61 @@ impl StreamManager {
                 0
             }
         }
+    }
+
+    pub fn get_detailed_track_info(&self) -> Option<serde_json::Value> {
+        let guard = self.inner.lock();
+        
+        // Base track info
+        if let Some(track_json) = &guard.current_track_info {
+            if let Ok(mut track_value) = serde_json::from_str::<serde_json::Value>(track_json) {
+                // Add additional metadata
+                if let serde_json::Value::Object(ref mut map) = track_value {
+                    // Add playback position
+                    map.insert(
+                        "playback_position".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(guard.playback_position))
+                    );
+                    
+                    // Calculate and add percentage
+                    let percentage = if guard.total_track_bytes > 0 {
+                        (guard.playback_bytes_position * 100) / guard.total_track_bytes
+                    } else {
+                        let duration = if let Some(track) = crate::services::playlist::get_current_track(
+                            &crate::config::PLAYLIST_FILE, 
+                            &guard.music_folder
+                        ) {
+                            track.duration
+                        } else {
+                            0
+                        };
+                        
+                        if duration > 0 {
+                            (guard.playback_position * 100) / duration
+                        } else {
+                            0
+                        }
+                    };
+                    
+                    map.insert(
+                        "percentage".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(
+                            std::cmp::min(percentage as u8, 100)
+                        ))
+                    );
+                    
+                    // Add saved_chunks info for debugging
+                    map.insert(
+                        "saved_chunks_count".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(guard.saved_chunks.len()))
+                    );
+                }
+                
+                return Some(track_value);
+            }
+        }
+        
+        None
     }
     
     pub fn get_receiver_count(&self) -> usize {

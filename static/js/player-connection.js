@@ -322,6 +322,90 @@ function attemptReconnection() {
     }, delay);
 }
 
+
+function handleTrackInfoUpdate(info) {
+    // Check if this is a mid-stream join
+    const midStreamJoin = info.mid_stream_join === true;
+    const position = info.playback_position || 0;
+    const percentage = info.percentage || 0;
+    
+    // Update UI with current track info
+    currentTitle.textContent = info.title || 'Unknown Title';
+    currentArtist.textContent = info.artist || 'Unknown Artist';
+    currentAlbum.textContent = info.album || 'Unknown Album';
+    
+    // Update progress bar immediately
+    if (info.duration) {
+        currentDuration.textContent = formatTime(info.duration);
+        
+        // When joining mid-stream, immediately set the progress bar
+        if (midStreamJoin && percentage > 0) {
+            // Update progress bar to current position
+            updateProgressBar(position, info.duration);
+            
+            // Store last known position
+            state.lastKnownPosition = position;
+            
+            log(`Joined stream at position ${position}s (${percentage}%)`, 'TRACK');
+        }
+    }
+    
+    // Update listener count
+    if (info.active_listeners !== undefined) {
+        listenerCount.textContent = `Listeners: ${info.active_listeners}`;
+    }
+    
+    // Store track ID for change detection
+    state.currentTrackId = info.path;
+    
+    // Update page title
+    document.title = `${info.title} - ${info.artist} | ChillOut Radio`;
+    
+    // Update last track info time
+    state.lastTrackInfoTime = Date.now();
+}
+function handleTrackInfoUpdate(info) {
+    // Check if this is a mid-stream join
+    const midStreamJoin = info.mid_stream_join === true;
+    const position = info.playback_position || 0;
+    const percentage = info.percentage || 0;
+    
+    // Update UI with current track info
+    currentTitle.textContent = info.title || 'Unknown Title';
+    currentArtist.textContent = info.artist || 'Unknown Artist';
+    currentAlbum.textContent = info.album || 'Unknown Album';
+    
+    // Update progress bar immediately
+    if (info.duration) {
+        currentDuration.textContent = formatTime(info.duration);
+        
+        // When joining mid-stream, immediately set the progress bar
+        if (midStreamJoin && percentage > 0) {
+            // Update progress bar to current position
+            updateProgressBar(position, info.duration);
+            
+            // Store last known position
+            state.lastKnownPosition = position;
+            
+            log(`Joined stream at position ${position}s (${percentage}%)`, 'TRACK');
+        }
+    }
+    
+    // Update listener count
+    if (info.active_listeners !== undefined) {
+        listenerCount.textContent = `Listeners: ${info.active_listeners}`;
+    }
+    
+    // Store track ID for change detection
+    state.currentTrackId = info.path;
+    
+    // Update page title
+    document.title = `${info.title} - ${info.artist} | ChillOut Radio`;
+    
+    // Update last track info time
+    state.lastTrackInfoTime = Date.now();
+}
+
 // Make functions available to other modules
 window.connectWebSocket = connectWebSocket;
 window.handleWebSocketMessage = handleWebSocketMessage;

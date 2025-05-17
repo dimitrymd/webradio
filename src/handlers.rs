@@ -8,20 +8,13 @@ use rocket::{get, catch};
 use rocket_dyn_templates::{Template, context};
 use rocket_ws as ws;
 use rocket::futures::SinkExt; // For WebSocket streaming
-use rocket::response::Stream;
-use std::io::{Cursor, ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 use futures::stream::StreamExt;
-use std::collections::VecDeque;
 
-use log::{info, error, warn}; // Add these log macros
-use tokio::sync::broadcast;   // Add broadcast import
-use rocket::response::stream::Stream; // Fix Stream import
-use std::sync::Arc;           // Make sure Arc is imported
-
-use crate::models::playlist::Playlist;
+use crate::models::playlist::Track;
 use crate::services::playlist;
 use crate::services::streamer::StreamManager;
 use crate::services::websocket_bus::WebSocketBus;
@@ -142,7 +135,6 @@ pub fn stream_ws(
         let (client_id, mut msg_rx) = websocket_bus.add_client();
         
         // Send initial data to the client - fixed by making it blocking
-        // Fix this line to avoid the "cannot apply unary operator" error
         if websocket_bus.send_initial_data(client_id).await == false {
             websocket_bus.remove_client(client_id);
             return Ok(());
@@ -236,6 +228,7 @@ pub fn stream_ws(
         Ok(())
     }))
 }
+
 #[get("/stream-opus")]
 pub fn stream_opus_ws(
     ws: ws::WebSocket, 
@@ -268,35 +261,13 @@ pub fn stream_opus_ws(
         // Get initial Opus chunks and send them
         let initial_chunks = transcoder.get_opus_chunks_from_current_position();
         
-        // Log the size of initial chunks for debugging
-        log::info!("Sending {} initial Opus chunks to iOS client", initial_chunks.len());
-        
-        // Send initial chunks with enhanced error handling
-        for (i, chunk) in initial_chunks.iter().enumerate() {
-            if let Err(e) = sink.send(ws::Message::Binary(chunk.clone())).await {
-                log::error!("Error sending initial Opus chunk {}: {}", i, e);
+        // Send initial chunks
+        log::debug!("Sending {} initial Opus chunks", initial_chunks.len());
+        for chunk in initial_chunks {
+            if let Err(e) = sink.send(ws::Message::Binary(chunk)).await {
+                log::error!("Error sending initial Opus chunk: {}", e);
                 websocket_bus.remove_client(client_id);
                 return Ok(());
-            }
-            
-            // Add small delays between chunks to avoid overwhelming iOS browsers
-            if i % 5 == 0 && i > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            }
-        }
-        
-        // Send a specific message to help clients verify the stream format
-        let format_info = serde_json::json!({
-            "type": "stream_info",
-            "format": "opus",
-            "container": "ogg",
-            "sample_rate": 48000,
-            "channels": 2
-        });
-        
-        if let Ok(format_info_str) = serde_json::to_string(&format_info) {
-            if let Err(e) = sink.send(ws::Message::Text(format_info_str)).await {
-                log::error!("Error sending format info: {}", e);
             }
         }
         
@@ -355,23 +326,6 @@ pub fn stream_opus_ws(
                                         ws::Message::Text(r#"{"type":"pong"}"#.to_string())
                                     );
                                 },
-                                "format_request" => {
-                                    // Client is asking about the format - send details
-                                    let format_info = serde_json::json!({
-                                        "type": "stream_info",
-                                        "format": "opus",
-                                        "container": "ogg",
-                                        "sample_rate": 48000,
-                                        "channels": 2
-                                    });
-                                    
-                                    if let Ok(format_info_str) = serde_json::to_string(&format_info) {
-                                        websocket_bus.send_to_client(
-                                            client_id,
-                                            ws::Message::Text(format_info_str)
-                                        );
-                                    }
-                                },
                                 _ => {
                                     log::debug!("Unknown request type: {}", req_type);
                                 }
@@ -400,63 +354,69 @@ pub fn stream_opus_ws(
     }))
 }
 
-// Direct streaming endpoint for iOS and other platforms without MSE support
 #[get("/direct-stream")]
-pub fn direct_stream(
-    stream_manager: &State<Arc<StreamManager>>
-) -> Result<Stream<impl Read>, Status> {
-    // Get a reference to the StreamManager
-    let sm = stream_manager.as_ref();
+pub async fn direct_stream(stream_manager: &State<Arc<StreamManager>>) -> rocket::response::Response<'static> {
+    use rocket::http::{ContentType, Status};
+    use rocket::response::Response;
+    use std::io::Cursor;
     
     // Check if streaming is active
-    if !sm.is_streaming() {
-        return Err(Status::ServiceUnavailable);
+    if !stream_manager.is_streaming() {
+        return Response::build()
+            .status(Status::ServiceUnavailable)
+            .header(ContentType::Plain)
+            .sized_body(0, Cursor::new("Streaming not active"))
+            .finalize();
     }
     
-    // Increment listener count
-    sm.increment_listener_count();
+    // Get the current playback position information
+    let position_percentage = stream_manager.get_playback_percentage();
     
-    // Log request for debugging
-    if let Some(track_info) = sm.get_track_info() {
-        info!("Direct stream request, serving: {}", track_info);
-    }
+    // Get the current chunks
+    let (header, all_chunks) = stream_manager.get_chunks_from_current_position();
     
-    // Get initial chunks to start with
-    let (id3_header, chunks) = sm.get_chunks_from_current_position();
-    
-    // Create a buffer with initial data
-    let mut initial_buffer = Vec::new();
-    
-    // Add ID3 header if available
-    if let Some(header) = id3_header {
-        initial_buffer.extend_from_slice(&header);
-    }
-    
-    // Add initial chunks - use more initial chunks for better buffering
-    for chunk in chunks.iter().take(config::INITIAL_CHUNKS_TO_SEND * 2) {
-        if !chunk.is_empty() {
-            initial_buffer.extend_from_slice(chunk);
-        }
-    }
-    
-    // Create a cursor for the initial buffer
-    let initial_cursor = Cursor::new(initial_buffer);
-    
-    // Get a broadcast receiver for ongoing data
-    let broadcast_rx = sm.get_broadcast_receiver();
-    
-    // Create a streaming reader that combines initial buffer with broadcast
-    let stream_reader = DirectStreamReader {
-        initial_data: Some(initial_cursor),
-        broadcast_rx,
-        stream_manager: sm.clone(), // sm.clone() already returns Arc<StreamManager>
-        closed: false,
+    // Determine which chunks to send based on current position
+    let chunks_to_use = if position_percentage > 0 && !all_chunks.is_empty() {
+        // Calculate position in the saved chunks
+        let total_chunks = all_chunks.len();
+        let target_chunk_index = (total_chunks as f32 * (position_percentage as f32 / 100.0)) as usize;
+        
+        // Start a few chunks before current position (if possible)
+        let buffer_chunks = 10; // Number of chunks before current position
+        let start_index = if target_chunk_index > buffer_chunks {
+            target_chunk_index - buffer_chunks
+        } else {
+            0
+        };
+        
+        // Get chunks from current position to the end
+        &all_chunks[start_index..]
+    } else {
+        // Use all chunks if we can't determine position
+        &all_chunks
     };
     
-    // Return streaming response with appropriate headers
-    Ok(Stream::from(stream_reader)
-       .chunked()
-       .with_content_type(ContentType::MP3))
+    // Combine the chunks into the response
+    let mut response_data = Vec::new();
+    
+    // Add header if available
+    if let Some(h) = header {
+        response_data.extend_from_slice(&h);
+    }
+    
+    // Add selected chunks
+    for chunk in chunks_to_use {
+        response_data.extend_from_slice(chunk);
+    }
+    
+    // Return the response with appropriate headers
+    Response::build()
+        .status(Status::Ok)
+        .header(ContentType::new("audio", "mpeg"))
+        .header(rocket::http::Header::new("Accept-Ranges", "bytes"))
+        .header(rocket::http::Header::new("Cache-Control", "no-cache"))
+        .sized_body(response_data.len(), Cursor::new(response_data))
+        .finalize()
 }
 
 // Helper function to get now playing data - this would be added to handlers.rs
@@ -552,76 +512,4 @@ pub async fn service_unavailable() -> Template {
         status: 503,
         message: "Server at capacity, try again later"
     })
-}
-
-pub struct DirectStreamReader {
-    initial_data: Option<Cursor<Vec<u8>>>,
-    broadcast_rx: broadcast::Receiver<Vec<u8>>,
-    stream_manager: Arc<StreamManager>,
-    closed: bool,
-}
-
-impl Read for DirectStreamReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // First, try to read from the initial data if available
-        if let Some(ref mut cursor) = self.initial_data {
-            match cursor.read(buf) {
-                Ok(0) => {
-                    // Initial data is exhausted, remove it
-                    self.initial_data = None;
-                },
-                Ok(n) => {
-                    // Successfully read data from initial buffer
-                    return Ok(n);
-                },
-                Err(e) => {
-                    error!("Error reading initial data: {}", e);
-                    self.initial_data = None;
-                    // Continue to reading from broadcast
-                }
-            }
-        }
-        
-        // If closed or stream is not active, return EOF
-        if self.closed || !self.stream_manager.is_streaming() {
-            return Ok(0); // EOF
-        }
-        
-        // Try to read from broadcast channel with a timeout
-        // Use blocking_recv to avoid busy waiting
-        match self.broadcast_rx.blocking_recv() {
-            Ok(chunk) => {
-                // Got a chunk, copy it to the output buffer
-                let n = std::cmp::min(buf.len(), chunk.len());
-                if n > 0 {
-                    buf[..n].copy_from_slice(&chunk[..n]);
-                }
-                Ok(n)
-            },
-            Err(broadcast::error::RecvError::Closed) => {
-                // Channel closed
-                self.closed = true;
-                self.stream_manager.decrement_listener_count();
-                Err(std::io::Error::new(ErrorKind::BrokenPipe, "Broadcast channel closed"))
-            },
-            Err(broadcast::error::RecvError::Lagged(_)) => {
-                // Channel lagged too much
-                warn!("Broadcast channel lagged, reinitializing");
-                // Get a fresh receiver and continue
-                self.broadcast_rx = self.stream_manager.get_broadcast_receiver();
-                // Return temporary "no data" without EOF
-                Ok(0)
-            }
-        }
-    }
-}
-
-impl Drop for DirectStreamReader {
-    fn drop(&mut self) {
-        if !self.closed {
-            // Decrement listener count when stream is dropped
-            self.stream_manager.decrement_listener_count();
-            self.closed = true;
-        }
-    }
 }
