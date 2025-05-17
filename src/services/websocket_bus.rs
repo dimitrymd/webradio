@@ -291,9 +291,9 @@ impl WebSocketBus {
         }
         
         // Send the selected chunks
-        for chunk in chunks_to_send {
+        for chunk in &chunks_to_send {
             if !chunk.is_empty() {
-                if !self.send_to_client(client_id, ws::Message::Binary(chunk)) {
+                if !self.send_to_client(client_id, ws::Message::Binary(chunk.to_vec())) {
                     return false;
                 }
                 
