@@ -119,7 +119,7 @@ pub async fn get_stats(
 
 // Direct streaming for all platforms
 #[get("/direct-stream")]
-pub async fn direct_stream(stream_manager: &State<Arc<StreamManager>>) -> Result<(rocket::http::ContentType, Vec<u8>), Status> {
+pub async fn direct_stream(stream_manager: &State<Arc<StreamManager>>) -> Result<(ContentType, Vec<u8>), Status> {
     use rocket::http::{ContentType, Status};
     
     // Check if streaming is active
@@ -127,11 +127,10 @@ pub async fn direct_stream(stream_manager: &State<Arc<StreamManager>>) -> Result
         return Err(Status::ServiceUnavailable);
     }
     
-    // Get all chunks from the current track
+    // For all platforms, we need to send the complete current track
     let (header, all_chunks) = stream_manager.get_chunks_from_current_position();
     
-    // For all platforms, we always send the complete audio from the beginning
-    // This ensures reliable track transitions and playback on all devices
+    // Always use all chunks - direct streaming needs the complete file
     let chunks_to_use = &all_chunks;
     
     // Combine the chunks into the response
@@ -148,6 +147,8 @@ pub async fn direct_stream(stream_manager: &State<Arc<StreamManager>>) -> Result
     }
     
     // Return the response with the appropriate Content-Type
+    // We can't use custom headers with the (ContentType, Vec<u8>) return type,
+    // so we'll need to handle the position synchronization on the client side using only the API
     Ok((ContentType::new("audio", "mpeg"), response_data))
 }
 

@@ -1,5 +1,3 @@
-// Updated player-api.js for direct streaming track info
-
 // Fetch now playing info via API
 async function fetchNowPlaying() {
     try {
@@ -11,8 +9,14 @@ async function fetchNowPlaying() {
         
         const data = await response.json();
         handleTrackInfoUpdate(data);
+        
+        // Return the data for promise chaining
+        return data;
     } catch (error) {
         log(`Error fetching now playing: ${error.message}`, 'API', true);
+        
+        // Re-throw to allow proper promise handling
+        throw error;
     }
 }
 
@@ -27,6 +31,9 @@ function handleTrackInfoUpdate(info) {
         
         // Get key info
         const position = info.playback_position || 0;
+        
+        // Store the server position for syncing
+        state.serverPosition = position;
         
         // Check for track change
         const newTrackId = info.path;

@@ -37,49 +37,89 @@ function startAudio() {
 function startDirectStream() {
     state.isPlaying = true;
     
-    // Create a direct stream URL with timestamp to prevent caching
-    const timestamp = Date.now();
-    const streamUrl = `/direct-stream?t=${timestamp}`;
-    
-    log(`Connecting to direct stream: ${streamUrl}`, 'CONTROL');
-    
-    // Set the source 
-    state.audioElement.src = streamUrl;
-    
-    // Try to play
-    const playPromise = state.audioElement.play();
-    
-    // Handle play promise
-    if (playPromise !== undefined) {
-        playPromise.then(() => {
-            log('Direct stream playback started successfully', 'AUDIO');
-            showStatus('Streaming started');
+    // First, fetch current track info to get the server position
+    fetchNowPlaying().then(() => {
+        // Create a direct stream URL with timestamp to prevent caching
+        const timestamp = Date.now();
+        const streamUrl = `/direct-stream?t=${timestamp}`;
+        
+        log(`Connecting to direct stream: ${streamUrl}`, 'CONTROL');
+        
+        // Set up a load event handler to set the current time after loading
+        state.audioElement.onloadedmetadata = function() {
+            // Get the server position from the API fetch we just did
+            const serverPosition = state.serverPosition || 0;
             
-            // Update UI
-            startBtn.textContent = 'Disconnect';
-            startBtn.disabled = false;
-            startBtn.dataset.connected = 'true';
-            
-            // Start polling for track info
-            startNowPlayingPolling();
-            
-            // Start track position monitor
-            startTrackPositionMonitor();
-            
-        }).catch(e => {
-            log(`Error starting direct stream: ${e.message}`, 'AUDIO', true);
-            
-            if (e.name === 'NotAllowedError') {
-                showStatus('Tap play button to start audio (browser requires user interaction)', true, false);
-                setupUserInteractionHandlers();
-            } else {
-                showStatus(`Playback error: ${e.message}`, true);
-                stopDirectStream();
+            if (serverPosition > 0) {
+                log(`Setting playback position to server position: ${serverPosition}s`, 'AUDIO');
+                
+                // Set the current time to match server position
+                // Subtract a small buffer to ensure smooth playback
+                const targetPosition = Math.max(0, serverPosition - 3);
+                
+                try {
+                    state.audioElement.currentTime = targetPosition;
+                } catch (e) {
+                    log(`Error setting currentTime: ${e.message}`, 'AUDIO', true);
+                }
             }
             
+            // Remove the handler after using it
+            state.audioElement.onloadedmetadata = null;
+        };
+        
+        // Set the source 
+        state.audioElement.src = streamUrl;
+        
+        // Try to play
+        const playPromise = state.audioElement.play();
+        
+        // Handle play promise
+        if (playPromise !== undefined) {
+            playPromise.then(() => {
+                log('Direct stream playback started successfully', 'AUDIO');
+                showStatus('Streaming started');
+                
+                // Update UI
+                startBtn.textContent = 'Disconnect';
+                startBtn.disabled = false;
+                startBtn.dataset.connected = 'true';
+                
+                // Start polling for track info
+                startNowPlayingPolling();
+                
+                // Start track position monitor
+                startTrackPositionMonitor();
+                
+            }).catch(e => {
+                log(`Error starting direct stream: ${e.message}`, 'AUDIO', true);
+                
+                if (e.name === 'NotAllowedError') {
+                    showStatus('Tap play button to start audio (browser requires user interaction)', true, false);
+                    setupUserInteractionHandlers();
+                } else {
+                    showStatus(`Playback error: ${e.message}`, true);
+                    stopDirectStream();
+                }
+                
+                startBtn.disabled = false;
+            });
+        }
+    }).catch(() => {
+        // If we couldn't fetch the server position, just start from the beginning
+        log('Could not fetch server position, starting from beginning', 'AUDIO', true);
+        
+        const timestamp = Date.now();
+        const streamUrl = `/direct-stream?t=${timestamp}`;
+        
+        // Set the source and play
+        state.audioElement.src = streamUrl;
+        state.audioElement.play().catch(e => {
+            log(`Error starting direct stream: ${e.message}`, 'AUDIO', true);
+            stopDirectStream();
             startBtn.disabled = false;
         });
-    }
+    });
 }
 
 // Set up listeners for direct streaming
@@ -250,35 +290,60 @@ function restartDirectStream() {
     state.reconnectAttempts++;
     log(`Restarting direct stream (attempt ${state.reconnectAttempts}/${config.MAX_RETRIES})`, 'CONTROL');
     
-    // Create a new timestamp to avoid caching
-    const timestamp = Date.now();
-    const streamUrl = `/direct-stream?t=${timestamp}`;
-    
-    // Stop the current playback
-    state.audioElement.pause();
-    state.audioElement.currentTime = 0;
-    
-    // Set new source and play
-    state.audioElement.src = streamUrl;
-    
-    // Small delay to allow for track transition
-    setTimeout(() => {
-        // Try to play
-        const playPromise = state.audioElement.play();
-        if (playPromise !== undefined) {
-            playPromise.catch(e => {
-                log(`Error restarting stream: ${e.message}`, 'AUDIO', true);
+    // Fetch latest track info before restarting
+    fetchNowPlaying().then(() => {
+        // Create a new timestamp to avoid caching
+        const timestamp = Date.now();
+        const streamUrl = `/direct-stream?t=${timestamp}`;
+        
+        // Stop the current playback
+        state.audioElement.pause();
+        
+        // Set up a load event handler to set the current time after loading
+        state.audioElement.onloadedmetadata = function() {
+            // Get the server position from the last track info
+            const serverPosition = state.serverPosition || 0;
+            
+            if (serverPosition > 0) {
+                log(`Setting playback position to server position: ${serverPosition}s`, 'AUDIO');
                 
-                if (e.name === 'NotAllowedError') {
-                    showStatus('Tap to restart audio', true, false);
-                    setupUserInteractionHandlers();
-                } else {
-                    // Try again after a delay
-                    setTimeout(restartDirectStream, config.RETRY_DELAY);
+                // Set the current time to match server position
+                // Subtract a small buffer to ensure smooth playback
+                const targetPosition = Math.max(0, serverPosition - 3);
+                
+                try {
+                    state.audioElement.currentTime = targetPosition;
+                } catch (e) {
+                    log(`Error setting currentTime: ${e.message}`, 'AUDIO', true);
                 }
-            });
-        }
-    }, 500);
+            }
+            
+            // Remove the handler after using it
+            state.audioElement.onloadedmetadata = null;
+        };
+        
+        // Set new source
+        state.audioElement.src = streamUrl;
+        
+        // Small delay to allow for track transition
+        setTimeout(() => {
+            // Try to play
+            const playPromise = state.audioElement.play();
+            if (playPromise !== undefined) {
+                playPromise.catch(e => {
+                    log(`Error restarting stream: ${e.message}`, 'AUDIO', true);
+                    
+                    if (e.name === 'NotAllowedError') {
+                        showStatus('Tap to restart audio', true, false);
+                        setupUserInteractionHandlers();
+                    } else {
+                        // Try again after a delay
+                        setTimeout(restartDirectStream, config.RETRY_DELAY);
+                    }
+                });
+            }
+        }, 500);
+    });
 }
 
 // Stop direct streaming
