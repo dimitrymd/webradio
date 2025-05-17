@@ -1,5 +1,5 @@
-// Main.rs modified to include the direct-stream route
-// Updated main.rs with safer transcoder implementation
+// Updated main.rs with direct streaming for all platforms
+
 extern crate rocket;
 
 use rocket_dyn_templates::Template;
@@ -21,10 +21,8 @@ use crate::services::transcoder::TranscoderManager;
 #[launch]
 fn rocket() -> rocket::Rocket<rocket::Build> {
     println!("============================================================");
-    println!("Starting Rust MP3 Web Radio (iOS Compatible with Opus Transcoding)");
+    println!("Starting Rust MP3 Web Radio (Direct Streaming for All Platforms)");
     println!("Music folder: {}", config::MUSIC_FOLDER.display());
-    println!("Chunk size: {}, Buffer size: {}", config::CHUNK_SIZE, config::BUFFER_SIZE);
-    println!("Transcoding enabled: {}", config::ENABLE_TRANSCODING);
     println!("============================================================");
 
     // Initialize the stream manager with the configuration values
@@ -35,7 +33,7 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         config::STREAM_CACHE_TIME,
     ));
     
-    // Initialize the transcoder for iOS with safer implementation
+    // Initialize the transcoder for iOS
     let transcoder = Arc::new(TranscoderManager::new(
         config::OPUS_BUFFER_SIZE,
         config::OPUS_CHUNK_SIZE,
@@ -66,11 +64,11 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         }
     };
     
-    // Create WebSocket bus for optimized handling
+    // Create WebSocket bus (still needed for now playing updates)
     let websocket_bus = Arc::new(WebSocketBus::new(stream_manager.clone()));
     
-    // Start WebSocket broadcast loop in a separate task
-    println!("Starting WebSocket broadcast loop...");
+    // Start WebSocket broadcast loop for now playing info
+    println!("Starting WebSocket broadcast loop for track info...");
     websocket_bus.clone().start_broadcast_loop();
     
     // Start the broadcast thread only if we have tracks
@@ -78,23 +76,11 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         println!("Starting broadcast thread...");
         stream_manager.start_broadcast_thread();
         
-        // Also start transcoder if enabled
+        // Start transcoder if enabled (for Opus)
         if config::ENABLE_TRANSCODING {
-            println!("Starting MP3 to Opus transcoder (minimal implementation)...");
-            
-            // First send headers
+            println!("Starting MP3 to Opus transcoder...");
             transcoder.send_opus_headers();
-            
-            // Start the transcoder (which will just generate dummy Opus packets)
             Arc::clone(&transcoder).start_transcoding_shared();
-            
-            // No need to connect to stream manager, but keep for API consistency
-            println!("NOTE: Using minimal transcoder that generates dummy Opus packets");
-            if transcoder.is_transcoding() {
-                println!("Transcoder is running!");
-            } else {
-                println!("WARNING: Transcoder failed to start");
-            }
         }
     } else {
         println!("Not starting broadcast thread - no tracks available");
@@ -109,7 +95,8 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     
     println!("Server initialization complete, starting web server...");
     
-    // Build and launch the Rocket instance
+    // Build and launch the Rocket instance with only the direct-stream route
+    // for audio streaming (no WebSocket streaming anymore)
     rocket::build()
         .manage(stream_manager.clone())
         .manage(websocket_bus.clone())
@@ -118,8 +105,7 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
             handlers::index,
             handlers::now_playing,
             handlers::get_stats,
-            handlers::stream_ws,        // MP3 streaming via WebSocket
-            handlers::direct_stream,    // Direct HTTP streaming
+            handlers::direct_stream,   // Only direct streaming for all platforms
             handlers::static_files,
             handlers::diagnostic_page,
         ])

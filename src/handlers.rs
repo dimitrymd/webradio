@@ -1,4 +1,4 @@
-// Updated handlers.rs with optimized WebSocket handling
+// Updated handlers.rs with direct streaming for all platforms
 
 use rocket::http::{ContentType, Status};
 use rocket::State;
@@ -6,13 +6,8 @@ use rocket::serde::json::Json;
 use rocket::fs::NamedFile;
 use rocket::{get, catch};
 use rocket_dyn_templates::{Template, context};
-use rocket_ws as ws;
-use rocket::futures::SinkExt; // For WebSocket streaming
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
-use futures::stream::StreamExt;
 
 use crate::models::playlist::Track;
 use crate::services::playlist;
@@ -122,113 +117,7 @@ pub async fn get_stats(
     }))
 }
 
-// Optimized WebSocket handler that uses the shared WebSocketBus
-#[get("/stream")]
-pub fn stream_ws(
-    ws: ws::WebSocket, 
-    websocket_bus: &State<Arc<WebSocketBus>>
-) -> ws::Channel<'static> {
-    let websocket_bus = websocket_bus.inner().clone();
-    
-    ws.channel(move |stream| Box::pin(async move {
-        // Add client to the bus
-        let (client_id, mut msg_rx) = websocket_bus.add_client();
-        
-        // Send initial data to the client - fixed by making it blocking
-        if websocket_bus.send_initial_data(client_id).await == false {
-            websocket_bus.remove_client(client_id);
-            return Ok(());
-        }
-        
-        // Split the stream for concurrent sending and receiving
-        let (mut sink, mut stream) = stream.split();
-        
-        // Task that forwards messages from the bus to the client
-        let forward_task = tokio::spawn(async move {
-            while let Some(msg) = msg_rx.recv().await {
-                if let Err(e) = sink.send(msg).await {
-                    log::error!("Error sending to WebSocket: {}", e);
-                    break;
-                }
-            }
-        });
-        
-        // Create a stream manager reference for handling client requests
-        let stream_manager = websocket_bus.get_stream_manager();
-        
-        // Process incoming messages from client
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(ws::Message::Close(_)) => {
-                    log::debug!("Client {} sent close message", client_id);
-                    break;
-                },
-                Ok(ws::Message::Pong(_)) => {
-                    // Update last activity time
-                    websocket_bus.update_client_activity(client_id);
-                },
-                Ok(ws::Message::Text(text)) => {
-                    // Handle text commands from client
-                    log::debug!("Client {} sent message: {}", client_id, text);
-                    websocket_bus.update_client_activity(client_id);
-                    
-                    // Try to parse the message as JSON
-                    if let Ok(request) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if let Some(req_type) = request.get("type").and_then(|t| t.as_str()) {
-                            match req_type {
-                                "now_playing_request" => {
-                                    // Get current track info
-                                    let track_info = get_now_playing_data(&stream_manager);
-                                    
-                                    // Format as a response message
-                                    let response = serde_json::json!({
-                                        "type": "now_playing",
-                                        "track": track_info
-                                    });
-                                    
-                                    // Send response to this client only
-                                    if let Ok(response_str) = serde_json::to_string(&response) {
-                                        websocket_bus.send_to_client(
-                                            client_id, 
-                                            ws::Message::Text(response_str)
-                                        );
-                                    }
-                                },
-                                "ping" => {
-                                    // Client is checking connection - respond with pong
-                                    websocket_bus.send_to_client(
-                                        client_id,
-                                        ws::Message::Text(r#"{"type":"pong"}"#.to_string())
-                                    );
-                                },
-                                _ => {
-                                    log::debug!("Unknown request type: {}", req_type);
-                                }
-                            }
-                        }
-                    } else {
-                        log::debug!("Non-JSON message from client {}: {}", client_id, text);
-                    }
-                },
-                Err(e) => {
-                    log::error!("WebSocket error from client {}: {}", client_id, e);
-                    break;
-                },
-                _ => {
-                    // Update last activity for any message
-                    websocket_bus.update_client_activity(client_id);
-                }
-            }
-        }
-        
-        // Clean up
-        forward_task.abort();
-        websocket_bus.remove_client(client_id);
-        
-        Ok(())
-    }))
-}
-
+// Direct streaming for all platforms
 #[get("/direct-stream")]
 pub async fn direct_stream(stream_manager: &State<Arc<StreamManager>>) -> Result<(rocket::http::ContentType, Vec<u8>), Status> {
     use rocket::http::{ContentType, Status};
@@ -238,32 +127,12 @@ pub async fn direct_stream(stream_manager: &State<Arc<StreamManager>>) -> Result
         return Err(Status::ServiceUnavailable);
     }
     
-    // Get the current playback position information
-    let position_percentage = stream_manager.get_playback_percentage();
-    
-    // Get the current chunks
+    // Get all chunks from the current track
     let (header, all_chunks) = stream_manager.get_chunks_from_current_position();
     
-    // Determine which chunks to send based on current position
-    let chunks_to_use = if position_percentage > 0 && !all_chunks.is_empty() {
-        // Calculate position in the saved chunks
-        let total_chunks = all_chunks.len();
-        let target_chunk_index = (total_chunks as f32 * (position_percentage as f32 / 100.0)) as usize;
-        
-        // Start a few chunks before current position (if possible)
-        let buffer_chunks = 20; // Increased from 10 for smoother start
-        let start_index = if target_chunk_index > buffer_chunks {
-            target_chunk_index - buffer_chunks
-        } else {
-            0
-        };
-        
-        // Get chunks from current position to the end
-        &all_chunks[start_index..]
-    } else {
-        // Use all chunks if we can't determine position
-        &all_chunks
-    };
+    // For all platforms, we always send the complete audio from the beginning
+    // This ensures reliable track transitions and playback on all devices
+    let chunks_to_use = &all_chunks;
     
     // Combine the chunks into the response
     let mut response_data = Vec::new();
@@ -280,64 +149,6 @@ pub async fn direct_stream(stream_manager: &State<Arc<StreamManager>>) -> Result
     
     // Return the response with the appropriate Content-Type
     Ok((ContentType::new("audio", "mpeg"), response_data))
-}
-
-// Helper function to get now playing data - this would be added to handlers.rs
-fn get_now_playing_data(stream_manager: &Arc<StreamManager>) -> serde_json::Value {
-    // Get the actual current track from the stream manager's state
-    let track_info = stream_manager.get_track_info();
-    let playback_position = stream_manager.get_playback_position();
-    let active_listeners = stream_manager.get_active_listeners();
-    let current_bitrate = stream_manager.get_current_bitrate();
-    
-    // If we have track info from the stream manager, parse and use it
-    if let Some(track_json) = track_info {
-        if let Ok(mut track_value) = serde_json::from_str::<serde_json::Value>(&track_json) {
-            if let serde_json::Value::Object(ref mut map) = track_value {
-                map.insert(
-                    "active_listeners".to_string(), 
-                    serde_json::Value::Number(serde_json::Number::from(active_listeners))
-                );
-                map.insert(
-                    "playback_position".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(playback_position))
-                );
-                map.insert(
-                    "bitrate".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(current_bitrate / 1000))
-                );
-            }
-            return track_value;
-        }
-    }
-    
-    // Fallback to playlist if stream manager doesn't have current info
-    let track = playlist::get_current_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER);
-    
-    match track {
-        Some(track) => {
-            let mut track_json = serde_json::to_value(track).unwrap_or_default();
-            if let serde_json::Value::Object(ref mut map) = track_json {
-                map.insert(
-                    "active_listeners".to_string(), 
-                    serde_json::Value::Number(serde_json::Number::from(active_listeners))
-                );
-                map.insert(
-                    "playback_position".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(playback_position))
-                );
-                map.insert(
-                    "bitrate".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(current_bitrate / 1000))
-                );
-            }
-            
-            track_json
-        },
-        None => serde_json::json!({
-            "error": "No tracks available"
-        })
-    }
 }
 
 #[get("/diag")]

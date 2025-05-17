@@ -1,84 +1,23 @@
-// static/js/player-control.js - Updated with improved buffering
+// Updated player-control.js for direct streaming on all platforms
 
-// Initialize and start playback with better buffering strategy
+// Direct streaming implementation for all platforms
 function startAudio() {
-    log('Starting audio playback', 'CONTROL');
+    log('Starting audio playback via direct streaming', 'CONTROL');
     startBtn.disabled = true;
     showStatus('Connecting to stream...', false, false);
     
     // Reset state
     state.reconnectAttempts = 0;
-    state.audioQueue = [];
-    state.consecutiveErrors = 0;
-    state.lastAudioChunkTime = Date.now();
-    state.lastTrackInfoTime = Date.now();
     state.bufferUnderflows = 0;
-    
-    // For iOS devices, use direct streaming approach
-    if (state.isIOS) {
-        log('Using direct streaming for iOS device', 'CONTROL');
-        startDirectStream();
-        return;
-    }
-    
-    // Check browser support
-    if (!('WebSocket' in window)) {
-        showStatus('Your browser does not support WebSockets', true);
-        startBtn.disabled = false;
-        return;
-    }
-    
-    // Regular MSE check
-    if (!('MediaSource' in window)) {
-        log('MediaSource API not supported, falling back to direct streaming', 'CONTROL');
-        startDirectStream();
-        return;
-    }
-    
-    // Set up audio element
-    if (!state.audioElement) {
-        state.audioElement = new Audio();
-        state.audioElement.controls = false;
-        state.audioElement.volume = volumeControl.value;
-        state.audioElement.muted = state.isMuted;
-        state.audioElement.preload = 'auto'; // Ensure preloading is enabled
-        
-        // Add to document but hide visually
-        state.audioElement.style.display = 'none';
-        document.body.appendChild(state.audioElement);
-        
-        // Set up audio event listeners
-        setupAudioListeners();
-    }
-    
-    // Apply mobile-specific optimizations if needed
-    optimizeMobileSettings();
-    
-    // Standard MSE approach
-    setupMediaSource();
-    
-    // Start connection health check timer
-    if (state.connectionHealthTimer) {
-        clearInterval(state.connectionHealthTimer);
-    }
-    
-    state.connectionHealthTimer = setInterval(checkConnectionHealth, config.BUFFER_MONITOR_INTERVAL);
-}
-
-// Direct streaming implementation for iOS with improved buffering
-function startDirectStream() {
-    // Set flag so we know we're using direct stream mode
-    state.usingDirectStream = true;
-    state.isPlaying = true;
     
     // Create audio element if needed
     if (!state.audioElement) {
         state.audioElement = new Audio();
         state.audioElement.controls = false;
-        state.audioElement.volume = volumeControl.value;
+        state.audioElement.volume = volumeControl ? volumeControl.value : 0.7;
         state.audioElement.muted = state.isMuted;
         
-        // Critical for iOS
+        // Add attributes for better mobile compatibility
         state.audioElement.setAttribute('playsinline', '');
         state.audioElement.setAttribute('webkit-playsinline', '');
         
@@ -87,11 +26,19 @@ function startDirectStream() {
         document.body.appendChild(state.audioElement);
         
         // Set up basic audio listeners
-        setupDirectStreamListeners();
+        setupAudioListeners();
     }
     
+    // Start direct streaming
+    startDirectStream();
+}
+
+// Direct HTTP streaming implementation
+function startDirectStream() {
+    state.isPlaying = true;
+    
     // Create a direct stream URL with timestamp to prevent caching
-    const timestamp = new Date().getTime();
+    const timestamp = Date.now();
     const streamUrl = `/direct-stream?t=${timestamp}`;
     
     log(`Connecting to direct stream: ${streamUrl}`, 'CONTROL');
@@ -99,10 +46,10 @@ function startDirectStream() {
     // Set the source 
     state.audioElement.src = streamUrl;
     
-    // Try to play - this will likely require user interaction on iOS
+    // Try to play
     const playPromise = state.audioElement.play();
     
-    // Handle play promise (modern browsers return a promise from play())
+    // Handle play promise
     if (playPromise !== undefined) {
         playPromise.then(() => {
             log('Direct stream playback started successfully', 'AUDIO');
@@ -116,11 +63,14 @@ function startDirectStream() {
             // Start polling for track info
             startNowPlayingPolling();
             
+            // Start track position monitor
+            startTrackPositionMonitor();
+            
         }).catch(e => {
             log(`Error starting direct stream: ${e.message}`, 'AUDIO', true);
             
             if (e.name === 'NotAllowedError') {
-                showStatus('Tap play button to start audio (iOS requires user interaction)', true, false);
+                showStatus('Tap play button to start audio (browser requires user interaction)', true, false);
                 setupUserInteractionHandlers();
             } else {
                 showStatus(`Playback error: ${e.message}`, true);
@@ -132,12 +82,15 @@ function startDirectStream() {
     }
 }
 
-// Set up listeners specific to direct streaming with improved buffering for iOS
-function setupDirectStreamListeners() {
+// Set up listeners for direct streaming
+function setupAudioListeners() {
+    // For performance, use passive event listeners where appropriate
+    const passiveOpts = { passive: true };
+    
     state.audioElement.addEventListener('playing', () => {
         log('Audio playing', 'AUDIO');
         showStatus('Audio playing');
-    });
+    }, passiveOpts);
     
     state.audioElement.addEventListener('waiting', () => {
         log('Audio buffering', 'AUDIO');
@@ -165,21 +118,49 @@ function setupDirectStreamListeners() {
     
     state.audioElement.addEventListener('ended', () => {
         log('Audio ended', 'AUDIO');
+        
         // If we're still supposed to be playing, try to restart
         if (state.isPlaying) {
-            log('Audio ended unexpectedly, restarting', 'AUDIO', true);
-            showStatus('Audio ended - reconnecting', true, false);
-            restartDirectStream();
+            log('Audio ended - checking if track change or error', 'AUDIO');
+            
+            // Check if this is a normal track end or an error
+            const now = Date.now();
+            const timeSinceLastChange = (now - state.lastTrackChange) / 1000;
+            
+            if (timeSinceLastChange > 10 && state.trackPlaybackDuration > 0 && 
+                timeSinceLastChange < state.trackPlaybackDuration * 1.1) {
+                // Normal track end - wait for next polling cycle to refresh
+                log('Track appears to have ended normally, waiting for next track', 'AUDIO');
+                showStatus('Track ended, loading next...', false, false);
+                
+                // Force an immediate track info update
+                fetchNowPlaying();
+                
+                // Small delay then restart stream
+                setTimeout(restartDirectStream, 1000);
+            } else {
+                // Possible error - restart immediately
+                log('Audio ended unexpectedly, restarting', 'AUDIO', true);
+                showStatus('Audio ended unexpectedly - reconnecting', true, false);
+                restartDirectStream();
+            }
         }
     });
     
-    // For iOS, slow down playback very slightly to help with buffering
-    if (state.isIOS) {
-        state.audioElement.playbackRate = 0.98; // 2% slower than normal - imperceptible but helps buffering
-    }
+    // Add timeupdate handler to update progress bar
+    state.audioElement.addEventListener('timeupdate', () => {
+        // Only update occasionally to avoid performance issues
+        if (Math.random() < 0.1) { // Update roughly every 10th event (~1 second)
+            const currentTime = state.audioElement.currentTime;
+            
+            if (currentDuration && currentPosition && progressBar) {
+                updateProgressBar(currentTime, state.trackPlaybackDuration);
+            }
+        }
+    }, passiveOpts);
 }
 
-// Add helpers for iOS autoplay restrictions
+// Add helpers for autoplay restrictions
 function setupUserInteractionHandlers() {
     // Function to try playing audio when user interacts with the page
     const tryPlayAudio = function() {
@@ -206,7 +187,7 @@ function setupUserInteractionHandlers() {
     document.addEventListener('touchstart', tryPlayAudio);
 }
 
-// Poll for track info with reduced interval for better updates
+// Poll for track info
 function startNowPlayingPolling() {
     // Clear any existing interval
     if (state.nowPlayingInterval) {
@@ -216,7 +197,7 @@ function startNowPlayingPolling() {
     // Initial fetch
     fetchNowPlaying();
     
-    // Set up polling every 5 seconds (reduced from 10)
+    // Set up polling
     state.nowPlayingInterval = setInterval(() => {
         if (state.isPlaying) {
             fetchNowPlaying();
@@ -224,17 +205,53 @@ function startNowPlayingPolling() {
             clearInterval(state.nowPlayingInterval);
             state.nowPlayingInterval = null;
         }
-    }, 5000);
+    }, config.NOW_PLAYING_INTERVAL);
 }
 
-// Restart the direct stream with improved buffering
+// Monitor track position for end-of-track detection
+function startTrackPositionMonitor() {
+    // Clear any existing interval
+    if (state.trackPositionInterval) {
+        clearInterval(state.trackPositionInterval);
+    }
+    
+    // Set up interval to check position
+    state.trackPositionInterval = setInterval(() => {
+        if (state.isPlaying && state.audioElement && !state.audioElement.paused) {
+            const currentTime = state.audioElement.currentTime;
+            const duration = state.trackPlaybackDuration;
+            
+            // Check if we're near the end of the track
+            if (duration > 0 && currentTime > 0 && currentTime >= duration - 1) {
+                log(`Near end of track: ${currentTime.toFixed(1)}/${duration}s`, 'TRACK');
+                
+                // Force a now playing check to prepare for next track
+                fetchNowPlaying();
+            }
+        } else if (!state.isPlaying) {
+            clearInterval(state.trackPositionInterval);
+            state.trackPositionInterval = null;
+        }
+    }, config.TRACK_CHECK_INTERVAL);
+}
+
+// Restart the direct stream
 function restartDirectStream() {
     if (!state.isPlaying) return;
     
-    log('Restarting direct stream', 'CONTROL');
+    // Don't retry too many times
+    if (state.reconnectAttempts >= config.MAX_RETRIES) {
+        log(`Maximum reconnection attempts (${config.MAX_RETRIES}) reached`, 'CONTROL', true);
+        showStatus('Could not reconnect to stream. Please try again later.', true);
+        stopDirectStream();
+        return;
+    }
+    
+    state.reconnectAttempts++;
+    log(`Restarting direct stream (attempt ${state.reconnectAttempts}/${config.MAX_RETRIES})`, 'CONTROL');
     
     // Create a new timestamp to avoid caching
-    const timestamp = new Date().getTime();
+    const timestamp = Date.now();
     const streamUrl = `/direct-stream?t=${timestamp}`;
     
     // Stop the current playback
@@ -244,18 +261,24 @@ function restartDirectStream() {
     // Set new source and play
     state.audioElement.src = streamUrl;
     
-    // Try to play
-    const playPromise = state.audioElement.play();
-    if (playPromise !== undefined) {
-        playPromise.catch(e => {
-            log(`Error restarting stream: ${e.message}`, 'AUDIO', true);
-            
-            if (e.name === 'NotAllowedError') {
-                showStatus('Tap to restart audio', true, false);
-                setupUserInteractionHandlers();
-            }
-        });
-    }
+    // Small delay to allow for track transition
+    setTimeout(() => {
+        // Try to play
+        const playPromise = state.audioElement.play();
+        if (playPromise !== undefined) {
+            playPromise.catch(e => {
+                log(`Error restarting stream: ${e.message}`, 'AUDIO', true);
+                
+                if (e.name === 'NotAllowedError') {
+                    showStatus('Tap to restart audio', true, false);
+                    setupUserInteractionHandlers();
+                } else {
+                    // Try again after a delay
+                    setTimeout(restartDirectStream, config.RETRY_DELAY);
+                }
+            });
+        }
+    }, 500);
 }
 
 // Stop direct streaming
@@ -263,12 +286,17 @@ function stopDirectStream() {
     log('Stopping direct stream', 'CONTROL');
     
     state.isPlaying = false;
-    state.usingDirectStream = false;
     
     // Stop polling for track info
     if (state.nowPlayingInterval) {
         clearInterval(state.nowPlayingInterval);
         state.nowPlayingInterval = null;
+    }
+    
+    // Stop track position monitoring
+    if (state.trackPositionInterval) {
+        clearInterval(state.trackPositionInterval);
+        state.trackPositionInterval = null;
     }
     
     // Stop audio playback
@@ -286,93 +314,37 @@ function stopDirectStream() {
     showStatus('Disconnected from stream');
 }
 
-// Stop audio playback and disconnect
-function stopAudio(isError = false) {
-    log(`Stopping audio playback${isError ? ' (due to error)' : ''}`, 'CONTROL');
-    
-    state.isPlaying = false;
-    
-    // If using direct streaming approach
-    if (state.usingDirectStream) {
-        stopDirectStream();
-        return;
-    }
-    
-    // Standard MSE cleanup
-    if (state.connectionHealthTimer) {
-        clearInterval(state.connectionHealthTimer);
-        state.connectionHealthTimer = null;
-    }
-    
-    if (state.connectionTimeout) {
-        clearTimeout(state.connectionTimeout);
-        state.connectionTimeout = null;
-    }
-    
-    // Close WebSocket
-    if (state.ws) {
-        try {
-            state.ws.close();
-        } catch (e) {
-            // Ignore close errors
-        }
-        state.ws = null;
-    }
-    
-    // Clean up MediaSource
-    if (state.sourceBuffer) {
-        state.sourceBuffer = null;
-    }
-    
-    if (state.mediaSource && state.mediaSource.readyState === 'open') {
-        try {
-            state.mediaSource.endOfStream();
-        } catch (e) {
-            log(`Error ending MediaSource: ${e.message}`, 'MEDIA');
-        }
-    }
-    state.mediaSource = null;
-    
-    // Stop audio
-    if (state.audioElement) {
-        state.audioElement.pause();
-        state.audioElement.src = '';
-        state.audioElement.load();
-    }
-    
-    // Clear queue
-    state.audioQueue = [];
-    
-    if (!isError) {
-        showStatus('Disconnected from audio stream');
-    }
-    
-    // Reset UI
-    startBtn.textContent = 'Connect';
-    startBtn.disabled = false;
-    startBtn.dataset.connected = 'false';
-}
-
 // Toggle connection
 function toggleConnection() {
     const isConnected = startBtn.dataset.connected === 'true';
     
     if (isConnected) {
         log('User requested disconnect', 'CONTROL');
-        stopAudio();
+        stopDirectStream();
     } else {
         log('User requested connect', 'CONTROL');
         startAudio();
     }
 }
 
+// Update progress bar function
+function updateProgressBar(position, duration) {
+    if (progressBar && duration > 0) {
+        const percent = (position / duration) * 100;
+        progressBar.style.width = `${percent}%`;
+        
+        // Update text display
+        if (currentPosition) currentPosition.textContent = formatTime(position);
+        if (currentDuration) currentDuration.textContent = formatTime(duration);
+    }
+}
+
 // Make functions available to other modules
 window.startAudio = startAudio;
-window.stopAudio = stopAudio;
-window.toggleConnection = toggleConnection;
-window.startDirectStream = startDirectStream;
 window.stopDirectStream = stopDirectStream;
+window.toggleConnection = toggleConnection;
 window.setupUserInteractionHandlers = setupUserInteractionHandlers;
-window.setupDirectStreamListeners = setupDirectStreamListeners;
+window.setupAudioListeners = setupAudioListeners;
 window.restartDirectStream = restartDirectStream;
 window.startNowPlayingPolling = startNowPlayingPolling;
+window.updateProgressBar = updateProgressBar;

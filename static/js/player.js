@@ -1,7 +1,7 @@
-// static/js/player.js - Updated with improved initialization
+// Updated player.js for direct streaming
 
 // player.js - Main entry point that loads all modules
-// ChillOut Radio player - Updated with iOS compatibility and improved buffering
+// ChillOut Radio player - Updated for Direct Streaming on all platforms
 
 // Load order: when this file is included, it loads all modules in correct order
 document.addEventListener('DOMContentLoaded', function() {
@@ -9,10 +9,9 @@ document.addEventListener('DOMContentLoaded', function() {
     // Verify all modules are loaded
     if (typeof formatTime !== 'function' || 
         typeof startAudio !== 'function' || 
-        typeof processQueue !== 'function' || 
-        typeof connectWebSocket !== 'function' ||
-        typeof checkMSECompatibility !== 'function' ||
-        typeof boostInitialBuffer !== 'function') {
+        typeof fetchNowPlaying !== 'function' ||
+        typeof handleTrackInfoUpdate !== 'function' ||
+        typeof updateProgressBar !== 'function') {
         
         console.error('[ERROR] Not all player modules are loaded. Please check script includes.');
         document.getElementById('status-message').textContent = 
@@ -25,17 +24,14 @@ document.addEventListener('DOMContentLoaded', function() {
     // Initialize player (function from player-core.js)
     initPlayer();
     
-    // Detect platform for optimized experience
+    // Detect platform for logging purposes
     const platform = detectPlatform();
-    
-    // Apply platform-specific optimizations
-    optimizeMobileSettings();
     
     // Log initialization
     const platformInfo = platform.isIOS ? 
-        'iOS detected (using direct stream)' : 
-        (platform.isMobile ? 'Mobile platform detected' : 'Desktop platform detected');
+        'iOS device detected' : 
+        (platform.isMobile ? 'Mobile device detected' : 'Desktop device detected');
     
     console.log(`ChillOut Radio player initialized - ${platformInfo}`);
-    console.log('Buffering optimizations enabled for smoother playback');
+    console.log('Using direct HTTP streaming for all platforms');
 });
