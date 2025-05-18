@@ -1,5 +1,62 @@
-// player-control.js - Part 1: Main Audio Control Functions
+// player-control.js - Part 1: Core Functions
 
+// Force seek to server position function - key to fixing position issue
+function forceSeekToServerPosition() {
+    // Don't attempt if not playing
+    if (!state.isPlaying || !state.audioElement) return;
+    
+    // Get current track info to determine server position
+    fetchNowPlaying().then(trackInfo => {
+        // Get the server position
+        const serverPosition = trackInfo.playback_position || 0;
+        const trackDuration = trackInfo.duration || 0;
+        
+        console.log(`[POSITION] Server is at position: ${serverPosition}s of ${trackDuration}s`);
+        
+        // Update our state
+        state.startPosition = serverPosition;
+        state.trackDuration = trackDuration;
+        
+        // Force update progress bar
+        updateProgressBar(serverPosition, trackDuration);
+        
+        // Only attempt to seek if we're not already close to the position
+        if (state.audioElement && Math.abs(state.audioElement.currentTime - serverPosition) > 3) {
+            try {
+                console.log(`[POSITION] Attempting forced seek to ${serverPosition}s`);
+                
+                // Check if seeking is possible
+                if (state.audioElement.readyState >= 2) {
+                    // Direct seek
+                    state.audioElement.currentTime = serverPosition;
+                    console.log(`[POSITION] Direct seek successful`);
+                } else {
+                    console.log(`[POSITION] Audio not ready for seeking (readyState=${state.audioElement.readyState})`);
+                    
+                    // Setup a listener for when the audio becomes seekable
+                    state.audioElement.addEventListener('canplay', function seekWhenReady() {
+                        state.audioElement.removeEventListener('canplay', seekWhenReady);
+                        
+                        try {
+                            state.audioElement.currentTime = serverPosition;
+                            console.log(`[POSITION] Delayed seek successful`);
+                        } catch (e) {
+                            console.error(`[POSITION] Delayed seek failed: ${e.message}`);
+                        }
+                    }, { once: true });
+                }
+            } catch (e) {
+                console.error(`[POSITION] Seek error: ${e.message}`);
+            }
+        } else {
+            console.log(`[POSITION] Already at or near server position, no seek needed`);
+        }
+    }).catch(error => {
+        console.error(`[POSITION] Error fetching server position: ${error.message}`);
+    });
+}
+
+// Start audio playback
 function startAudio() {
     log('Starting audio playback via direct streaming', 'CONTROL');
     startBtn.disabled = true;
@@ -8,10 +65,14 @@ function startAudio() {
     // Reset state
     state.reconnectAttempts = 0;
     state.bufferUnderflows = 0;
-    state.lastBufferAttempt = 0;
+    state.lastBufferEvent = 0;
     state.bufferMetrics = [];
     state.bufferPauseActive = false;
     state.initialStartTime = Date.now();
+    state.trackChangeInProgress = false; // Added for track change tracking
+    state.lastPlaybackTime = undefined; // Added for stall detection
+    state.lastPlaybackCheck = undefined; // Added for stall detection
+    state.consecutiveErrors = 0; // Added for error tracking
     
     // IMPORTANT: For better performance, always create a fresh Audio element
     if (state.audioElement) {
@@ -81,6 +142,10 @@ function stopDirectStream() {
     state.reconnectAttempts = 0;
     state.bufferMetrics = [];
     state.bufferPauseActive = false;
+    state.trackChangeInProgress = false;
+    state.lastPlaybackTime = undefined;
+    state.lastPlaybackCheck = undefined;
+    state.consecutiveErrors = 0;
     
     // Reset UI
     startBtn.textContent = 'Connect';
@@ -147,6 +212,11 @@ function clearAllTimers() {
         clearTimeout(state.rateRestoreTimeout);
         state.rateRestoreTimeout = null;
     }
+    
+    if (state.heartbeatInterval) {
+        clearInterval(state.heartbeatInterval);
+        state.heartbeatInterval = null;
+    }
 }
 
 // player-control.js - Part 2: Direct Streaming Implementation
@@ -170,15 +240,17 @@ function startDirectStreamWithImprovedBuffering() {
         state.startPosition = serverPosition;
         state.currentTrackId = trackId;
         
-        // BUFFERING IMPROVEMENT: Start from slightly earlier position (2s) and increase buffer
+        // IMPORTANT: Update the progress bar immediately to show correct position
+        updateProgressBar(serverPosition, state.trackDuration);
+        
+        // BUFFERING IMPROVEMENT: Use the current server position without modification
         const timestamp = Date.now();
-        // Start a bit earlier to prevent gaps - with safety check
-        const positionSec = Math.max(0, Math.min(serverPosition - 2, (state.trackDuration || 300) - 10)); 
+        const positionSec = serverPosition; // Use server position exactly
         
         // ENHANCED: Request larger buffer (90s) to reduce pauses during playback
         const streamUrl = `/direct-stream?t=${timestamp}&position=${positionSec}&track=${encodeURIComponent(trackId)}&buffer=90`;
         
-        log(`Connecting to direct stream: ${streamUrl}`, 'CONTROL');
+        log(`Connecting to direct stream at position ${positionSec}s: ${streamUrl}`, 'CONTROL');
         
         // CRITICAL: Set timeout to prevent never-ending load attempts
         state.loadTimeout = setTimeout(() => {
@@ -209,6 +281,17 @@ function startDirectStreamWithImprovedBuffering() {
                 state.loadTimeout = null;
             }
             
+            // CRITICAL: Try to set currentTime to match server position before playing
+            try {
+                if (state.audioElement.seekable && state.audioElement.seekable.length > 0) {
+                    log(`Setting current time to match server position: ${serverPosition}s`, 'AUDIO');
+                    state.audioElement.currentTime = Math.max(0, serverPosition);
+                }
+            } catch (e) {
+                log(`Error setting current time: ${e.message}`, 'AUDIO', true);
+                // Continue anyway - we'll attempt another seek after playback starts
+            }
+            
             // Proceed with playback
             proceedWithPlayback();
         }, { once: true });
@@ -226,6 +309,17 @@ function startDirectStreamWithImprovedBuffering() {
                 if (state.loadTimeout) {
                     clearTimeout(state.loadTimeout);
                     state.loadTimeout = null;
+                }
+                
+                // CRITICAL: Try to set currentTime here too for browsers that didn't trigger loadeddata
+                try {
+                    if (state.audioElement.seekable && state.audioElement.seekable.length > 0) {
+                        log(`Setting current time to match server position (canplay): ${serverPosition}s`, 'AUDIO');
+                        state.audioElement.currentTime = Math.max(0, serverPosition);
+                    }
+                } catch (e) {
+                    log(`Error setting current time (canplay): ${e.message}`, 'AUDIO', true);
+                    // Continue anyway - we'll attempt another seek after playback starts
                 }
                 
                 // Proceed with playback
@@ -269,7 +363,13 @@ function startDirectStreamWithImprovedBuffering() {
                 if (playPromise !== undefined) {
                     playPromise.then(() => {
                         log('Direct stream playback started', 'AUDIO');
-                        showStatus('Streaming started');
+                        
+                        // IMPORTANT: Show the current position in the status message
+                        const position = state.audioElement.currentTime;
+                        const duration = state.trackDuration;
+                        const percentage = Math.round((position / duration) * 100);
+                        showStatus(`Streaming started at position ${formatTime(position)} (${percentage}%)`);
+                        
                         finishStartup();
                     }).catch(e => {
                         log(`Error starting direct stream: ${e.message}`, 'AUDIO', true);
@@ -301,8 +401,9 @@ function startDirectStreamWithImprovedBuffering() {
                 startBtn.disabled = false;
                 startBtn.dataset.connected = 'true';
                 
-                // Start progress calculation right away
-                updateProgressDisplay();
+                // IMPORTANT: Start progress display with a very short interval initially
+                // This ensures we quickly show the correct position
+                updateProgressDisplayImmediate();
                 
                 // Start enhanced buffer monitoring
                 startEnhancedBufferMonitoring();
@@ -311,6 +412,13 @@ function startDirectStreamWithImprovedBuffering() {
                 setTimeout(() => {
                     startNowPlayingPolling();
                 }, 2000);
+                
+                // IMPORTANT NEW ADDITION: Force seek after a short delay 
+                // This allows the audio to initialize properly first
+                setTimeout(forceSeekToServerPosition, 2000);
+                
+                // Start heartbeat checks
+                startHeartbeatChecks();
             }
         }
     }).catch((error) => {
@@ -356,268 +464,37 @@ function startDirectStreamWithImprovedBuffering() {
         updateProgressDisplay();
         startEnhancedBufferMonitoring();
         startNowPlayingPolling();
+        
+        // Start heartbeat checks
+        startHeartbeatChecks();
     });
 }
 
-// player-control.js - Part 3: Event Listeners for Audio Element
+// Add immediate progress display update for better UI responsiveness
+function updateProgressDisplayImmediate() {
+    if (!state.isPlaying || !state.audioElement) return;
+    
+    // Get current position and duration
+    const position = state.audioElement.currentTime || state.startPosition;
+    const duration = state.trackDuration || 0;
+    
+    // Update progress bar immediately
+    updateProgressBar(position, duration);
+    
+    // Update text display
+    if (currentPosition) currentPosition.textContent = formatTime(position);
+    if (currentDuration && duration > 0) currentDuration.textContent = formatTime(duration);
+    
+    // Force another quick update in 100ms to handle any race conditions
+    setTimeout(() => {
+        if (state.isPlaying && state.audioElement) {
+            const newPosition = state.audioElement.currentTime || state.startPosition;
+            updateProgressBar(newPosition, duration);
+            if (currentPosition) currentPosition.textContent = formatTime(newPosition);
+        }
+    }, 100);
+    // player-control.js - Part 3: Event Listeners for Audio Element (continued)
 
-// Enhanced audio event listeners with better buffer management
-function setupEnhancedAudioListeners() {
-    // For performance, use passive event listeners where appropriate
-    const passiveOpts = { passive: true };
-    
-    state.audioElement.addEventListener('playing', () => {
-        log(`Audio playing`, 'AUDIO');
-        showStatus('Audio playing');
-        
-        // When we first start playing, update the display
-        updateProgressDisplay();
-        
-        // Reset buffer underflows on successful playback
-        setTimeout(() => {
-            if (state.audioElement && !state.audioElement.paused) {
-                state.bufferUnderflows = 0;
-            }
-        }, 5000);
-    }, passiveOpts);
-    
-    // ENHANCED: Better buffering detection and handling
-    state.audioElement.addEventListener('waiting', () => {
-        log('Audio buffering - waiting for data', 'AUDIO');
-        showStatus('Buffering...', false, false);
-        
-        // Track buffer starvation with rate limiting
-        const now = Date.now();
-        if (now - state.lastBufferEvent > 2000) {
-            state.bufferUnderflows++;
-            state.lastBufferEvent = now;
-            
-            // If we've had too many buffer underflows in a short time, take action
-            if (state.bufferUnderflows > 5 && now - state.streamStartTime < 30000) {
-                // Multiple underflows in first 30 seconds - likely network issues
-                log('Multiple buffer underflows at start - network may be too slow', 'AUDIO', true);
-                
-                // Try to adjust audio element options for slower networks
-                try {
-                    // Request smaller chunk size by restarting
-                    restartWithSlowerNetworkSettings();
-                    return;
-                } catch (e) {
-                    log(`Error adjusting for slow network: ${e.message}`, 'AUDIO', true);
-                }
-            }
-        }
-        
-        // Try to recover from buffer underflow with adaptive playback rate
-        if (state.audioElement && state.isPlaying) {
-            try {
-                const oldRate = state.audioElement.playbackRate;
-                
-                // Progressively slow down based on underflow frequency
-                const newRate = Math.max(0.8, 1.0 - (state.bufferUnderflows * 0.03));
-                
-                if (oldRate !== newRate) {
-                    state.audioElement.playbackRate = newRate;
-                    log(`Adjusted playback rate to ${newRate.toFixed(2)} for buffering recovery`, 'AUDIO');
-                    
-                    // Schedule playback rate restoration after buffer improves
-                    clearTimeout(state.rateRestoreTimeout);
-                    state.rateRestoreTimeout = setTimeout(() => {
-                        if (state.audioElement && state.isPlaying) {
-                            // Gradually restore to normal
-                            const current = state.audioElement.playbackRate;
-                            const newValue = Math.min(1.0, current + 0.05);
-                            state.audioElement.playbackRate = newValue;
-                            log(`Gradually restoring playback rate to ${newValue.toFixed(2)}`, 'AUDIO');
-                            
-                            // Continue restoring if needed
-                            if (newValue < 1.0) {
-                                state.rateRestoreTimeout = setTimeout(arguments.callee, 5000);
-                            }
-                        }
-                    }, 10000);
-                }
-            } catch (e) {
-                // Ignore playback rate errors
-            }
-        }
-    });
-    
-    state.audioElement.addEventListener('stalled', () => {
-        log('Audio stalled - network issue?', 'AUDIO');
-        showStatus('Stream stalled - buffering', true, false);
-        
-        // If we stall for too long, attempt to reconnect
-        if (state.stallTimeout) {
-            clearTimeout(state.stallTimeout);
-        }
-        
-        // Progressive timeout based on previous issues
-        const stallTimeoutDuration = state.bufferUnderflows > 3 ? 15000 : 8000;
-        
-        state.stallTimeout = setTimeout(() => {
-            if (state.isPlaying && state.audioElement && 
-                (state.audioElement.paused || state.audioElement.readyState < 3)) {
-                log(`Stall timeout after ${stallTimeoutDuration/1000}s - attempting to restart`, 'AUDIO', true);
-                restartDirectStreamWithImprovedBuffering();
-            }
-        }, stallTimeoutDuration);
-    });
-    
-    // ENHANCED: Better progress event monitoring
-    state.audioElement.addEventListener('progress', () => {
-        // Clear stall timeout if we're making progress
-        if (state.stallTimeout) {
-            clearTimeout(state.stallTimeout);
-            state.stallTimeout = null;
-        }
-        
-        // Check buffer state occasionally
-        if (Math.random() < 0.05) { // ~5% of events
-            reportBufferState();
-        }
-    }, passiveOpts);
-    
-    // Enhanced error handling with detailed diagnosis
-    state.audioElement.addEventListener('error', (e) => {
-        const error = state.audioElement.error;
-        const errorCode = error ? error.code : 'unknown';
-        const errorMessage = error ? error.message : 'Unknown error';
-        
-        log(`Audio error (code ${errorCode}): ${errorMessage}`, 'AUDIO', true);
-        
-        // Provide meaningful error messages based on code
-        let errorDescription = "Audio error";
-        switch (errorCode) {
-            case 1: // MEDIA_ERR_ABORTED
-                errorDescription = "Playback aborted";
-                break;
-            case 2: // MEDIA_ERR_NETWORK
-                errorDescription = "Network error";
-                break;
-            case 3: // MEDIA_ERR_DECODE
-                errorDescription = "Audio decoding error";
-                break;
-            case 4: // MEDIA_ERR_SRC_NOT_SUPPORTED
-                errorDescription = "Audio format not supported";
-                break;
-        }
-        
-        // Only attempt recovery if we're trying to play
-        if (state.isPlaying) {
-            showStatus(`${errorDescription} - attempting to recover`, true, false);
-            
-            // Network errors benefit most from a restart
-            if (errorCode === 2) {
-                // Use progressive backoff based on number of errors
-                const delay = Math.min(1000 * Math.pow(1.5, state.reconnectAttempts), 8000);
-                
-                setTimeout(() => {
-                    restartDirectStreamWithImprovedBuffering();
-                }, delay);
-            } else if (errorCode === 3) {
-                // For decode errors, try to adjust position
-                try {
-                    if (state.audioElement.currentTime > 0) {
-                        log('Trying to skip past decoding error', 'AUDIO');
-                        state.audioElement.currentTime = state.audioElement.currentTime + 1;
-                        
-                        // Try to resume after position change
-                        setTimeout(() => {
-                            if (state.audioElement && state.isPlaying) {
-                                state.audioElement.play().catch(e => {
-                                    log(`Failed to resume after position change: ${e.message}`, 'AUDIO', true);
-                                    restartDirectStreamWithImprovedBuffering();
-                                });
-                            }
-                        }, 500);
-                    } else {
-                        // If at beginning, just restart
-                        restartDirectStreamWithImprovedBuffering();
-                    }
-                } catch (e) {
-                    log(`Error handling decode error: ${e.message}`, 'AUDIO', true);
-                    restartDirectStreamWithImprovedBuffering();
-                }
-            } else {
-                // For other errors, just restart
-                restartDirectStreamWithImprovedBuffering();
-            }
-        }
-    });
-    
-    // Improved end of track detection and handling
-    state.audioElement.addEventListener('ended', () => {
-        log('Audio ended event fired', 'AUDIO');
-        
-        // If we're still supposed to be playing, handle track end properly
-        if (state.isPlaying) {
-            // Get current position estimate and track duration
-            const startTime = state.streamStartTime || 0;
-            const startPosition = state.startPosition || 0;
-            const elapsedSec = (Date.now() - startTime) / 1000;
-            const estimatedPosition = startPosition + elapsedSec;
-            const duration = state.trackDuration || 0;
-            
-            log(`Ended event at estimated position: ${estimatedPosition.toFixed(1)}s of ${duration}s`, 'AUDIO');
-            
-            // More intelligent track end detection
-            const timeSinceStart = (Date.now() - state.streamStartTime) / 1000;
-            const realEndExpected = (duration > 0 && estimatedPosition > (duration * 0.85));
-            const minPlaybackTime = Math.min(30, duration * 0.3); // At least 30s or 30% of duration
-            
-            if (realEndExpected && timeSinceStart > minPlaybackTime) {
-                // This is likely a real track end - get updated track info
-                log('Track appears to have ended normally, checking for next track', 'AUDIO');
-                showStatus('Track ended, loading next...', false, false);
-                
-                // Force an immediate track info update to check for new track
-                fetchNowPlaying().then(trackInfo => {
-                    if (trackInfo && trackInfo.path && trackInfo.path !== state.currentTrackId) {
-                        // Track has changed - restart with new track
-                        log('New track detected, restarting stream', 'TRACK');
-                        setTimeout(restartDirectStreamWithImprovedBuffering, 500);
-                    } else {
-                        // Same track or no change yet - try seeking to beginning
-                        log('Same track still playing on server, seeking to beginning', 'TRACK');
-                        try {
-                            // Seek to beginning of current track
-                            state.audioElement.currentTime = 0;
-                            state.audioElement.play().catch(e => {
-                                log(`Failed to restart track: ${e.message}`, 'AUDIO', true);
-                                restartDirectStreamWithImprovedBuffering();
-                            });
-                        } catch (e) {
-                            log(`Error seeking to beginning: ${e.message}`, 'AUDIO', true);
-                            restartDirectStreamWithImprovedBuffering();
-                        }
-                    }
-                }).catch(error => {
-                    log(`Error fetching track info: ${error.message}, restarting stream`, 'API', true);
-                    setTimeout(restartDirectStreamWithImprovedBuffering, 1000);
-                });
-            } else {
-                // This is likely a false end - probably a buffer issue
-                log('False end detected - track did not complete. Restarting stream.', 'AUDIO', true);
-                showStatus('Reconnecting...', true, false);
-                
-                // Check audio element state for diagnostics
-                const readyState = state.audioElement.readyState;
-                const buffered = state.audioElement.buffered;
-                let bufferInfo = "No buffer";
-                
-                if (buffered && buffered.length > 0) {
-                    bufferInfo = `Buffer: ${buffered.start(0)}-${buffered.end(0)}s`;
-                }
-                
-                log(`Audio state at false end: readyState=${readyState}, ${bufferInfo}`, 'AUDIO');
-                
-                // Restart with slight delay
-                setTimeout(restartDirectStreamWithImprovedBuffering, 1000);
-            }
-        }
-    });
-    
     // Add timeupdate listener for progress tracking
     state.audioElement.addEventListener('timeupdate', () => {
         // Clear stall timeout if we're updating
@@ -640,6 +517,102 @@ function setupEnhancedAudioListeners() {
                     restartDirectStreamWithImprovedBuffering();
                 }
             });
+        }
+        
+        // IMPORTANT NEW ADDITION: Check for end of track and potential track change
+        if (state.trackDuration > 0 && 
+            state.audioElement.currentTime > state.trackDuration * 0.98 && 
+            !state.trackChangeInProgress) {
+            
+            log(`Near end of track: ${state.audioElement.currentTime.toFixed(1)}s / ${state.trackDuration}s`, 'TRACK');
+            
+            // Flag we're checking for track change
+            state.trackChangeInProgress = true;
+            
+            // Force check for track change
+            fetchNowPlaying().then(response => {
+                if (response && response.path && response.path !== state.currentTrackId) {
+                    log('Track changed confirmed via API, restarting stream', 'TRACK');
+                    restartDirectStreamWithImprovedBuffering();
+                } else {
+                    // If we're really at the end but no track change detected,
+                    // force a restart anyway after a short delay
+                    if (state.audioElement.currentTime > state.trackDuration * 0.99) {
+                        log('At end of track but no track change detected, forcing restart soon', 'TRACK');
+                        setTimeout(() => {
+                            if (!state.trackChangeInProgress) {
+                                log('Forcing restart at track end', 'TRACK');
+                                restartDirectStreamWithImprovedBuffering();
+                            }
+                        }, 3000);
+                    }
+                }
+                
+                // Clear track change flag after a timeout
+                setTimeout(() => {
+                    state.trackChangeInProgress = false;
+                }, 5000);
+            }).catch(() => {
+                // Clear track change flag on error
+                state.trackChangeInProgress = false;
+            });
+        }
+        
+        // IMPORTANT NEW ADDITION: Check for stalled playback by monitoring position changes
+        if (state.lastPlaybackTime === undefined) {
+            state.lastPlaybackTime = state.audioElement.currentTime;
+            state.lastPlaybackCheck = Date.now();
+        } else {
+            const now = Date.now();
+            // Only check every 5 seconds
+            if (now - state.lastPlaybackCheck > 5000) {
+                const currentTime = state.audioElement.currentTime;
+                const timeDiff = currentTime - state.lastPlaybackTime;
+                
+                // If playback hasn't advanced in 5 seconds, we might be stalled
+                if (timeDiff < 0.5) {
+                    log(`Playback may be stalled: advanced only ${timeDiff.toFixed(2)}s in 5 seconds`, 'AUDIO');
+                    
+                    // Check if we are near the end of track
+                    const nearEnd = state.trackDuration > 0 && 
+                                   currentTime > 0 && 
+                                   currentTime > state.trackDuration * 0.95;
+                    
+                    if (nearEnd) {
+                        log(`Near end of track (${currentTime.toFixed(1)}/${state.trackDuration}s), checking for track change`, 'TRACK');
+                        // Check if track has changed on server
+                        fetchNowPlaying().catch(() => {});
+                    } else {
+                        // Not near end, might be a connection issue
+                        state.consecutiveErrors++;
+                        
+                        if (state.consecutiveErrors >= 3) {
+                            log(`Playback stalled for too long, force refreshing NOW PLAYING info`, 'AUDIO');
+                            // Force fetch now playing which should trigger track change if needed
+                            fetchNowPlaying().then(trackInfo => {
+                                // Check if track has changed
+                                if (trackInfo && trackInfo.path && trackInfo.path !== state.currentTrackId) {
+                                    log(`Track changed on server, restarting stream`, 'TRACK');
+                                    // Track has changed - reloading is needed
+                                    setTimeout(restartDirectStreamWithImprovedBuffering, 500);
+                                } else {
+                                    // Same track, try seeking to current server position 
+                                    forceSeekToServerPosition();
+                                }
+                            }).catch(() => {});
+                            
+                            state.consecutiveErrors = 0;
+                        }
+                    }
+                } else {
+                    // Playback is advancing normally
+                    state.consecutiveErrors = 0;
+                }
+                
+                // Update for next check
+                state.lastPlaybackTime = currentTime;
+                state.lastPlaybackCheck = now;
+            }
         }
     }, passiveOpts);
 }
@@ -899,7 +872,63 @@ function updateProgressDisplay() {
     }, 250); // Update 4 times per second for smoother progress
 }
 
-// player-control.js - Part 5: Track Info Polling and "Now Playing" Updates
+// player-control.js - Part 5: Track Info Polling and Heartbeat
+
+// Start server heartbeat checks to detect issues
+function startHeartbeatChecks() {
+    // Clear any existing interval
+    if (state.heartbeatInterval) {
+        clearInterval(state.heartbeatInterval);
+        state.heartbeatInterval = null;
+    }
+    
+    // Initialize error tracking
+    if (state.serverErrorCount === undefined) {
+        state.serverErrorCount = 0;
+    }
+    
+    // Set up a regular heartbeat with the server
+    state.heartbeatInterval = setInterval(() => {
+        if (state.isPlaying) {
+            // Simple ping to the server to check health
+            fetch('/api/now-playing')
+                .then(response => {
+                    if (!response.ok) {
+                        log(`Server returned status ${response.status}`, 'HEARTBEAT');
+                        if (response.status >= 500) {
+                            // Server error, may need restart
+                            if (!state.serverErrorDetected) {
+                                state.serverErrorDetected = true;
+                                log(`Server error detected`, 'HEARTBEAT');
+                                
+                                // After multiple errors, try reconnecting
+                                if (state.serverErrorCount++ > 2) {
+                                    log(`Multiple server errors, attempting reconnection`, 'HEARTBEAT');
+                                    restartDirectStreamWithImprovedBuffering();
+                                    state.serverErrorCount = 0;
+                                }
+                            }
+                        }
+                    } else {
+                        // Server is responding normally
+                        state.serverErrorDetected = false;
+                        state.serverErrorCount = 0;
+                    }
+                })
+                .catch(error => {
+                    log(`Heartbeat error: ${error.message}`, 'HEARTBEAT');
+                    state.serverErrorCount++;
+                    
+                    // After multiple connection errors, try reconnecting
+                    if (state.serverErrorCount > 3) {
+                        log(`Multiple heartbeat failures, attempting reconnection`, 'HEARTBEAT');
+                        restartDirectStreamWithImprovedBuffering();
+                        state.serverErrorCount = 0;
+                    }
+                });
+        }
+    }, 30000); // Check every 30 seconds
+}
 
 // Improved now playing polling with better track change detection
 function startNowPlayingPolling() {
@@ -964,28 +993,44 @@ function startNowPlayingPolling() {
                 if (state.currentTrackId && newTrackId && state.currentTrackId !== newTrackId) {
                     log(`Track changed on server: ${data.title}`, 'TRACK');
                     
-                    // Handle track change based on playback position
-                    const position = state.audioElement ? state.audioElement.currentTime : 0;
-                    const duration = state.trackDuration || 0;
-                    const percentage = duration > 0 ? position / duration : 0;
+                    // IMPORTANT: Flag track change handling is in progress
+                    state.trackChangeInProgress = true;
                     
                     // Store the track change info for reference
                     state.currentTrackId = newTrackId;
                     state.lastTrackChange = Date.now();
                     
-                    // Only restart if already near the end of the previous track
-                    // OR if we've been playing for a long time and might be out of sync
-                    const playingFor = (Date.now() - state.streamStartTime) / 1000;
+                    // Immediately restart the stream to get the new track
+                    log(`Restarting stream for new track`, 'TRACK');
+                    setTimeout(() => {
+                        // Clear the flag when restarting
+                        state.trackChangeInProgress = false;
+                        restartDirectStreamWithImprovedBuffering();
+                    }, 300);
                     
-                    if (percentage > 0.85 || playingFor > 300) { // >85% through or over 5 minutes
-                        log(`Restarting stream for new track (position: ${percentage.toFixed(2)}, time played: ${playingFor.toFixed(0)}s)`, 'TRACK');
-                        setTimeout(restartDirectStreamWithImprovedBuffering, 500);
-                    } else {
-                        log(`Track changed on server but we're only at ${(percentage*100).toFixed(0)}%, continuing playback`, 'TRACK');
-                    }
+                    return; // Exit function to prevent further execution
                 } else if (!state.currentTrackId && newTrackId) {
                     // First update
                     state.currentTrackId = newTrackId;
+                }
+                
+                // Update server position tracking
+                if (data.playback_position !== undefined) {
+                    state.serverPosition = data.playback_position;
+                    state.serverPositionTime = Date.now();
+                    
+                    // Check if we're far behind server
+                    if (state.audioElement && !state.audioElement.paused && 
+                        Math.abs(state.audioElement.currentTime - data.playback_position) > 10) {
+                        log(`Client significantly behind server: ${state.audioElement.currentTime.toFixed(1)}s vs ${data.playback_position}s`, 'POSITION');
+                        
+                        // Only force sync if not near end of track
+                        if (state.trackDuration > 0 && 
+                            state.audioElement.currentTime < state.trackDuration * 0.9) {
+                            log(`Forcing sync with server position`, 'POSITION');
+                            forceSeekToServerPosition();
+                        }
+                    }
                 }
                 
                 // Update listener count
@@ -1054,7 +1099,7 @@ function setupUserInteractionHandlers() {
     }
 }
 
-// For backward compatibility (these functions are no longer used)
+// For backward compatibility (these functions are still used by other parts of the code)
 function updateProgressBar(position, duration) {
     // This is now handled by updateProgressDisplay
     if (progressBar && duration > 0) {
@@ -1066,371 +1111,294 @@ function updateProgressBar(position, duration) {
     }
 }
 
-// player-control.js - Part 6: Stream Restart and Recovery Functions
+// player-control.js - Part 6: Stream Restart and Recovery Functions (continued)
 
-// Restart stream with improved buffering
-function restartDirectStreamWithImprovedBuffering() {
-    log('Restarting stream with improved buffering', 'CONTROL');
+startPosition = Math.max(0, clientPosition - 2); // Back up slightly
+log(`Resuming from client position: ${startPosition.toFixed(1)}s (server: ${serverPosition}s)`, 'POSITION');
+} else if (clientPosition < serverPosition) {
+// Our position is behind, use it to avoid skipping forward
+startPosition = Math.max(0, clientPosition - 1);
+log(`Resuming from client position: ${startPosition.toFixed(1)}s (behind server: ${serverPosition}s)`, 'POSITION');
+} else {
+// Too far ahead, use server position
+startPosition = serverPosition;
+log(`Client too far ahead (${clientPosition}s > ${serverPosition}s + ${maxAhead}s), using server position`, 'POSITION');
+}
+} else {
+// Track changed, start from server position
+log(`Track changed from ${state.currentTrackId} to ${trackId}, using server position: ${serverPosition}s`, 'POSITION');
+startPosition = serverPosition;
+}
+}
+
+// IMPORTANT: Start a bit before our target position to ensure smooth playback
+const safePosition = Math.max(0, startPosition - 2);
+log(`Restarting stream at position: ${safePosition.toFixed(1)}s (calculated from ${startPosition.toFixed(1)}s)`, 'CONTROL');
+
+// Set loading state and update status
+state.isLoading = true;
+showStatus('Reconnecting...', false, false);
+
+// Create URL with position
+const timestamp = Date.now();
+
+// Request larger buffer for reconnection attempts
+const bufferSize = Math.min(90 + (state.reconnectAttempts * 15), 180); // Scale up buffer with reconnect attempts
+
+const streamUrl = `/direct-stream?t=${timestamp}&position=${Math.floor(safePosition)}&track=${encodeURIComponent(trackId)}&buffer=${bufferSize}`;
+
+// Set timeout for loading
+if (state.loadTimeout) {
+clearTimeout(state.loadTimeout);
+}
+
+state.loadTimeout = setTimeout(() => {
+if (state.isLoading) {
+log('Audio load timeout during restart - proceeding anyway', 'AUDIO', true);
+state.isLoading = false;
+proceedWithReconnection();
+}
+}, 6000);
+
+// Set source and prepare to play
+state.audioElement.src = streamUrl;
+
+// Listen for data loaded
+state.audioElement.addEventListener('loadeddata', function loadedHandler() {
+state.audioElement.removeEventListener('loadeddata', loadedHandler);
+log('Audio data loaded during restart', 'AUDIO');
+state.isLoading = false;
+
+if (state.loadTimeout) {
+clearTimeout(state.loadTimeout);
+state.loadTimeout = null;
+}
+
+proceedWithReconnection();
+}, { once: true });
+
+// Listen for canplay as fallback
+state.audioElement.addEventListener('canplay', function canPlayHandler() {
+state.audioElement.removeEventListener('canplay', canPlayHandler);
+
+if (state.isLoading) {
+log('Audio can play during restart', 'AUDIO');
+state.isLoading = false;
+
+if (state.loadTimeout) {
+clearTimeout(state.loadTimeout);
+state.loadTimeout = null;
+}
+
+proceedWithReconnection();
+}
+}, { once: true });
+
+// Start loading
+try {
+state.audioElement.load();
+} catch (e) {
+log(`Error loading audio during restart: ${e.message}`, 'AUDIO', true);
+state.isLoading = false;
+proceedWithReconnection();
+}
+
+function proceedWithReconnection() {
+// Update stream start time and position for progress calculation
+state.streamStartTime = Date.now();
+state.startPosition = safePosition;
+
+// Clear any existing timers
+clearAllTimers();
+
+// Attempt to play with retries
+playWithRetry(3);
+
+function playWithRetry(retriesLeft) {
+log(`Playing audio, ${retriesLeft} retries left`, 'AUDIO');
+
+const playPromise = state.audioElement.play();
+
+if (playPromise !== undefined) {
+playPromise.then(() => {
+    log('Stream restarted successfully', 'AUDIO');
+    showStatus('Stream restarted');
     
-    if (!state.isPlaying) {
-        log('Not restarting - playback stopped', 'CONTROL');
-        return;
+    // Reset buffer underflows on successful restart
+    if (state.reconnectAttempts <= 5) {
+        state.bufferUnderflows = 0;
     }
     
-    // Increment reconnect attempts
-    state.reconnectAttempts++;
+    // Start monitoring and updating
+    updateProgressDisplay();
+    startEnhancedBufferMonitoring();
+    startNowPlayingPolling();
     
-    // Limit maximum restart attempts to prevent endless loops
-    if (state.reconnectAttempts > 10) {
-        const timeSinceStart = (Date.now() - (state.initialStartTime || 0)) / 1000;
+    // Set up heartbeat check
+    startHeartbeatChecks();
+    
+    // Force a seek to the correct position after a short delay
+    setTimeout(forceSeekToServerPosition, 2000);
+}).catch(e => {
+    log(`Error playing after restart: ${e.message}`, 'AUDIO', true);
+    
+    if (e.name === 'NotAllowedError') {
+        showStatus('Tap play button to start audio (browser requires user interaction)', true, false);
+        setupUserInteractionHandlers();
+    } else if (retriesLeft > 0) {
+        log(`Retrying playback, ${retriesLeft} attempts left`, 'AUDIO');
+        setTimeout(() => playWithRetry(retriesLeft - 1), 1000);
+    } else {
+        showStatus(`Playback error: ${e.message}`, true);
         
-        // If we've been trying for a long time (>5 minutes), allow more restarts
-        if (timeSinceStart < 300) {
-            log(`Too many restart attempts (${state.reconnectAttempts}), stopping reconnection loop`, 'CONTROL', true);
-            showStatus('Too many reconnection attempts. Please try again later.', true);
-            stopDirectStream();
-            return;
-        } else {
-            // Reset counter after 5 minutes to allow new attempts
-            log('Resetting reconnection counter after extended playback time', 'CONTROL');
-            state.reconnectAttempts = 1;
-        }
+        // Back off with increasing delays between retries
+        const backoffDelay = Math.min(2000 * Math.pow(1.5, state.reconnectAttempts), 15000);
+        
+        log(`Failed to restart after multiple attempts, will try again in ${(backoffDelay/1000).toFixed(1)}s`, 'CONTROL');
+        setTimeout(restartDirectStreamWithImprovedBuffering, backoffDelay);
     }
-    
-    // Properly clean up old audio element
-    if (state.audioElement) {
-        try {
-            // Keep volume setting
-            const volume = state.audioElement.volume;
-            const muted = state.audioElement.muted;
-            
-            // Clean up
-            state.audioElement.pause();
-            state.audioElement.src = '';
-            state.audioElement.load();
-            state.audioElement.remove();
-            
-            // Create new element with same settings
-            state.audioElement = new Audio();
-            state.audioElement.volume = volume;
-            state.audioElement.muted = muted;
-            state.audioElement.setAttribute('playsinline', '');
-            state.audioElement.setAttribute('webkit-playsinline', '');
-            state.audioElement.setAttribute('preload', 'auto');
-            
-            // Add to DOM
-            state.audioElement.style.display = 'none';
-            document.body.appendChild(state.audioElement);
-            
-            // Set up listeners
-            setupEnhancedAudioListeners();
-        } catch (e) {
-            log(`Error cleaning up audio element: ${e.message}`, 'AUDIO', true);
-            // Create a fresh audio element anyway
-            state.audioElement = new Audio();
-            state.audioElement.style.display = 'none';
-            document.body.appendChild(state.audioElement);
-            setupEnhancedAudioListeners();
-        }
-    }
-    
-    // Get current track info before restarting
-    fetchNowPlaying().then((trackInfo) => {
-        // Get server position
-        const serverPosition = trackInfo.playback_position || 0;
-        
-        // Track ID for continuity
-        const trackId = trackInfo.path || 'unknown';
-        
-        // Update track info
-        state.trackDuration = trackInfo.duration || 0;
-        state.currentTrackId = trackId;
-        
-        // Determine optimal start position
-        // For track changes or errors, start from current server position
-        // For buffer issues, try to resume close to where we left off
-        let startPosition = serverPosition;
-        
-        if (state.audioElement && state.audioElement.currentTime > 0) {
-            // If we were playing and this is a buffer/network recovery,
-            // try to resume close to where we were
-            if (trackId === state.currentTrackId) {
-                // Same track - use our position but ensure it's not too far ahead
-                // of server position to avoid getting out of sync
-                const clientPosition = state.audioElement.currentTime;
-                const maxAhead = 10; // Don't get more than 10 seconds ahead
-                
-                if (clientPosition > serverPosition && clientPosition - serverPosition < maxAhead) {
-                    // Our position is reasonable, use it
-                    startPosition = Math.max(0, clientPosition - 2); // Back up slightly
-                    log(`Resuming from client position: ${startPosition.toFixed(1)}s (server: ${serverPosition}s)`, 'POSITION');
-                } else if (clientPosition < serverPosition) {
-                    // Our position is behind, use it to avoid skipping forward
-                    startPosition = Math.max(0, clientPosition - 1);
-                    log(`Resuming from client position: ${startPosition.toFixed(1)}s (behind server: ${serverPosition}s)`, 'POSITION');
-                } else {
-                    // Too far ahead, use server position
-                    startPosition = serverPosition;
-                    log(`Client too far ahead (${clientPosition}s > ${serverPosition}s + ${maxAhead}s), using server position`, 'POSITION');
-                }
-            } else {
-                // Track changed, start from server position
-                log(`Track changed from ${state.currentTrackId} to ${trackId}, using server position: ${serverPosition}s`, 'POSITION');
-                startPosition = serverPosition;
-            }
-        }
-        
-        // IMPORTANT: Start a bit before our target position to ensure smooth playback
-        const safePosition = Math.max(0, startPosition - 2);
-        log(`Restarting stream at position: ${safePosition.toFixed(1)}s (calculated from ${startPosition.toFixed(1)}s)`, 'CONTROL');
-        
-        // Set loading state and update status
-        state.isLoading = true;
-        showStatus('Reconnecting...', false, false);
-        
-        // Create URL with position
-        const timestamp = Date.now();
-        
-        // Request larger buffer for reconnection attempts
-        const bufferSize = Math.min(90 + (state.reconnectAttempts * 15), 180); // Scale up buffer with reconnect attempts
-        
-        const streamUrl = `/direct-stream?t=${timestamp}&position=${Math.floor(safePosition)}&track=${encodeURIComponent(trackId)}&buffer=${bufferSize}`;
-        
-        // Set timeout for loading
-        if (state.loadTimeout) {
-            clearTimeout(state.loadTimeout);
-        }
-        
-        state.loadTimeout = setTimeout(() => {
-            if (state.isLoading) {
-                log('Audio load timeout during restart - proceeding anyway', 'AUDIO', true);
-                state.isLoading = false;
-                proceedWithReconnection();
-            }
-        }, 6000);
-        
-        // Set source and prepare to play
-        state.audioElement.src = streamUrl;
-        
-        // Listen for data loaded
-        state.audioElement.addEventListener('loadeddata', function loadedHandler() {
-            state.audioElement.removeEventListener('loadeddata', loadedHandler);
-            log('Audio data loaded during restart', 'AUDIO');
-            state.isLoading = false;
-            
-            if (state.loadTimeout) {
-                clearTimeout(state.loadTimeout);
-                state.loadTimeout = null;
-            }
-            
-            proceedWithReconnection();
-        }, { once: true });
-        
-        // Listen for canplay as fallback
-        state.audioElement.addEventListener('canplay', function canPlayHandler() {
-            state.audioElement.removeEventListener('canplay', canPlayHandler);
-            
-            if (state.isLoading) {
-                log('Audio can play during restart', 'AUDIO');
-                state.isLoading = false;
-                
-                if (state.loadTimeout) {
-                    clearTimeout(state.loadTimeout);
-                    state.loadTimeout = null;
-                }
-                
-                proceedWithReconnection();
-            }
-        }, { once: true });
-        
-        // Start loading
-        try {
-            state.audioElement.load();
-        } catch (e) {
-            log(`Error loading audio during restart: ${e.message}`, 'AUDIO', true);
-            state.isLoading = false;
-            proceedWithReconnection();
-        }
-        
-        function proceedWithReconnection() {
-            // Update stream start time and position for progress calculation
-            state.streamStartTime = Date.now();
-            state.startPosition = safePosition;
-            
-            // Clear any existing timers
-            clearAllTimers();
-            
-            // Attempt to play with retries
-            playWithRetry(3);
-            
-            function playWithRetry(retriesLeft) {
-                log(`Playing audio, ${retriesLeft} retries left`, 'AUDIO');
-                
-                const playPromise = state.audioElement.play();
-                
-                if (playPromise !== undefined) {
-                    playPromise.then(() => {
-                        log('Stream restarted successfully', 'AUDIO');
-                        showStatus('Stream restarted');
-                        
-                        // Reset buffer underflows on successful restart
-                        if (state.reconnectAttempts <= 5) {
-                            state.bufferUnderflows = 0;
-                        }
-                        
-                        // Start monitoring and updating
-                        updateProgressDisplay();
-                        startEnhancedBufferMonitoring();
-                        startNowPlayingPolling();
-                    }).catch(e => {
-                        log(`Error playing after restart: ${e.message}`, 'AUDIO', true);
-                        
-                        if (e.name === 'NotAllowedError') {
-                            showStatus('Tap play button to start audio (browser requires user interaction)', true, false);
-                            setupUserInteractionHandlers();
-                        } else if (retriesLeft > 0) {
-                            log(`Retrying playback, ${retriesLeft} attempts left`, 'AUDIO');
-                            setTimeout(() => playWithRetry(retriesLeft - 1), 1000);
-                        } else {
-                            showStatus(`Playback error: ${e.message}`, true);
-                            
-                            // Back off with increasing delays between retries
-                            const backoffDelay = Math.min(2000 * Math.pow(1.5, state.reconnectAttempts), 15000);
-                            
-                            log(`Failed to restart after multiple attempts, will try again in ${(backoffDelay/1000).toFixed(1)}s`, 'CONTROL');
-                            setTimeout(restartDirectStreamWithImprovedBuffering, backoffDelay);
-                        }
-                    });
-                } else {
-                    // For older browsers that don't return a promise
-                    log('Play method did not return a promise, assuming playback started', 'AUDIO');
-                    showStatus('Stream restarted');
-                    
-                    // Start monitoring and updating
-                    updateProgressDisplay();
-                    startEnhancedBufferMonitoring();
-                    setTimeout(startNowPlayingPolling, 1000);
-                }
-            }
-        }
-    }).catch(error => {
-        log(`Error fetching track info for restart: ${error.message}`, 'API', true);
-        
-        // Fallback restart without position info
-        const timestamp = Date.now();
-        const streamUrl = `/direct-stream?t=${timestamp}&buffer=120`; // Large buffer for fallback
-        
-        state.streamStartTime = Date.now();
-        state.startPosition = 0;
-        
-        if (state.audioElement) {
-            state.audioElement.src = streamUrl;
-            
-            // Try to play with retry
-            state.audioElement.load();
-            state.audioElement.play().catch(e => {
-                log(`Error restarting stream: ${e.message}`, 'AUDIO', true);
-                
-                if (e.name === 'NotAllowedError') {
-                    showStatus('Tap play button to start audio (browser requires user interaction)', true, false);
-                    setupUserInteractionHandlers();
-                } else {
-                    // Retry after delay
-                    setTimeout(() => {
-                        state.audioElement.play().catch(e2 => {
-                            log(`Second restart attempt failed: ${e2.message}`, 'AUDIO', true);
-                            stopDirectStream();
-                        });
-                    }, 2000);
-                }
-            });
-        }
-        
-        // Set up monitoring anyway
-        updateProgressDisplay();
-        startEnhancedBufferMonitoring();
-        startNowPlayingPolling();
+});
+} else {
+// For older browsers that don't return a promise
+log('Play method did not return a promise, assuming playback started', 'AUDIO');
+showStatus('Stream restarted');
+
+// Start monitoring and updating
+updateProgressDisplay();
+startEnhancedBufferMonitoring();
+setTimeout(startNowPlayingPolling, 1000);
+
+// Set up heartbeat check
+startHeartbeatChecks();
+
+// Force a seek to the correct position
+setTimeout(forceSeekToServerPosition, 2000);
+}
+}
+}
+}).catch(error => {
+log(`Error fetching track info for restart: ${error.message}`, 'API', true);
+
+// Fallback restart without position info
+const timestamp = Date.now();
+const streamUrl = `/direct-stream?t=${timestamp}&buffer=120`; // Large buffer for fallback
+
+state.streamStartTime = Date.now();
+state.startPosition = 0;
+
+if (state.audioElement) {
+state.audioElement.src = streamUrl;
+
+// Try to play with retry
+state.audioElement.load();
+state.audioElement.play().catch(e => {
+log(`Error restarting stream: ${e.message}`, 'AUDIO', true);
+
+if (e.name === 'NotAllowedError') {
+showStatus('Tap play button to start audio (browser requires user interaction)', true, false);
+setupUserInteractionHandlers();
+} else {
+// Retry after delay
+setTimeout(() => {
+    state.audioElement.play().catch(e2 => {
+        log(`Second restart attempt failed: ${e2.message}`, 'AUDIO', true);
+        stopDirectStream();
     });
+}, 2000);
+}
+});
+}
+
+// Set up monitoring anyway
+updateProgressDisplay();
+startEnhancedBufferMonitoring();
+startNowPlayingPolling();
+startHeartbeatChecks();
+});
 }
 
 // For slow networks, restart with smaller chunks
 function restartWithSlowerNetworkSettings() {
-    log('Restarting with settings optimized for slower network', 'CONTROL');
-    
-    if (!state.isPlaying) return;
-    
-    // Record that we've optimized for slow network
-    state.optimizedForSlowNetwork = true;
-    
-    // Restart with special flag for slower network
-    // Get current track position if possible
-    let currentPosition = 0;
-    if (state.audioElement && state.audioElement.currentTime > 0) {
-        currentPosition = Math.max(0, state.audioElement.currentTime - 2);
-    }
-    
-    // Stop current playback
-    if (state.audioElement) {
-        try {
-            state.audioElement.pause();
-            state.audioElement.src = '';
-            state.audioElement.load();
-        } catch (e) {
-            log(`Error stopping playback for slow network restart: ${e}`, 'AUDIO');
-        }
-    }
-    
-    // Fetch current track info
-    fetchNowPlaying().then(trackInfo => {
-        const trackId = trackInfo.path || 'unknown';
-        
-        // Create specialized URL for slow networks
-        const timestamp = Date.now();
-        // Request smaller chunks (flag for server) and larger buffer
-        const streamUrl = `/direct-stream?t=${timestamp}&position=${Math.floor(currentPosition)}&track=${encodeURIComponent(trackId)}&buffer=120&slow=true`;
-        
-        // Create new audio element
-        const newAudio = new Audio();
-        newAudio.volume = state.audioElement ? state.audioElement.volume : 0.7;
-        newAudio.muted = state.isMuted;
-        newAudio.setAttribute('playsinline', '');
-        newAudio.setAttribute('webkit-playsinline', '');
-        newAudio.setAttribute('preload', 'auto');
-        
-        // Set up listeners
-        setupEnhancedAudioListeners();
-        
-        // Set source
-        newAudio.src = streamUrl;
-        newAudio.load();
-        
-        // Replace audio element
-        if (state.audioElement) {
-            state.audioElement.remove();
-        }
-        state.audioElement = newAudio;
-        document.body.appendChild(state.audioElement);
-        
-        // Try to play
-        state.audioElement.play().catch(e => {
-            log(`Error starting playback for slow network: ${e.message}`, 'AUDIO', true);
-            // Fall back to normal restart
-            restartDirectStreamWithImprovedBuffering();
-        });
-        
-        // Update state
-        state.streamStartTime = Date.now();
-        state.startPosition = currentPosition;
-        
-        // Start monitoring
-        updateProgressDisplay();
-        startEnhancedBufferMonitoring();
-        startNowPlayingPolling();
-    }).catch(error => {
-        log(`Error fetching track info for slow network: ${error.message}`, 'API', true);
-        // Fall back to normal restart
-        restartDirectStreamWithImprovedBuffering();
-    });
+log('Restarting with settings optimized for slower network', 'CONTROL');
+
+if (!state.isPlaying) return;
+
+// Record that we've optimized for slow network
+state.optimizedForSlowNetwork = true;
+
+// Restart with special flag for slower network
+// Get current track position if possible
+let currentPosition = 0;
+if (state.audioElement && state.audioElement.currentTime > 0) {
+currentPosition = Math.max(0, state.audioElement.currentTime - 2);
+}
+
+// Stop current playback
+if (state.audioElement) {
+try {
+state.audioElement.pause();
+state.audioElement.src = '';
+state.audioElement.load();
+} catch (e) {
+log(`Error stopping playback for slow network restart: ${e}`, 'AUDIO');
+}
+}
+
+// Fetch current track info
+fetchNowPlaying().then(trackInfo => {
+const trackId = trackInfo.path || 'unknown';
+
+// Create specialized URL for slow networks
+const timestamp = Date.now();
+// Request smaller chunks (flag for server) and larger buffer
+const streamUrl = `/direct-stream?t=${timestamp}&position=${Math.floor(currentPosition)}&track=${encodeURIComponent(trackId)}&buffer=120&slow=true`;
+
+// Create new audio element
+const newAudio = new Audio();
+newAudio.volume = state.audioElement ? state.audioElement.volume : 0.7;
+newAudio.muted = state.isMuted;
+newAudio.setAttribute('playsinline', '');
+newAudio.setAttribute('webkit-playsinline', '');
+newAudio.setAttribute('preload', 'auto');
+
+// Set up listeners
+setupEnhancedAudioListeners();
+
+// Set source
+newAudio.src = streamUrl;
+newAudio.load();
+
+// Replace audio element
+if (state.audioElement) {
+state.audioElement.remove();
+}
+state.audioElement = newAudio;
+document.body.appendChild(state.audioElement);
+
+// Try to play
+state.audioElement.play().catch(e => {
+log(`Error starting playback for slow network: ${e.message}`, 'AUDIO', true);
+// Fall back to normal restart
+restartDirectStreamWithImprovedBuffering();
+});
+
+// Update state
+state.streamStartTime = Date.now();
+state.startPosition = currentPosition;
+
+// Start monitoring
+updateProgressDisplay();
+startEnhancedBufferMonitoring();
+startNowPlayingPolling();
+startHeartbeatChecks();
+
+// Force seek to correct position
+setTimeout(forceSeekToServerPosition, 2000);
+}).catch(error => {
+log(`Error fetching track info for slow network: ${error.message}`, 'API', true);
+// Fall back to normal restart
+restartDirectStreamWithImprovedBuffering();
+});
 }
 
 // Make functions available to other modules
@@ -1442,6 +1410,9 @@ window.setupEnhancedAudioListeners = setupEnhancedAudioListeners;
 window.restartDirectStreamWithImprovedBuffering = restartDirectStreamWithImprovedBuffering;
 window.startNowPlayingPolling = startNowPlayingPolling;
 window.updateProgressDisplay = updateProgressDisplay;
+window.updateProgressDisplayImmediate = updateProgressDisplayImmediate;
 window.startEnhancedBufferMonitoring = startEnhancedBufferMonitoring;
 window.getBufferInfo = getBufferInfo;
 window.reportBufferState = reportBufferState;
+window.forceSeekToServerPosition = forceSeekToServerPosition;
+window.startHeartbeatChecks = startHeartbeatChecks;

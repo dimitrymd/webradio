@@ -1,3 +1,103 @@
+// player-core.js - Enhanced platform detection with capabilities assessment
+
+// Global state object to track player state
+window.state = {
+    // Audio element
+    audioElement: null,
+    mediaSource: null,
+    sourceBuffer: null,
+    
+    // Connection state
+    isPlaying: false,
+    isLoading: false,
+    usingDirectStream: true, // Default to direct streaming for all platforms
+    
+    // Playback state
+    currentTrackId: null,
+    trackDuration: 0,
+    streamStartTime: 0,
+    startPosition: 0,
+    
+    // Buffer management
+    audioQueue: [],
+    bufferUnderflows: 0,
+    lastBufferEvent: 0,
+    lastErrorTime: 0,
+    bufferMetrics: [],
+    
+    // UI state
+    isMuted: false,
+    lastToggle: 0,
+    statusHideTimer: null,
+    debugMode: true, // Enable for development
+    
+    // Platform detection (will be populated during initialization)
+    isIOS: false,
+    isAndroid: false,
+    isMobile: false,
+    
+    // Track timing and monitoring
+    lastTrackInfoTime: 0,
+    lastAudioChunkTime: 0,
+    trackPlaybackDuration: 0,
+    
+    // Reconnection handling
+    reconnectAttempts: 0,
+    maxReconnectAttempts: 10,
+    
+    // Error tracking
+    errorHistory: [],
+    consecutiveErrors: 0,
+    lastErrorMessage: '',
+    
+    // Performance metrics
+    performanceMetrics: {
+        avgBufferSize: 0,
+        bufferSamples: 0,
+        lastBufferCheck: 0
+    }
+};
+
+// Global config object for player settings
+window.config = {
+    // Buffer size settings (in seconds)
+    MIN_BUFFER_SIZE: 2,        // Minimum buffer before playback starts
+    TARGET_BUFFER_SIZE: 10,    // Target buffer size to maintain
+    MAX_BUFFER_SIZE: 30,       // Maximum buffer size before trimming
+    
+    // Mobile-specific buffer multipliers
+    MOBILE_BUFFER_MULTIPLIER: 1.5,  // Mobile devices need more buffer
+    IOS_BUFFER_MULTIPLIER: 1.5,     // iOS needs even more buffer
+    
+    // Connection management
+    RECONNECT_DELAY_BASE: 1000,     // 1 second base delay
+    RECONNECT_BACKOFF_FACTOR: 1.5,  // Exponential backoff factor
+    NO_DATA_TIMEOUT: 15,            // Seconds without data before reconnecting
+    
+    // Track position synchronization
+    POSITION_SYNC_THRESHOLD: 5,     // Seconds difference between client/server before resyncing
+    MIN_TRACK_PLAYBACK_TIME: 10,    // Minimum seconds to play before considering track change
+    
+    // Timing and polling
+    NOW_PLAYING_INTERVAL: 10000,    // ms between polling for now playing info
+    
+    // Buffer management
+    AUDIO_STARVATION_THRESHOLD: 0.5 // Seconds of buffer before considering "starved"
+};
+
+// UI element references (will be populated during init)
+let startBtn = null;
+let muteBtn = null;
+let volumeControl = null;
+let progressBar = null;
+let currentPosition = null;
+let currentDuration = null;
+let currentTitle = null;
+let currentArtist = null;
+let currentAlbum = null;
+let listenerCount = null;
+let statusMessage = null;
+
 // Enhanced platform detection with capabilities assessment
 function detectPlatform() {
     const ua = window.navigator.userAgent;
@@ -187,6 +287,22 @@ function formatTime(seconds) {
     const secs = totalSeconds % 60;
     return `${minutes}:${secs.toString().padStart(2, '0')}`;
 }
+
+// Initialize UI elements when document is ready
+document.addEventListener('DOMContentLoaded', function() {
+    // Find all UI elements
+    startBtn = document.getElementById('start-btn');
+    muteBtn = document.getElementById('mute-btn');
+    volumeControl = document.getElementById('volume');
+    progressBar = document.getElementById('progress-bar');
+    currentPosition = document.getElementById('current-position');
+    currentDuration = document.getElementById('current-duration');
+    currentTitle = document.getElementById('current-title');
+    currentArtist = document.getElementById('current-artist');
+    currentAlbum = document.getElementById('current-album');
+    listenerCount = document.getElementById('listener-count');
+    statusMessage = document.getElementById('status-message');
+});
 
 // Main initialization with improved error handling
 function initPlayer() {

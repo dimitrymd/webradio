@@ -1,4 +1,4 @@
-// Updated handlers.rs with direct streaming for all platforms
+// src/handlers.rs - Updated with better position handling and track id tracking
 
 use rocket::http::{ContentType, Status};
 use rocket::State;
@@ -9,7 +9,6 @@ use rocket_dyn_templates::{Template, context};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::models::playlist::Track;
 use crate::services::playlist;
 use crate::services::streamer::StreamManager;
 use crate::services::websocket_bus::WebSocketBus;
@@ -116,104 +115,157 @@ pub async fn get_stats(
     }))
 }
 
-// Direct streaming for all platforms
-// Updated direct_stream handler with seeking support
-#[get("/direct-stream?<t>&<position>&<track>&<buffer>")]
+#[get("/direct-stream?<t>&<position>&<track>&<buffer>&<slow>")]
 pub async fn direct_stream(
     stream_manager: &State<Arc<StreamManager>>,
     t: Option<u64>,
     position: Option<u64>,
     track: Option<String>,
-    buffer: Option<u64>
+    buffer: Option<u64>,
+    slow: Option<bool>
 ) -> Result<(ContentType, Vec<u8>), Status> {
-    use rocket::http::{ContentType, Status};
-    
     // Check if streaming is active
     if !stream_manager.is_streaming() {
         return Err(Status::ServiceUnavailable);
     }
     
-    // For all platforms, we need to send the complete current track
+    // Get the current server position and track
+    let server_position = stream_manager.get_playback_position();
+    let current_track_id = stream_manager.get_current_track_id();
+    
+    // Log request details
+    println!("Stream request: position={:?}, track={:?}, buffer={:?}, slow={:?} (server at {}s)", 
+             position, track, buffer, slow, server_position);
+    
+    // Check if requested track matches current track
+    let track_match = if let Some(ref req_track) = track {
+        if let Some(ref cur_track) = current_track_id {
+            req_track == cur_track
+        } else {
+            true // No current track ID available, assume match
+        }
+    } else {
+        true // No track specified, assume match
+    };
+    
+    // Handle track mismatch - client might be requesting an old track
+    if !track_match {
+        println!("Track mismatch - client requested {:?} but server is playing {:?}", 
+                 track, current_track_id);
+    }
+    
+    // For all platforms, we need to send the current track chunks
     let (header, all_chunks) = stream_manager.get_chunks_from_current_position();
     
     // Always use all chunks - direct streaming needs the complete file
     let chunks_to_use = &all_chunks;
     
     // Determine how much data to include based on buffer parameter
-    // Default to 30 seconds of buffer (increased from 5)
-    let buffer_seconds = buffer.unwrap_or(30);
+    // Default to 60 seconds of buffer - increased for better stability
+    let buffer_seconds = buffer.unwrap_or(60);
     
-    // Log the buffer size for debugging
-    println!("Stream request with buffer size: {}s", buffer_seconds);
+    // Use the requested position or server position
+    // If there's a track mismatch, always use server position
+    let effective_position = if track_match {
+        position.unwrap_or(server_position)
+    } else {
+        // Track mismatch - use server position
+        println!("Using server position due to track mismatch");
+        server_position
+    };
     
-    // If a position was specified and it's greater than 0, try to skip some chunks
-    let chunks_to_return = if let Some(pos) = position {
-        if pos > 0 {
-            // Log the position request
-            println!("Position request: {}s for track: {:?}, buffer: {}s", pos, track, buffer_seconds);
+    // Handle slow network flag
+    let chunk_size_modifier = if slow.unwrap_or(false) {
+        println!("Using smaller chunk sizes for slow network");
+        0.5 // Use half-size chunks
+    } else {
+        1.0 // Normal size
+    };
+    
+    println!("Effective position: {}s (server at {}s)", effective_position, server_position);
+    
+    // If position specified and > 0, try to skip some chunks
+    let chunks_to_return = if effective_position > 0 {
+        // Get current bitrate for better accuracy
+        let bitrate = stream_manager.get_current_bitrate();
+        let bytes_per_second = (bitrate / 8) as usize;
+        
+        // Check if we have enough chunks
+        if chunks_to_use.len() < 10 {
+            println!("Not enough chunks available ({}), sending all", chunks_to_use.len());
+            return Ok((ContentType::new("audio", "mpeg"), 
+                     combine_chunks(header.as_ref(), chunks_to_use)));
+        }
+        
+        // Calculate bytes to skip based on position
+        let bytes_to_skip: usize = effective_position as usize * bytes_per_second;
+        let mut total_bytes: usize = 0;
+        let mut skip_chunks: usize = 0;
+        
+        // Count chunks to skip
+        for chunk in chunks_to_use {
+            total_bytes += chunk.len();
+            skip_chunks += 1;
             
-            // We'd need to know the bitrate to accurately skip, but we can estimate
-            // Let's assume 128kbps = 16KB per second of audio
-            // Skip approximately the right number of chunks to reach position
-            let bytes_per_second: usize = 16000; // 16KB per second at 128kbps
-            let bytes_to_skip: usize = (pos as usize) * bytes_per_second;
-            let mut total_bytes: usize = 0;
-            let mut skip_chunks: usize = 0;
-            
-            for chunk in chunks_to_use {
-                total_bytes += chunk.len();
-                skip_chunks += 1;
-                
-                if total_bytes >= bytes_to_skip {
-                    break;
-                }
+            if total_bytes >= bytes_to_skip {
+                break;
             }
-            
-            // Only skip if we have enough chunks and won't skip everything
-            if skip_chunks > 0 && skip_chunks < chunks_to_use.len() - 1 {
-                println!("Skipping {} chunks (approx. {} bytes) to reach position {}s", 
-                         skip_chunks, total_bytes, pos);
-                         
-                // Return the chunks after the skip point
-                &chunks_to_use[skip_chunks..]
-            } else {
-                // Not enough chunks to skip or would skip everything, return all
-                chunks_to_use
-            }
+        }
+        
+        // Safety check - ensure we don't skip too many chunks
+        let max_skip = chunks_to_use.len().saturating_sub(10);
+        if skip_chunks > max_skip {
+            skip_chunks = max_skip;
+            println!("Limiting skip to {} chunks to ensure enough data", skip_chunks);
+        }
+        
+        if skip_chunks > 0 && skip_chunks < chunks_to_use.len() {
+            println!("Skipping {} chunks to reach position {}s", 
+                    skip_chunks, effective_position);
+                    
+            // Return the chunks after the skip point
+            &chunks_to_use[skip_chunks..]
         } else {
+            println!("Skip calculation resulted in skip_chunks={}, using all chunks", 
+                    skip_chunks);
             chunks_to_use
         }
     } else {
+        // No position or position=0, use all chunks
         chunks_to_use
     };
     
-    // IMPORTANT: Calculate approximate file size for headers
-    let total_file_size: usize = chunks_to_return.iter().map(|c| c.len()).sum();
-    let bitrate: usize = 128000; // Assume 128kbps for simplicity
-    let bytes_per_second: usize = bitrate / 8;
-    let approximate_duration: u64 = (total_file_size / bytes_per_second) as u64;
+    // Return combined chunks with the appropriate Content-Type
+    Ok((ContentType::new("audio", "mpeg"), 
+       combine_chunks(header.as_ref(), chunks_to_return)))
+}
+
+// Helper function to combine header and chunks
+fn combine_chunks(header: Option<&Vec<u8>>, chunks: &[Vec<u8>]) -> Vec<u8> {
+    // Calculate total size
+    let header_size = header.map_or(0, |h| h.len());
+    let chunks_size: usize = chunks.iter().map(|c| c.len()).sum();
+    let total_size = header_size + chunks_size;
     
-    // Combine the chunks into the response
-    let mut response_data = Vec::new();
+    // Allocate with capacity
+    let mut response_data = Vec::with_capacity(total_size);
     
     // Add header if available
     if let Some(h) = header {
-        response_data.extend_from_slice(&h);
+        response_data.extend_from_slice(h);
     }
     
-    // Add selected chunks
-    for chunk in chunks_to_return {
+    // Add chunks
+    for chunk in chunks {
         response_data.extend_from_slice(chunk);
     }
     
-    // Return the response with the appropriate Content-Type
-    // We can't add custom headers with the (ContentType, Vec<u8>) return type
-    Ok((ContentType::new("audio", "mpeg"), response_data))
+    response_data
 }
 
-#[get("/diag")]
-pub async fn diagnostic_page() -> Option<NamedFile> {
-    NamedFile::open(Path::new("static/diag.html")).await.ok()
+#[get("/test")]
+pub async fn test_page() -> Option<NamedFile> {
+    NamedFile::open(Path::new("static/test.html")).await.ok()
 }
 
 // Helper function to serve static files

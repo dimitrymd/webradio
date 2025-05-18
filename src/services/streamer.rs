@@ -125,6 +125,25 @@ impl StreamManager {
             track_ended: Arc::new(AtomicBool::new(false)),
         }
     }
+
+    pub fn get_current_track_id(&self) -> Option<String> {
+        let inner = self.inner.lock();
+        
+        if let Some(track_path) = &inner.current_track_path {
+            Some(track_path.clone())
+        } else {
+            // If for some reason current_track_path isn't set, try to parse from track info
+            if let Some(track_info) = &inner.current_track_info {
+                // Try to parse track info as JSON and extract path
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(track_info) {
+                    if let Some(path) = value.get("path").and_then(|v| v.as_str()) {
+                        return Some(path.to_string());
+                    }
+                }
+            }
+            None
+        }
+    }
     
     pub fn start_broadcast_thread(&self) {
         let mut inner = self.inner.lock();
@@ -229,8 +248,11 @@ impl StreamManager {
                 
                 // Store next track path for potential pre-buffering
                 {
-                    let mut next_track_path_lock = inner.lock().next_track_path.lock();
+                    let inner_guard = inner.lock();
+                    let mut next_track_path_lock = inner_guard.next_track_path.lock();
                     *next_track_path_lock = Some(next_track_path.clone());
+                    drop(next_track_path_lock);
+                    drop(inner_guard);
                 }
             }
             
@@ -249,8 +271,11 @@ impl StreamManager {
                 // Log error and update error tracking
                 error!("Error broadcasting track: {}", e);
                 {
-                    let mut last_error = inner.lock().last_error.lock();
+                    let inner_guard = inner.lock();
+                    let mut last_error = inner_guard.last_error.lock();
                     *last_error = Some(format!("Error broadcasting track: {}", e));
+                    drop(last_error);
+                    drop(inner_guard);
                 }
                 
                 // Increment error count
@@ -459,7 +484,7 @@ impl StreamManager {
             // Send chunk if available
             if let Some(chunk) = chunk_buffer.pop_front() {
                 // Get lock for updating state
-                let inner_lock = inner.lock();
+                let mut inner_lock = inner.lock();
                 
                 // Update playback metrics
                 let elapsed = track_start.elapsed().as_secs();
@@ -553,8 +578,11 @@ impl StreamManager {
                         let id3_data = id3_buffer[..n].to_vec();
                         
                         // Store header for next track
-                        let mut next_header = inner.lock().next_track_header.lock();
+                        let inner_guard = inner.lock();
+                        let mut next_header = inner_guard.next_track_header.lock();
                         *next_header = Some(id3_data);
+                        drop(next_header);
+                        drop(inner_guard);
                         
                         // Reset file position
                         let _ = file.seek(SeekFrom::Start(0));
@@ -585,8 +613,11 @@ impl StreamManager {
                 info!("Pre-buffered {} chunks of next track", prebuffer.len());
                 
                 // Store in shared buffer
-                let mut next_buffer = inner.lock().next_track_buffer.lock();
+                let inner_guard = inner.lock();
+                let mut next_buffer = inner_guard.next_track_buffer.lock();
                 *next_buffer = prebuffer;
+                drop(next_buffer);
+                drop(inner_guard);
             },
             Err(e) => {
                 error!("Failed to open next track for pre-buffering: {}", e);

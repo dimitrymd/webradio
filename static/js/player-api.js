@@ -1,3 +1,5 @@
+// Updated player-api.js with track change detection improvements
+
 // player-api.js - Improved track info handling and error recovery
 
 // Fetch now playing info via API with improved error handling and retries
@@ -82,9 +84,14 @@ function handleTrackInfoUpdate(info) {
         const newTrackId = info.path;
         const isNewTrack = state.currentTrackId !== newTrackId;
         
-        if (isNewTrack) {
-            log(`Track changed to: "${info.title}" by "${info.artist}"`, 'TRACK');
-            state.currentTrackId = newTrackId;
+        if (isNewTrack && state.currentTrackId && newTrackId) {
+            log(`Track changed from ${state.currentTrackId} to ${newTrackId}`, 'TRACK');
+            
+            // If the track has changed and we're playing, we need to restart the stream
+            if (state.isPlaying && typeof restartDirectStreamWithImprovedBuffering === 'function') {
+                log('Track changed while stream is playing, restarting stream', 'TRACK');
+                setTimeout(restartDirectStreamWithImprovedBuffering, 300);
+            }
             
             // Store track changed time for end-of-track detection
             state.lastTrackChange = Date.now();
@@ -94,22 +101,11 @@ function handleTrackInfoUpdate(info) {
             
             // Always update UI for track change
             uiNeedsUpdate = true;
-            
-            // Track transitions need special handling
-            if (state.isPlaying && state.audioElement && !state.audioElement.paused) {
-                // Only handle track change automatically if we've been playing for a while
-                // to avoid restart loops
-                const playbackTime = (Date.now() - state.streamStartTime) / 1000;
-                
-                if (playbackTime > config.MIN_TRACK_PLAYBACK_TIME) {
-                    if (typeof window.restartDirectStreamWithImprovedBuffering === 'function') {
-                        log('Track changed while playing, scheduling restart to get new track', 'TRACK');
-                        setTimeout(restartDirectStreamWithImprovedBuffering, 1000);
-                    }
-                } else {
-                    log(`Track changed but we've only been playing for ${playbackTime.toFixed(1)}s, continuing playback`, 'TRACK');
-                }
-            }
+        }
+        
+        // Always update currentTrackId if we have a valid one
+        if (newTrackId) {
+            state.currentTrackId = newTrackId;
         }
         
         // Check if any track metadata has changed
@@ -140,43 +136,48 @@ function handleTrackInfoUpdate(info) {
             uiNeedsUpdate = true;
         }
         
-        // Check if we need to update progress bar
-        let clientPosition = 0;
-        
+        // Update progress bar based on server position if needed
         if (state.audioElement && !state.audioElement.paused) {
-            // We're playing audio, get client position
-            clientPosition = state.audioElement.currentTime;
-            
-            // Check if server position is significantly different from client
+            // We're playing audio, check if the server position is significantly different
+            const clientPosition = state.audioElement.currentTime;
             const positionDifference = Math.abs(clientPosition - position);
             
-            if (positionDifference > config.POSITION_SYNC_THRESHOLD) {
+            if (positionDifference > 10) {  // more than 10 seconds difference
                 log(`Position significantly different: client=${clientPosition.toFixed(1)}s, server=${position}s (diff: ${positionDifference.toFixed(1)}s)`, 'POSITION');
                 
-                // Update our tracking metrics but don't disturb playback
-                state.serverPlayheadDifference = positionDifference;
-                
-                // Calculate server playhead rate (how many seconds per second)
-                if (state.serverPosition !== undefined && state.serverPositionTime) {
-                    const timeDelta = (Date.now() - state.serverPositionTime) / 1000;
-                    if (timeDelta > 0) {
-                        const positionDelta = position - state.serverPosition;
-                        state.serverPlayheadRate = positionDelta / timeDelta;
-                        
-                        // Log if rate is unexpected
-                        if (Math.abs(state.serverPlayheadRate - 1.0) > 0.1) {
-                            log(`Server playhead rate: ${state.serverPlayheadRate.toFixed(2)}x`, 'POSITION');
+                // If difference is large and not near end of track, force a seek
+                if (clientPosition < duration * 0.9) {
+                    log('Client significantly behind server, forcing seek', 'POSITION');
+                    
+                    if (typeof forceSeekToServerPosition === 'function') {
+                        setTimeout(forceSeekToServerPosition, 500);
+                    } else {
+                        try {
+                            state.audioElement.currentTime = position;
+                        } catch (e) {
+                            log(`Error seeking: ${e.message}`, 'POSITION', true);
                         }
                     }
                 }
             }
+            
+            // Calculate server playhead rate (how many seconds per second)
+            if (state.serverPosition !== undefined && state.serverPositionTime) {
+                const timeDelta = (Date.now() - state.serverPositionTime) / 1000;
+                if (timeDelta > 0) {
+                    const positionDelta = position - state.serverPosition;
+                    state.serverPlayheadRate = positionDelta / timeDelta;
+                    
+                    // Log if rate is unexpected
+                    if (Math.abs(state.serverPlayheadRate - 1.0) > 0.1) {
+                        log(`Server playhead rate: ${state.serverPlayheadRate.toFixed(2)}x`, 'POSITION');
+                    }
+                }
+            }
         } else {
-            // We're not playing, use server position
-            clientPosition = position;
+            // We're not playing or just starting, use server position directly
+            updateProgressBar(position, duration);
         }
-        
-        // Always update progress bar for smooth UX
-        updateProgressBar(clientPosition, state.trackDuration);
         
         // Update listener count if changed
         if (info.active_listeners !== undefined && listenerCount) {

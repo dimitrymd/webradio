@@ -9,6 +9,46 @@ document.addEventListener('DOMContentLoaded', function() {
     const PLAYER_VERSION = '1.2.0';
     const BUILD_DATE = '2025-05-18';
     
+    // Make sure state and config objects exist
+    if (typeof window.state === 'undefined') {
+        console.error('[ERROR] State object not initialized. Ensure player-core.js is loaded first.');
+        
+        // Create minimal state object to prevent further errors
+        window.state = {
+            debugMode: true,
+            errorHistory: [],
+            isPlaying: false,
+            performanceMetrics: { bufferSamples: 0, avgBufferSize: 0, lastBufferCheck: 0 }
+        };
+    }
+    
+    if (typeof window.config === 'undefined') {
+        console.error('[ERROR] Config object not initialized. Ensure player-core.js is loaded first.');
+        
+        // Create minimal config object to prevent further errors
+        window.config = {
+            MIN_BUFFER_SIZE: 2,
+            TARGET_BUFFER_SIZE: 10,
+            MAX_BUFFER_SIZE: 30,
+            AUDIO_STARVATION_THRESHOLD: 0.5
+        };
+    }
+    
+    // Initialize UI elements if not already done
+    if (!startBtn) {
+        startBtn = document.getElementById('start-btn');
+        muteBtn = document.getElementById('mute-btn');
+        volumeControl = document.getElementById('volume');
+        progressBar = document.getElementById('progress-bar');
+        currentPosition = document.getElementById('current-position');
+        currentDuration = document.getElementById('current-duration');
+        currentTitle = document.getElementById('current-title');
+        currentArtist = document.getElementById('current-artist');
+        currentAlbum = document.getElementById('current-album');
+        listenerCount = document.getElementById('listener-count');
+        statusMessage = document.getElementById('status-message');
+    }
+    
     // Verify all modules are loaded
     const requiredFunctions = [
         'formatTime',

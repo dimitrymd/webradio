@@ -1,4 +1,4 @@
-// src/main.rs - Updated with improved initialization and error handling
+// Modified main.rs to ensure routes are correctly declared
 
 extern crate rocket;
 
@@ -100,7 +100,7 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     
     println!("Server initialization complete, starting web server...");
     
-    // Build and launch the Rocket instance
+    // Build and launch the Rocket instance with updated routes
     rocket::build()
         .manage(stream_manager.clone())
         .manage(websocket_bus.clone())
@@ -108,10 +108,9 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
             handlers::index,
             handlers::now_playing,
             handlers::get_stats,
-            handlers::direct_stream,   // Direct streaming for all platforms
+            handlers::direct_stream,
             handlers::static_files,
-            handlers::diagnostic_page,
-            handlers::test_page,      // Added test page route
+            handlers::test_page,
         ])
         .register("/", catchers![
             handlers::not_found,
