@@ -1,112 +1,58 @@
-// static/js/player-connection.js - Updated with better buffering and error handling
+// player-connection.js - WebSocket connection and track info handling
 
-// Improved WebSocket connection with better error handling
-function connectWebSocket() {
-    // Skip for direct streaming mode
-    if (state.usingDirectStream) return;
-    
-    // Clean up any existing connection
-    if (state.ws) {
-        try {
-            state.ws.close();
-        } catch (e) {
-            // Ignore close errors
-        }
-        state.ws = null;
-    }
-    
+// Process track info from WebSocket or API
+function updateTrackInfo(info) {
     try {
-        // Determine WebSocket URL based on platform
-        const wsUrl = getWebSocketURL();
-        log(`Connecting to WebSocket: ${wsUrl}`, 'STREAM');
+        // Check for error message
+        if (info.error) {
+            showStatus(`Server error: ${info.error}`, true);
+            return;
+        }
         
-        // Create connection
-        state.ws = new WebSocket(wsUrl);
-        
-        // Set up event handlers
-        state.ws.onopen = () => {
-            log('WebSocket connection established', 'STREAM');
-            showStatus('Connected to stream');
-            startBtn.textContent = 'Disconnect';
-            startBtn.disabled = false;
-            startBtn.dataset.connected = 'true';
-            state.isPlaying = true;
+        // Store track ID for change detection
+        const newTrackId = info.path;
+        if (state.currentTrackId !== newTrackId) {
+            log(`Track changed to: ${info.title}`, 'TRACK');
+            state.currentTrackId = newTrackId;
             
-            // Reset reconnect attempts on successful connection
-            state.reconnectAttempts = 0;
-            
-            // Request initial track info
-            try {
-                state.ws.send(JSON.stringify({ type: 'now_playing_request' }));
-                log('Requested initial track info', 'TRACK');
-            } catch (e) {
-                log(`Error requesting track info: ${e.message}`, 'TRACK', true);
-                // Fallback to API
-                fetchNowPlaying();
-            }
-            
-            // Start audio playback with boost for initial buffering
-            if (state.audioElement.paused) {
-                // First wait to build up some buffer
-                setTimeout(() => {
-                    const playPromise = state.audioElement.play();
-                    playPromise.catch(e => {
-                        log(`Play error: ${e.message}`, 'AUDIO', true);
-                        if (e.name === 'NotAllowedError') {
-                            showStatus('Click play to start audio (browser requires user interaction)', true, false);
-                        }
-                    });
-                    
-                    // After playback starts, boost buffer
-                    playPromise.then(() => {
-                        boostInitialBuffer();
-                    });
-                }, 100);
-            }
-        };
+            // Reset position tracking
+            state.lastKnownPosition = 0;
+        }
         
-        state.ws.onclose = (event) => {
-            log(`WebSocket closed: Code ${event.code}`, 'STREAM');
-            
-            // Only attempt reconnect if we're still supposed to be playing
-            if (state.isPlaying) {
-                // Use a brief delay to avoid hammering the server
-                setTimeout(() => {
-                    if (state.isPlaying) {
-                        showStatus('Connection closed. Reconnecting...', true, false);
-                        attemptReconnection();
-                    }
-                }, 500); // Reduced from 1000ms to 500ms
-            }
-        };
+        // Update UI
+        currentTitle.textContent = info.title || 'Unknown Title';
+        currentArtist.textContent = info.artist || 'Unknown Artist';
+        currentAlbum.textContent = info.album || 'Unknown Album';
         
-        state.ws.onerror = (error) => {
-            log('WebSocket error', 'STREAM', true);
-            
-            // Don't immediately try to reconnect - wait for the close event
-            showStatus('Connection error', true, false);
-        };
+        // Update progress
+        if (info.duration) {
+            currentDuration.textContent = formatTime(info.duration);
+        }
         
-        state.ws.onmessage = handleWebSocketMessage;
+        if (info.playback_position !== undefined) {
+            state.lastKnownPosition = info.playback_position;
+            updateProgressBar(info.playback_position, info.duration);
+        }
         
-        // Set connection timeout (increased for slower connections)
-        const timeoutDuration = 20000;
-        state.connectionTimeout = setTimeout(() => {
-            if (state.ws && state.audioQueue.length === 0) {
-                log('Connection timeout - no data received', 'STREAM', true);
-                showStatus('Connection timeout. Reconnecting...', true, false);
-                attemptReconnection();
-            }
-        }, timeoutDuration);
+        // Update listener count
+        if (info.active_listeners !== undefined) {
+            listenerCount.textContent = `Listeners: ${info.active_listeners}`;
+        }
         
+        // Store track ID in DOM for future comparison
+        currentTitle.dataset.trackId = info.path;
+        
+        // Update page title
+        document.title = `${info.title} - ${info.artist} | ChillOut Radio`;
+        
+        // Update last track info time
+        state.lastTrackInfoTime = Date.now();
     } catch (e) {
-        log(`WebSocket setup error: ${e.message}`, 'STREAM', true);
-        showStatus(`Connection error: ${e.message}`, true);
-        attemptReconnection();
+        log(`Error processing track info: ${e.message}`, 'TRACK', true);
     }
 }
 
-// Handle WebSocket messages with improved buffering
+// Handle WebSocket messages
 function handleWebSocketMessage(event) {
     // Clear connection timeout if set
     if (state.connectionTimeout) {
@@ -118,11 +64,6 @@ function handleWebSocketMessage(event) {
     if (event.data instanceof Blob) {
         // Handle non-text data (audio)
         event.data.arrayBuffer().then(buffer => {
-            // Skip empty buffers
-            if (buffer.byteLength === 0) {
-                return;
-            }
-            
             // Check for special markers (2-byte control messages)
             if (buffer.byteLength === 2) {
                 const view = new Uint8Array(buffer);
@@ -135,6 +76,11 @@ function handleWebSocketMessage(event) {
                     log('Track end marker received', 'STREAM');
                     return;
                 }
+            }
+            
+            // Skip empty buffers
+            if (buffer.byteLength === 0) {
+                return;
             }
             
             // Add data to queue
@@ -151,86 +97,22 @@ function handleWebSocketMessage(event) {
         // Process text data (track info or other commands)
         try {
             const data = JSON.parse(event.data);
-            handleTrackInfoUpdate(data);
+            
+            // Check message type
+            if (data.type === 'now_playing') {
+                updateTrackInfo(data.track);
+            } else {
+                // Default treatment as track info
+                updateTrackInfo(data);
+            }
         } catch (e) {
             log(`Non-JSON message: ${event.data}`, 'STREAM');
         }
     }
 }
 
-// Enhanced track info handling for mid-stream joins and position info
-function handleTrackInfoUpdate(info) {
-    try {
-        // Check for error message
-        if (info.error) {
-            showStatus(`Server error: ${info.error}`, true);
-            return;
-        }
-        
-        // Check if this is a mid-stream join
-        const midStreamJoin = info.mid_stream_join === true;
-        const position = info.playback_position || 0;
-        const percentage = info.percentage || 0;
-        
-        // Store track ID for change detection
-        const newTrackId = info.path;
-        if (state.currentTrackId !== newTrackId) {
-            log(`Track changed to: ${info.title}`, 'TRACK');
-            state.currentTrackId = newTrackId;
-            
-            // Reset position tracking
-            state.lastKnownPosition = 0;
-        }
-        
-        // Update UI
-        if (currentTitle) currentTitle.textContent = info.title || 'Unknown Title';
-        if (currentArtist) currentArtist.textContent = info.artist || 'Unknown Artist';
-        if (currentAlbum) currentAlbum.textContent = info.album || 'Unknown Album';
-        
-        // Update progress
-        if (info.duration) {
-            if (currentDuration) currentDuration.textContent = formatTime(info.duration);
-            
-            // When joining mid-stream, immediately set the progress bar
-            if (midStreamJoin && percentage > 0) {
-                // Update progress bar to current position
-                updateProgressBar(position, info.duration);
-                
-                // Store last known position
-                state.lastKnownPosition = position;
-                
-                log(`Joined stream at position ${position}s (${percentage}%)`, 'TRACK');
-            }
-        }
-        
-        if (info.playback_position !== undefined) {
-            state.lastKnownPosition = info.playback_position;
-            updateProgressBar(info.playback_position, info.duration);
-        }
-        
-        // Update listener count
-        if (info.active_listeners !== undefined && listenerCount) {
-            listenerCount.textContent = `Listeners: ${info.active_listeners}`;
-        }
-        
-        // Store track ID in DOM for future comparison
-        if (currentTitle) currentTitle.dataset.trackId = info.path;
-        
-        // Update page title
-        document.title = `${info.title} - ${info.artist} | ChillOut Radio`;
-        
-        // Update last track info time
-        state.lastTrackInfoTime = Date.now();
-    } catch (e) {
-        log(`Error processing track info: ${e.message}`, 'TRACK', true);
-    }
-}
-
 // Improved connection health monitoring
 function checkConnectionHealth() {
-    // Skip for direct streaming mode
-    if (state.usingDirectStream) return;
-    
     if (!state.isPlaying) return;
     
     const now = Date.now();
@@ -261,6 +143,13 @@ function checkConnectionHealth() {
                 }
             }
         }
+    } else {
+        // Log buffer state for monitoring
+        if (bufferHealth.ahead < config.AUDIO_STARVATION_THRESHOLD) {
+            log(`WARNING: Low buffer - ${bufferHealth.ahead.toFixed(1)}s ahead, ${state.audioQueue.length} chunks queued`, 'HEALTH');
+        } else if (state.debugMode) {
+            log(`Buffer health: ${bufferHealth.ahead.toFixed(1)}s ahead, ${state.audioQueue.length} chunks queued`, 'HEALTH');
+        }
     }
     
     // Check if we need to request now playing info
@@ -280,12 +169,6 @@ function checkConnectionHealth() {
             fetchNowPlaying();
         }
     }
-    
-    // Check buffer health periodically
-    if (now - state.performanceMetrics.lastBufferCheck > 10000) { // Every 10 seconds
-        log(`Buffer health check: ${bufferHealth.ahead.toFixed(1)}s ahead, ${state.audioQueue.length} chunks queued, ${state.bufferUnderflows} underflows`, 'HEALTH');
-        state.performanceMetrics.lastBufferCheck = now;
-    }
 }
 
 // Fetch now playing info via API (fallback method)
@@ -298,17 +181,109 @@ async function fetchNowPlaying() {
         }
         
         const data = await response.json();
-        handleTrackInfoUpdate(data);
+        updateTrackInfo(data);
     } catch (error) {
         log(`Error fetching now playing: ${error.message}`, 'API', true);
     }
 }
 
-// Improved reconnection with reduced backoff for faster recovery
-function attemptReconnection() {
-    // Skip for direct streaming mode
-    if (state.usingDirectStream) return;
+// Improved WebSocket connection with better error handling
+function connectWebSocket() {
+    // Clean up any existing connection
+    if (state.ws) {
+        try {
+            state.ws.close();
+        } catch (e) {
+            // Ignore close errors
+        }
+        state.ws = null;
+    }
     
+    try {
+        // Determine WebSocket URL
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/stream`;
+        log(`Connecting to WebSocket: ${wsUrl}`, 'STREAM');
+        
+        // Create connection
+        state.ws = new WebSocket(wsUrl);
+        
+        // Set up event handlers
+        state.ws.onopen = () => {
+            log('WebSocket connection established', 'STREAM');
+            showStatus('Connected to stream');
+            startBtn.textContent = 'Disconnect';
+            startBtn.disabled = false;
+            startBtn.dataset.connected = 'true';
+            state.isPlaying = true;
+            
+            // Reset reconnect attempts on successful connection
+            state.reconnectAttempts = 0;
+            
+            // Request initial track info
+            try {
+                state.ws.send(JSON.stringify({ type: 'now_playing_request' }));
+                log('Requested initial track info', 'TRACK');
+            } catch (e) {
+                log(`Error requesting track info: ${e.message}`, 'TRACK', true);
+                // Fallback to API
+                fetchNowPlaying();
+            }
+            
+            // Start audio playback
+            if (state.audioElement.paused) {
+                const playPromise = state.audioElement.play();
+                playPromise.catch(e => {
+                    log(`Play error: ${e.message}`, 'AUDIO', true);
+                    if (e.name === 'NotAllowedError') {
+                        showStatus('Click play to start audio (browser requires user interaction)', true, false);
+                    }
+                });
+            }
+        };
+        
+        state.ws.onclose = (event) => {
+            log(`WebSocket closed: Code ${event.code}`, 'STREAM');
+            
+            // Only attempt reconnect if we're still supposed to be playing
+            if (state.isPlaying) {
+                // Use a brief delay to avoid hammering the server
+                setTimeout(() => {
+                    if (state.isPlaying) {
+                        showStatus('Connection closed. Reconnecting...', true, false);
+                        attemptReconnection();
+                    }
+                }, 1000);
+            }
+        };
+        
+        state.ws.onerror = (error) => {
+            log('WebSocket error', 'STREAM', true);
+            
+            // Don't immediately try to reconnect - wait for the close event
+            showStatus('Connection error', true, false);
+        };
+        
+        state.ws.onmessage = handleWebSocketMessage;
+        
+        // Set connection timeout (increased for slower connections)
+        state.connectionTimeout = setTimeout(() => {
+            if (state.ws && state.audioQueue.length === 0) {
+                log('Connection timeout - no data received', 'STREAM', true);
+                showStatus('Connection timeout. Reconnecting...', true, false);
+                attemptReconnection();
+            }
+        }, 20000);
+        
+    } catch (e) {
+        log(`WebSocket setup error: ${e.message}`, 'STREAM', true);
+        showStatus(`Connection error: ${e.message}`, true);
+        attemptReconnection();
+    }
+}
+
+// Attempt reconnection with exponential backoff
+function attemptReconnection() {
     // Don't try to reconnect if we're not supposed to be playing
     if (!state.isPlaying) return;
     
@@ -325,11 +300,9 @@ function attemptReconnection() {
     // Increment attempts
     state.reconnectAttempts++;
     
-    // Calculate delay with more gentle exponential backoff and less jitter
-    const baseDelay = Math.min(config.RECONNECT_DELAY_BASE * 
-                         Math.pow(config.RECONNECT_BACKOFF_FACTOR, state.reconnectAttempts - 1), 
-                         5000); // Cap at 5 seconds
-    const jitter = Math.random() * 500; // Reduced jitter
+    // Calculate delay with exponential backoff and a bit of randomness
+    const baseDelay = Math.min(500 * Math.pow(1.3, state.reconnectAttempts - 1), 8000);
+    const jitter = Math.random() * 1000; // Add up to 1 second of jitter
     const delay = baseDelay + jitter;
     
     log(`Reconnection attempt ${state.reconnectAttempts}/${state.maxReconnectAttempts} in ${(delay/1000).toFixed(1)}s`, 'CONTROL');
@@ -353,11 +326,3 @@ function attemptReconnection() {
         }
     }, delay);
 }
-
-// Make functions available to other modules
-window.connectWebSocket = connectWebSocket;
-window.handleWebSocketMessage = handleWebSocketMessage;
-window.handleTrackInfoUpdate = handleTrackInfoUpdate;
-window.checkConnectionHealth = checkConnectionHealth;
-window.fetchNowPlaying = fetchNowPlaying;
-window.attemptReconnection = attemptReconnection;
