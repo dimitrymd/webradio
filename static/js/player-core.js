@@ -1,4 +1,4 @@
-// Updated player-core.js for direct streaming on all platforms
+// Updated player-core.js with enhanced platform detection and state tracking
 
 // Elements
 const startBtn = document.getElementById('start-btn');
@@ -34,45 +34,75 @@ const state = {
     isIOS: false,
     isMobile: false,
     
-    // Direct streaming
+    // Direct streaming state
     nowPlayingInterval: null,
     lastTrackChange: 0,
     trackPlaybackDuration: 0,
     
+    // Position syncing
+    serverPosition: 0,
+    positionSyncAttempted: false,
+    lastPositionSync: 0,
+    
     // Performance monitoring
-    bufferUnderflows: 0
+    bufferUnderflows: 0,
+    
+    // Debugging
+    debugMode: true  // Set to true to enable detailed logging
 };
 
-// Configuration constants
+// Configuration constants (expanded for better position syncing)
 const config = {
     NOW_PLAYING_INTERVAL: 5000,     // Check now playing every 5 seconds
     RETRY_DELAY: 2000,              // Delay between retry attempts
     MAX_RETRIES: 5,                 // Maximum retry attempts
-    TRACK_CHECK_INTERVAL: 1000      // Check track position every second
+    TRACK_CHECK_INTERVAL: 1000,     // Check track position every second
+    POSITION_SYNC_INTERVAL: 30000,  // Re-sync position with server every 30 seconds
+    IOS_SEEK_RETRY_COUNT: 3,        // Number of times to retry seeking on iOS
+    POSITION_SYNC_THRESHOLD: 10     // Seconds difference before considering position out of sync
 };
 
-// Enhanced platform detection function
+// Enhanced platform detection function with iOS version detection
 function detectPlatform() {
     const ua = window.navigator.userAgent;
     
-    // iOS detection
-    const iOS = /iPad|iPhone|iPod/.test(ua) || 
-                (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    // iOS detection with version information
+    let iOSVersion = 0;
+    let iOS = /iPad|iPhone|iPod/.test(ua) || 
+              (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    
+    if (iOS) {
+        // Extract iOS version if possible
+        const match = ua.match(/OS (\d+)_(\d+)/);
+        if (match && match[1]) {
+            iOSVersion = parseInt(match[1], 10);
+        }
+    }
     
     // General mobile detection
     const mobile = iOS || /Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(ua);
     
+    // Chrome detection - useful for specific Chrome workarounds
+    const isChrome = /Chrome/.test(ua) && /Google Inc/.test(navigator.vendor);
+    
     // Store in state
     state.isIOS = iOS;
+    state.iOSVersion = iOSVersion;
     state.isMobile = mobile;
+    state.isChrome = isChrome;
     
     if (iOS) {
-        log(`Detected iOS device: ${ua}`, 'PLATFORM');
+        log(`Detected iOS device (version ${iOSVersion || 'unknown'}): ${ua}`, 'PLATFORM');
     } else if (mobile) {
         log(`Detected mobile device: ${ua}`, 'PLATFORM');
     }
     
-    return { isIOS: iOS, isMobile: mobile };
+    return { 
+        isIOS: iOS, 
+        iOSVersion: iOSVersion,
+        isMobile: mobile,
+        isChrome: isChrome 
+    };
 }
 
 // Utility functions

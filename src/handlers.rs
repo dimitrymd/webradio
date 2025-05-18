@@ -13,7 +13,6 @@ use crate::models::playlist::Track;
 use crate::services::playlist;
 use crate::services::streamer::StreamManager;
 use crate::services::websocket_bus::WebSocketBus;
-use crate::services::transcoder::TranscoderManager;
 use crate::config;
 
 #[get("/")]
@@ -118,8 +117,15 @@ pub async fn get_stats(
 }
 
 // Direct streaming for all platforms
-#[get("/direct-stream")]
-pub async fn direct_stream(stream_manager: &State<Arc<StreamManager>>) -> Result<(ContentType, Vec<u8>), Status> {
+// Updated direct_stream handler with seeking support
+#[get("/direct-stream?<t>&<position>&<track>&<buffer>")]
+pub async fn direct_stream(
+    stream_manager: &State<Arc<StreamManager>>,
+    t: Option<u64>,
+    position: Option<u64>,
+    track: Option<String>,
+    buffer: Option<u64>
+) -> Result<(ContentType, Vec<u8>), Status> {
     use rocket::http::{ContentType, Status};
     
     // Check if streaming is active
@@ -133,6 +139,60 @@ pub async fn direct_stream(stream_manager: &State<Arc<StreamManager>>) -> Result
     // Always use all chunks - direct streaming needs the complete file
     let chunks_to_use = &all_chunks;
     
+    // Determine how much data to include based on buffer parameter
+    // Default to 30 seconds of buffer (increased from 5)
+    let buffer_seconds = buffer.unwrap_or(30);
+    
+    // Log the buffer size for debugging
+    println!("Stream request with buffer size: {}s", buffer_seconds);
+    
+    // If a position was specified and it's greater than 0, try to skip some chunks
+    let chunks_to_return = if let Some(pos) = position {
+        if pos > 0 {
+            // Log the position request
+            println!("Position request: {}s for track: {:?}, buffer: {}s", pos, track, buffer_seconds);
+            
+            // We'd need to know the bitrate to accurately skip, but we can estimate
+            // Let's assume 128kbps = 16KB per second of audio
+            // Skip approximately the right number of chunks to reach position
+            let bytes_per_second: usize = 16000; // 16KB per second at 128kbps
+            let bytes_to_skip: usize = (pos as usize) * bytes_per_second;
+            let mut total_bytes: usize = 0;
+            let mut skip_chunks: usize = 0;
+            
+            for chunk in chunks_to_use {
+                total_bytes += chunk.len();
+                skip_chunks += 1;
+                
+                if total_bytes >= bytes_to_skip {
+                    break;
+                }
+            }
+            
+            // Only skip if we have enough chunks and won't skip everything
+            if skip_chunks > 0 && skip_chunks < chunks_to_use.len() - 1 {
+                println!("Skipping {} chunks (approx. {} bytes) to reach position {}s", 
+                         skip_chunks, total_bytes, pos);
+                         
+                // Return the chunks after the skip point
+                &chunks_to_use[skip_chunks..]
+            } else {
+                // Not enough chunks to skip or would skip everything, return all
+                chunks_to_use
+            }
+        } else {
+            chunks_to_use
+        }
+    } else {
+        chunks_to_use
+    };
+    
+    // IMPORTANT: Calculate approximate file size for headers
+    let total_file_size: usize = chunks_to_return.iter().map(|c| c.len()).sum();
+    let bitrate: usize = 128000; // Assume 128kbps for simplicity
+    let bytes_per_second: usize = bitrate / 8;
+    let approximate_duration: u64 = (total_file_size / bytes_per_second) as u64;
+    
     // Combine the chunks into the response
     let mut response_data = Vec::new();
     
@@ -142,13 +202,12 @@ pub async fn direct_stream(stream_manager: &State<Arc<StreamManager>>) -> Result
     }
     
     // Add selected chunks
-    for chunk in chunks_to_use {
+    for chunk in chunks_to_return {
         response_data.extend_from_slice(chunk);
     }
     
     // Return the response with the appropriate Content-Type
-    // We can't use custom headers with the (ContentType, Vec<u8>) return type,
-    // so we'll need to handle the position synchronization on the client side using only the API
+    // We can't add custom headers with the (ContentType, Vec<u8>) return type
     Ok((ContentType::new("audio", "mpeg"), response_data))
 }
 

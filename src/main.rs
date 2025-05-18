@@ -16,7 +16,6 @@ mod utils;
 use crate::services::streamer::StreamManager;
 use crate::services::websocket_bus::WebSocketBus;
 use crate::services::playlist;
-use crate::services::transcoder::TranscoderManager;
 
 #[launch]
 fn rocket() -> rocket::Rocket<rocket::Build> {
@@ -31,13 +30,7 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         config::CHUNK_SIZE,
         config::BUFFER_SIZE,
         config::STREAM_CACHE_TIME,
-    ));
-    
-    // Initialize the transcoder for iOS
-    let transcoder = Arc::new(TranscoderManager::new(
-        config::OPUS_BUFFER_SIZE,
-        config::OPUS_CHUNK_SIZE,
-    ));
+    ));     
     
     // Rescan and update durations before starting
     println!("Checking and updating track durations...");
@@ -75,13 +68,6 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     if has_tracks {
         println!("Starting broadcast thread...");
         stream_manager.start_broadcast_thread();
-        
-        // Start transcoder if enabled (for Opus)
-        if config::ENABLE_TRANSCODING {
-            println!("Starting MP3 to Opus transcoder...");
-            transcoder.send_opus_headers();
-            Arc::clone(&transcoder).start_transcoding_shared();
-        }
     } else {
         println!("Not starting broadcast thread - no tracks available");
     }
@@ -100,7 +86,6 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     rocket::build()
         .manage(stream_manager.clone())
         .manage(websocket_bus.clone())
-        .manage(transcoder.clone())
         .mount("/", routes![
             handlers::index,
             handlers::now_playing,

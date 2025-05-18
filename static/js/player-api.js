@@ -1,10 +1,12 @@
-// Fetch now playing info via API
+// Updated player-api.js - Modified to avoid unnecessary position updates
+
+// Fetch now playing info via API with return value for promise chaining
 async function fetchNowPlaying() {
     try {
         const response = await fetch('/api/now-playing');
         if (!response.ok) {
             log(`Now playing API error: ${response.status}`, 'API', true);
-            return;
+            return {};
         }
         
         const data = await response.json();
@@ -20,7 +22,7 @@ async function fetchNowPlaying() {
     }
 }
 
-// Handle track info updates
+// SIMPLIFIED: Handle track info updates without unnecessary position syncing
 function handleTrackInfoUpdate(info) {
     try {
         // Check for error message
@@ -46,8 +48,12 @@ function handleTrackInfoUpdate(info) {
             // Store track changed time for end-of-track detection
             state.lastTrackChange = Date.now();
             
-            // If we're currently playing, restart the stream to get the new track
-            if (state.isPlaying && state.audioElement && !state.audioElement.paused && state.audioElement.currentTime > 10) {
+            // IMPORTANT: Only restart the stream on track change if we've been playing
+            // for a while (to avoid restart loops)
+            if (state.isPlaying && state.audioElement && !state.audioElement.paused && 
+                state.audioElement.currentTime > 10 && 
+                Date.now() - state.lastPositionSync > 30000) { // At least 30 seconds since last sync
+                
                 log('Track changed while playing, restarting stream to get new track', 'TRACK');
                 restartDirectStream();
             }
@@ -64,13 +70,13 @@ function handleTrackInfoUpdate(info) {
             if (currentDuration) currentDuration.textContent = formatTime(info.duration);
         }
         
-        // For streams that we're not seeing position updates,
-        // estimate based on audioElement.currentTime
+        // SIMPLIFIED: Just update UI with current client position
+        // DO NOT try to reset or sync audio position during regular polling
         if (state.audioElement && !state.audioElement.paused) {
             const currentTime = state.audioElement.currentTime;
             updateProgressBar(currentTime, state.trackPlaybackDuration);
         } else {
-            // Use server's position
+            // Use server's position only if we're not playing
             updateProgressBar(position, state.trackPlaybackDuration);
         }
         

@@ -12,7 +12,6 @@ use log::{info, error, warn};
 use tokio::sync::broadcast;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::services::transcoder::TranscoderManager;
 use crate::config;
 
 // Buffer management constants
@@ -514,29 +513,6 @@ impl StreamManager {
         if let Some(thread) = thread {
             let _ = thread.join();
         }
-    }
-
-    // Set up a connection to feed MP3 data to the transcoder 
-    pub fn connect_transcoder(&self, transcoder: Arc<TranscoderManager>) {
-        let broadcast_tx = self.broadcast_tx.clone();
-        
-        thread::spawn(move || {
-            info!("Starting MP3 to transcoder feed");
-            
-            let mut broadcast_rx = broadcast_tx.subscribe();
-            
-            loop {
-                match broadcast_rx.blocking_recv() {
-                    Ok(chunk) => {
-                        transcoder.add_mp3_chunk(&chunk);
-                    },
-                    Err(e) => {
-                        error!("Error receiving from broadcast: {:?}", e);
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                }
-            }
-        });
     }
 
     // Get playback percentage
