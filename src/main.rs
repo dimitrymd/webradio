@@ -1,4 +1,4 @@
-// Updated main.rs with optimized WebSocket handling
+// main.rs - Completely rewritten to fix the duplicate module issues
 
 extern crate rocket;
 
@@ -12,6 +12,7 @@ mod handlers;
 mod models;
 mod services;
 mod utils;
+mod direct_stream; // Import the direct stream module
 
 use crate::services::streamer::StreamManager;
 use crate::services::websocket_bus::WebSocketBus;
@@ -20,7 +21,7 @@ use crate::services::playlist;
 #[launch]
 fn rocket() -> rocket::Rocket<rocket::Build> {
     println!("============================================================");
-    println!("Starting Rust MP3 Web Radio (Optimized WebSocket Architecture)");
+    println!("Starting Rust MP3 Web Radio (Direct Streaming Architecture)");
     println!("Music folder: {}", config::MUSIC_FOLDER.display());
     println!("Chunk size: {}, Buffer size: {}", config::CHUNK_SIZE, config::BUFFER_SIZE);
     println!("============================================================");
@@ -32,6 +33,10 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         config::BUFFER_SIZE,
         config::STREAM_CACHE_TIME,
     ));
+    
+    // We still need WebSocketBus for StreamManager integration, 
+    // but clients won't connect to it
+    let websocket_bus = Arc::new(WebSocketBus::new(stream_manager.clone()));
     
     // Rescan and update durations before starting
     println!("Checking and updating track durations...");
@@ -66,17 +71,11 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         println!("Not starting broadcast thread - no tracks available");
     }
 
-    // Create WebSocket bus for optimized handling
-    let websocket_bus = Arc::new(WebSocketBus::new(stream_manager.clone()));
-    
-    // Don't start the WebSocket broadcast loop here; it will be started by Rocket
-    // We'll set up a Rocket fairing to start it when the Rocket runtime is available
-    
     // Start monitoring thread to handle track switching
     let stream_manager_for_monitor = stream_manager.clone();
     thread::spawn(move || {
         println!("Starting track monitoring thread...");
-        crate::services::playlist::track_switcher(stream_manager_for_monitor.clone());
+        crate::services::playlist::track_switcher(stream_manager_for_monitor);
     });
     
     println!("Server initialization complete, starting web server...");
@@ -85,12 +84,16 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     rocket::build()
         .manage(stream_manager.clone())
         .manage(websocket_bus.clone())
-        .attach(WebSocketFairing)  // Add a custom fairing to start the WebSocket broadcast loop
+        .attach(WebSocketFairing)  // Keep this for WebSocketBus initialization
         .mount("/", routes![
             handlers::index,
             handlers::now_playing,
             handlers::get_stats,
-            handlers::stream_ws,  // Optimized WebSocket endpoint
+            // Commenting out the WebSocket endpoint since we're using direct streaming only
+            // handlers::stream_ws,  
+            direct_stream::direct_stream,
+            direct_stream::direct_stream_head,
+            direct_stream::stream_status,
             handlers::static_files,
             handlers::diagnostic_page,
         ])
@@ -102,21 +105,20 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         .attach(Template::fairing())
 }
 
-use rocket::{fairing::{Fairing, Info, Kind}, Rocket, Build};
-
-// Fairing to start the WebSocket broadcast loop within Rocket's runtime context
+// Keeping the WebSocketFairing for compatibility with existing code
+// We can remove this later when fully migrating away from WebSockets
 struct WebSocketFairing;
 
 #[rocket::async_trait]
-impl Fairing for WebSocketFairing {
-    fn info(&self) -> Info {
-        Info {
+impl rocket::fairing::Fairing for WebSocketFairing {
+    fn info(&self) -> rocket::fairing::Info {
+        rocket::fairing::Info {
             name: "WebSocket Broadcast Loop",
-            kind: Kind::Ignite
+            kind: rocket::fairing::Kind::Ignite
         }
     }
 
-    async fn on_ignite(&self, rocket: Rocket<Build>) -> rocket::fairing::Result {
+    async fn on_ignite(&self, rocket: rocket::Rocket<rocket::Build>) -> rocket::fairing::Result {
         // Get the WebSocketBus from managed state
         if let Some(websocket_bus) = rocket.state::<Arc<WebSocketBus>>() {
             println!("Starting WebSocket broadcast loop from Rocket runtime...");

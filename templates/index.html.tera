@@ -1,3 +1,4 @@
+<!-- Updated index.html.tera template -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -202,11 +203,7 @@
         </div>
     </div>
 
-    <!-- Player module scripts - order matters -->
-    <script src="/static/js/player-core.js"></script>
-    <script src="/static/js/player-audio.js"></script>
-    <script src="/static/js/player-connection.js"></script>
-    <script src="/static/js/player-control.js"></script>
-    <script src="/static/js/player.js"></script>
+    <!-- Direct streaming player (replaces all previous player scripts) -->
+    <script src="/static/js/direct-only-player.js"></script>
 </body>
 </html>
