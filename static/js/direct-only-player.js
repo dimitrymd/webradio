@@ -1,4 +1,4 @@
-// Complete fixed direct-only-player.js with improved error handling and reconnection logic
+// Fixed direct-only-player.js with proper connection handling and debugging
 
 // Player state and configuration
 const state = {
@@ -17,6 +17,7 @@ const state = {
     // Track info
     currentTrackId: null,
     lastKnownPosition: 0,
+    serverPosition: 0,
     
     // Timers
     nowPlayingTimer: null,
@@ -31,7 +32,18 @@ const state = {
     
     // Connection state
     connectionType: 'unknown',
-    isReconnecting: false
+    isReconnecting: false,
+    
+    // Playback state
+    needsPositionSync: true,
+    syncedToServerPosition: false,
+    
+    // Track history - to detect track changes
+    currentTrack: null,
+    lastTrack: null,
+    
+    // Debug mode - set to true while troubleshooting
+    debugMode: true
 };
 
 // Configuration constants 
@@ -50,6 +62,10 @@ const config = {
     MIN_RECONNECT_DELAY: 1000,        // Minimum reconnection delay
     MAX_RECONNECT_DELAY: 8000,        // Maximum reconnection delay
     RECONNECT_BACKOFF_FACTOR: 1.5,    // Exponential backoff factor
+    
+    // Position synchronization
+    SYNC_POSITION_THRESHOLD: 10,      // How many seconds off before we force resync
+    POSITION_CHECK_INTERVAL: 5000,    // How often to check if we're in sync
     
     // Debug settings
     SHOW_DEBUG_INFO: true,            // Show debug info in console
@@ -80,7 +96,15 @@ const isMobile = /Mobi|Android/i.test(navigator.userAgent);
 function initPlayer() {
     log("Initializing direct streaming radio player... Platform: " + (isMobile ? 'Mobile' : 'Desktop') + " (Apple: " + isAppleDevice + ", Safari: " + isSafari + ")", 'INIT');
     
+    // Make sure all required DOM elements are available
+    if (!startBtn || !muteBtn || !volumeControl || !statusMessage) {
+        console.error("Critical error: Required UI elements not found!");
+        alert("Player initialization error: UI elements not found.");
+        return;
+    }
+    
     // Set up event listeners
+    log("Setting up event listeners", 'INIT');
     startBtn.addEventListener('click', toggleConnection);
     
     muteBtn.addEventListener('click', function() {
@@ -156,16 +180,20 @@ function initPlayer() {
     state.hasAudioContextSupport = window.AudioContext || window.webkitAudioContext;
     
     // Fetch initial track info
+    log("Fetching initial track info", 'INIT');
     fetchNowPlaying();
     
     // Initial stream status check
     fetchStreamStatus();
     
     log('ChillOut Radio player initialized');
+    showStatus('Player ready - click Connect to start streaming', false, false);
 }
 
 // Setup audio listeners separately to keep organized
 function setupAudioListeners() {
+    log("Setting up audio event listeners", 'AUDIO');
+    
     // Playback state events
     state.audioElement.addEventListener('loadstart', () => {
         log('Audio load started', 'AUDIO');
@@ -303,8 +331,37 @@ function setupAudioListeners() {
             // Update last known playback time for stall detection
             state.lastPlaybackTime = state.audioElement.currentTime;
             
+            // Check if we're significantly out of sync with server position
+            if (state.serverPosition > 0 && state.currentTrack) {
+                // Calculate how far we are from server position
+                const serverEstimatedPosition = state.serverPosition + 
+                    ((Date.now() - state.lastTrackInfoTime) / 1000); // Adjust for time since update
+                    
+                const positionDiff = Math.abs(serverEstimatedPosition - state.audioElement.currentTime);
+                
+                // If we're too far off and not already syncing, consider reconnecting
+                if (positionDiff > config.SYNC_POSITION_THRESHOLD && 
+                    !state.syncedToServerPosition && !state.isReconnecting) {
+                    log(`Position significantly out of sync: local=${state.audioElement.currentTime.toFixed(1)}s, server~=${serverEstimatedPosition.toFixed(1)}s, diff=${positionDiff.toFixed(1)}s`, 'SYNC', true);
+                    
+                    // If this is the first time we're detecting this, try to seek
+                    if (state.needsPositionSync) {
+                        tryPositionSync(serverEstimatedPosition);
+                    }
+                } else if (positionDiff < 5) {
+                    // We're reasonably in sync
+                    state.syncedToServerPosition = true;
+                    state.needsPositionSync = false;
+                }
+            }
+            
             // Reset stall timer during active playback
             state.stalledStartTime = null;
+            
+            // Update UI if we have duration info
+            if (state.currentTrack && state.currentTrack.duration) {
+                updateProgressBar(state.audioElement.currentTime, state.currentTrack.duration);
+            }
         }
     });
     
@@ -321,6 +378,61 @@ function setupAudioListeners() {
             state.poorBufferStartTime = null;
         }
     });
+    
+    // Seeking events
+    state.audioElement.addEventListener('seeking', () => {
+        log('Audio seeking to ' + state.audioElement.currentTime.toFixed(1) + 's', 'AUDIO');
+    });
+    
+    state.audioElement.addEventListener('seeked', () => {
+        log('Audio seeked to ' + state.audioElement.currentTime.toFixed(1) + 's', 'AUDIO');
+    });
+}
+
+// Try to sync to the server position by seeking
+function tryPositionSync(serverPosition) {
+    if (!state.audioElement || !state.isPlaying || state.isReconnecting) {
+        return false;
+    }
+    
+    log(`Attempting to sync position to server time: ${serverPosition.toFixed(1)}s`, 'SYNC');
+    
+    try {
+        // First check if we can seek in our current buffer
+        const bufferInfo = getDetailedBufferInfo();
+        let canSeekInBuffer = false;
+        
+        // Check if serverPosition is within any buffered range
+        for (const range of bufferInfo.bufferedRanges) {
+            if (serverPosition >= range.start && serverPosition <= range.end) {
+                canSeekInBuffer = true;
+                break;
+            }
+        }
+        
+        if (canSeekInBuffer) {
+            log(`Server position ${serverPosition.toFixed(1)}s is within buffer, seeking...`, 'SYNC');
+            state.audioElement.currentTime = serverPosition;
+            state.needsPositionSync = false;
+            state.syncedToServerPosition = true;
+            return true;
+        } else {
+            // If we can't seek within buffer, we need to reconnect
+            log(`Server position ${serverPosition.toFixed(1)}s is outside buffer, need to reconnect`, 'SYNC');
+            state.needsPositionSync = true; // Still needs sync
+            
+            // Only reconnect if we're significantly out of sync
+            if (Math.abs(serverPosition - state.audioElement.currentTime) > config.SYNC_POSITION_THRESHOLD) {
+                // We'll try to reconnect and start from server position
+                attemptReconnection(serverPosition);
+                return true;
+            }
+        }
+    } catch (e) {
+        log(`Error during position sync: ${e.message}`, 'SYNC', true);
+    }
+    
+    return false;
 }
 
 // Start audio playback
@@ -335,6 +447,8 @@ function startAudio() {
     state.lastStatusCheck = Date.now();
     state.isPlaying = true;
     state.isReconnecting = false;
+    state.syncedToServerPosition = false;
+    state.needsPositionSync = true;
     
     // Clear any cleanup timeout that may be running
     if (state.cleanupTimeout) {
@@ -477,135 +591,155 @@ function toggleConnection() {
     }
 }
 
-// Start direct HTTP streaming with improved platform detection
-function startDirectPlayback() {
+// Start direct HTTP streaming with improved platform detection and position sync
+function startDirectPlayback(position) {
     try {
-        // Set up audio element for direct streaming with platform-specific settings
-        const timestamp = Date.now(); // Prevent caching
-        
-        // Build URL with platform-specific parameters
-        let streamUrl = "/direct-stream?t=" + timestamp;
-        
-        // Add platform-specific parameters
-        if (isAppleDevice) {
-            streamUrl += '&platform=ios';
-            
-            // Request large buffer for iOS specifically
-            streamUrl += '&buffer=large';
-            
-            // Add network quality hint
-            if (state.connectionType && state.connectionType !== 'unknown') {
-                streamUrl += "&network=" + state.connectionType;
-            }
-        } else if (isSafari) {
-            streamUrl += '&platform=safari';
-        } else if (isMobile) {
-            streamUrl += '&platform=mobile';
-        }
-        
-        // Apply the URL to the audio element
-        state.audioElement.src = streamUrl;
-        
-        // Platform specific handling
-        if (isAppleDevice) {
-            // iOS/Safari requires user interaction to start playback
-            showStatus('Ready - Tap play to start streaming', false, false);
-            startBtn.textContent = 'Play';
-            startBtn.disabled = false;
-            startBtn.dataset.connected = 'true';
-            
-            // Setup click handler for playback that requires gentle handling on iOS
-            startBtn.onclick = function() {
-                if (!state.audioElement) return;
-                
-                if (state.audioElement.paused) {
-                    startBtn.disabled = true;
-                    showStatus('Starting playback...', false, false);
-                    
-                    // Add a short delay before playing on iOS
-                    setTimeout(() => {
-                        if (!state.audioElement) return;
-                        
-                        state.audioElement.play().then(() => {
-                            showStatus('Stream playing');
-                            startBtn.textContent = 'Disconnect';
-                            startBtn.disabled = false;
-                        }).catch(e => {
-                            log("iOS play failed: " + e.message, 'AUDIO', true);
-                            showStatus("Playback error: " + e.message, true);
-                            startBtn.disabled = false;
-                        });
-                    }, 100);
-                    
-                    // Reset onclick to normal toggle behavior after initial play
-                    startBtn.onclick = toggleConnection;
-                } else {
-                    stopAudio();
-                }
-            };
+        // Get the current position from server first if not provided
+        if (position === undefined) {
+            log("Starting playback with fetched position", 'PLAYBACK');
+            // Use what we already have
+            const serverPosition = state.serverPosition || 0;
+            setDirectPlaybackSource(serverPosition);
         } else {
-            // For other browsers, play automatically
-            showStatus('Starting playback...', false, false);
-            
-            // Use a small delay before playing to ensure browser is ready
-            setTimeout(() => {
-                if (!state.audioElement || !state.isPlaying) return;
-                
-                const playPromise = state.audioElement.play();
-                playPromise.then(() => {
-                    log('Direct stream playback started', 'AUDIO');
-                    showStatus('Connected to stream');
-                    startBtn.textContent = 'Disconnect';
-                    startBtn.disabled = false;
-                    startBtn.dataset.connected = 'true';
-                }).catch(e => {
-                    log("Direct stream playback error: " + e.message, 'AUDIO', true);
-                    
-                    if (e.name === 'NotAllowedError') {
-                        // Browser requires user interaction
-                        showStatus('Click play to start audio (browser requires user interaction)', true, false);
-                        startBtn.disabled = false;
-                        startBtn.dataset.connected = 'true';
-                        
-                        // Setup click handler for playback
-                        startBtn.onclick = function() {
-                            if (!state.audioElement) return;
-                            
-                            if (state.audioElement.paused && state.isPlaying) {
-                                startBtn.disabled = true;
-                                state.audioElement.play().then(() => {
-                                    showStatus('Stream playing');
-                                    startBtn.textContent = 'Disconnect';
-                                    startBtn.disabled = false;
-                                }).catch(e => {
-                                    log("Play failed: " + e.message, 'AUDIO', true);
-                                    showStatus("Playback error: " + e.message, true);
-                                    startBtn.disabled = false;
-                                });
-                                // Reset onclick to normal toggle behavior after initial play
-                                startBtn.onclick = toggleConnection;
-                            } else {
-                                stopAudio();
-                            }
-                        };
-                    } else {
-                        showStatus("Playback error: " + e.message, true);
-                        startBtn.disabled = false;
-                        
-                        // For other errors, try reconnecting
-                        setTimeout(() => {
-                            if (state.isPlaying && !state.isReconnecting) {
-                                attemptReconnection();
-                            }
-                        }, 1000);
-                    }
-                });
-            }, 200);
+            log(`Starting playback at specified position: ${position}s`, 'PLAYBACK');
+            setDirectPlaybackSource(position);
         }
     } catch (e) {
         log("Direct streaming error: " + e.message, 'AUDIO', true);
         showStatus("Streaming error: " + e.message, true);
         stopAudio(true);
+    }
+}
+
+// Set the audio element source with all required parameters
+function setDirectPlaybackSource(position) {
+    if (!state.audioElement || !state.isPlaying) return;
+    
+    const timestamp = Date.now();
+    
+    // Build URL with position and platform-specific parameters
+    let streamUrl = `/direct-stream?t=${timestamp}&position=${position}`;
+    
+    // Add platform-specific parameters
+    if (isAppleDevice) {
+        streamUrl += '&platform=ios';
+        
+        // Request large buffer for iOS specifically
+        streamUrl += '&buffer=large';
+        
+        // Add network quality hint
+        if (state.connectionType && state.connectionType !== 'unknown') {
+            streamUrl += "&network=" + state.connectionType;
+        }
+    } else if (isSafari) {
+        streamUrl += '&platform=safari';
+    } else if (isMobile) {
+        streamUrl += '&platform=mobile';
+    }
+    
+    log(`Using stream URL: ${streamUrl}`, 'PLAYBACK');
+    
+    // Apply the URL to the audio element
+    state.audioElement.src = streamUrl;
+    
+    // Platform specific handling
+    if (isAppleDevice) {
+        // iOS/Safari requires user interaction to start playback
+        showStatus('Ready - Tap play to start streaming', false, false);
+        startBtn.textContent = 'Play';
+        startBtn.disabled = false;
+        startBtn.dataset.connected = 'true';
+        
+        // Setup click handler for playback that requires gentle handling on iOS
+        startBtn.onclick = function() {
+            if (!state.audioElement) return;
+            
+            if (state.audioElement.paused) {
+                startBtn.disabled = true;
+                showStatus('Starting playback...', false, false);
+                
+                // Add a short delay before playing on iOS
+                setTimeout(() => {
+                    if (!state.audioElement) return;
+                    
+                    state.audioElement.play().then(() => {
+                        showStatus('Stream playing');
+                        startBtn.textContent = 'Disconnect';
+                        startBtn.disabled = false;
+                        state.syncedToServerPosition = true;
+                    }).catch(e => {
+                        log("iOS play failed: " + e.message, 'AUDIO', true);
+                        showStatus("Playback error: " + e.message, true);
+                        startBtn.disabled = false;
+                    });
+                }, 100);
+                
+                // Reset onclick to normal toggle behavior after initial play
+                startBtn.onclick = toggleConnection;
+            } else {
+                stopAudio();
+            }
+        };
+    } else {
+        // For other browsers, play automatically
+        showStatus('Starting playback...', false, false);
+        
+        // Use a small delay before playing to ensure browser is ready
+        setTimeout(() => {
+            if (!state.audioElement || !state.isPlaying) return;
+            
+            const playPromise = state.audioElement.play();
+            playPromise.then(() => {
+                log('Direct stream playback started', 'AUDIO');
+                showStatus('Connected to stream');
+                startBtn.textContent = 'Disconnect';
+                startBtn.disabled = false;
+                startBtn.dataset.connected = 'true';
+                state.syncedToServerPosition = true;
+            }).catch(e => {
+                log("Direct stream playback error: " + e.message, 'AUDIO', true);
+                
+                if (e.name === 'NotAllowedError') {
+                    // Browser requires user interaction
+                    showStatus('Click play to start audio (browser requires user interaction)', true, false);
+                    startBtn.disabled = false;
+                    startBtn.dataset.connected = 'true';
+                    
+                    // Setup click handler for playback
+                    startBtn.onclick = function() {
+                        if (!state.audioElement) return;
+                        
+                        if (state.audioElement.paused && state.isPlaying) {
+                            startBtn.disabled = true;
+                            state.audioElement.play().then(() => {
+                                showStatus('Stream playing');
+                                startBtn.textContent = 'Disconnect';
+                                startBtn.disabled = false;
+                                state.syncedToServerPosition = true;
+                            }).catch(e => {
+                                log("Play failed: " + e.message, 'AUDIO', true);
+                                showStatus("Playback error: " + e.message, true);
+                                startBtn.disabled = false;
+                            });
+                            // Reset onclick to normal toggle behavior after initial play
+                            startBtn.onclick = toggleConnection;
+                        } else {
+                            stopAudio();
+                        }
+                    };
+                } else {
+                    showStatus("Playback error: " + e.message, true);
+                    startBtn.disabled = false;
+                    
+                    // For other errors, try reconnecting
+                    setTimeout(() => {
+                        if (state.isPlaying && !state.isReconnecting) {
+                            attemptReconnection();
+                        }
+                    }, 1000);
+                }
+            });
+        }, 200);
     }
 }
 
@@ -642,7 +776,7 @@ function getDetailedBufferInfo() {
     };
 }
 
-// Check connection health with improved reliability
+// Check connection health with improved reliability and position sync
 function checkConnectionHealth() {
     if (!state.isPlaying || state.isReconnecting) return;
     
@@ -715,8 +849,48 @@ function checkConnectionHealth() {
             state.stalledStartTime = null;
         }
         
+        // ISSUE #4: Buffer looping - detect if we're playing the same portion of audio repeatedly
+        const bufferEnd = getBufferEnd();
+        if (bufferEnd > 0 && state.audioElement.currentTime > 0) {
+            // If we're close to the end of our buffer and not getting new data,
+            // we might be about to loop
+            if (bufferEnd - state.audioElement.currentTime < 2 && 
+                bufferInfo.bufferedRanges.length === 1 && 
+                bufferInfo.totalSeconds < 20) {
+                
+                log(`Possible buffer loop detected: currentTime=${state.audioElement.currentTime.toFixed(1)}, bufferEnd=${bufferEnd.toFixed(1)}`, 'HEALTH', true);
+                
+                // Check if position is significantly different from server position
+                const serverEstimatedPosition = state.serverPosition + 
+                    ((Date.now() - state.lastTrackInfoTime) / 1000);
+                    
+                if (Math.abs(serverEstimatedPosition - state.audioElement.currentTime) > 10) {
+                    log(`Buffer loop confirmed: local=${state.audioElement.currentTime.toFixed(1)}s, server~=${serverEstimatedPosition.toFixed(1)}s`, 'HEALTH', true);
+                    showStatus('Fixing buffer loop...', true, false);
+                    attemptReconnection(serverEstimatedPosition);
+                    return;
+                }
+            }
+        }
+        
         // Update last playback time
         state.lastPlaybackTime = state.audioElement.currentTime;
+        
+        // After a while, check if we're still in sync with server
+        if (now - state.lastTrackInfoTime > config.POSITION_CHECK_INTERVAL && state.serverPosition > 0) {
+            const serverEstimatedPosition = state.serverPosition + 
+                ((now - state.lastTrackInfoTime) / 1000);
+                
+            const positionDiff = Math.abs(serverEstimatedPosition - state.audioElement.currentTime);
+            
+            // If we're significantly out of sync and it's been a while, get fresh data
+            if (positionDiff > config.SYNC_POSITION_THRESHOLD && 
+                now - state.lastStatusCheck > config.STATUS_CHECK_INTERVAL) {
+                
+                log(`Position check: local=${state.audioElement.currentTime.toFixed(1)}s, server~=${serverEstimatedPosition.toFixed(1)}s, diff=${positionDiff.toFixed(1)}s`, 'SYNC');
+                fetchStreamStatus();
+            }
+        }
     }
 }
 
@@ -739,8 +913,18 @@ function getBufferInfo() {
     };
 }
 
+// Get the end time of the last buffered range
+function getBufferEnd() {
+    if (!state.audioElement || !state.audioElement.buffered || state.audioElement.buffered.length === 0) {
+        return 0;
+    }
+    
+    const buffered = state.audioElement.buffered;
+    return buffered.end(buffered.length - 1);
+}
+
 // Attempt reconnection with improved exponential backoff and recovery
-function attemptReconnection() {
+function attemptReconnection(position) {
     // Set reconnection flag to prevent multiple reconnections
     if (state.isReconnecting) {
         log('Already reconnecting, skipping additional request', 'CONTROL');
@@ -752,6 +936,10 @@ function attemptReconnection() {
     
     // Set reconnecting state
     state.isReconnecting = true;
+    
+    // Store position to sync to, if provided
+    const syncPosition = position || (state.serverPosition > 0 ? 
+        state.serverPosition + ((Date.now() - state.lastTrackInfoTime) / 1000) : 0);
     
     // Check if we've reached the maximum attempts
     if (state.reconnectAttempts >= state.maxReconnectAttempts) {
@@ -774,7 +962,7 @@ function attemptReconnection() {
     const jitter = Math.random() * 1000; // Add up to 1 second of jitter
     const delay = baseDelay + jitter;
     
-    log("Reconnection attempt " + state.reconnectAttempts + "/" + state.maxReconnectAttempts + " in " + (delay/1000).toFixed(1) + "s", 'CONTROL');
+    log("Reconnection attempt " + state.reconnectAttempts + "/" + state.maxReconnectAttempts + " in " + (delay/1000).toFixed(1) + "s (position: " + syncPosition.toFixed(1) + "s)", 'CONTROL');
     showStatus("Reconnecting (" + state.reconnectAttempts + "/" + state.maxReconnectAttempts + ")...", true, false);
     
     // Clean up existing audio element first - THIS IS CRITICAL
@@ -788,7 +976,7 @@ function attemptReconnection() {
             return;
         }
         
-        log("Starting reconnection attempt " + state.reconnectAttempts, 'CONTROL');
+        log("Starting reconnection attempt " + state.reconnectAttempts + " at position " + syncPosition.toFixed(1) + "s", 'CONTROL');
         
         // Create a new audio element
         state.audioElement = new Audio();
@@ -804,63 +992,13 @@ function attemptReconnection() {
         // Setup event listeners on new element
         setupAudioListeners();
         
-        // Try playback with fresh source and new audio element
-        const timestamp = Date.now(); // Prevent caching
-        let streamUrl = "/direct-stream?t=" + timestamp;
+        // Try playback with fresh source at the specified position
+        startDirectPlayback(syncPosition);
         
-        // Add platform-specific parameters
-        if (isAppleDevice) {
-            streamUrl += '&platform=ios&buffer=large';
-        } else if (isSafari) {
-            streamUrl += '&platform=safari';
-        } else if (isMobile) {
-            streamUrl += '&platform=mobile';
-        }
-        
-        // Add reconnect attempt number to help server debugging
-        streamUrl += "&reconnect=" + state.reconnectAttempts;
-        
-        // Apply URL to audio element
-        state.audioElement.src = streamUrl;
-        
-        // Add a small delay before playing to ensure the browser is ready
+        // Reset reconnection state after a delay to allow the connection attempt to complete
         setTimeout(() => {
-            if (!state.isPlaying || !state.audioElement) {
-                state.isReconnecting = false;
-                return;
-            }
-            
-            state.audioElement.play().then(() => {
-                log('Reconnection successful', 'CONTROL');
-                showStatus('Reconnected to stream');
-                startBtn.textContent = 'Disconnect';
-                startBtn.disabled = false;
-                startBtn.dataset.connected = 'true';
-                
-                // Reset reconnect attempts on successful connection
-                state.reconnectAttempts = 0;
-                state.isReconnecting = false;
-            }).catch(e => {
-                log("Reconnection playback error: " + e.message, 'AUDIO', true);
-                state.isReconnecting = false;
-                
-                // Try again with next attempt, but only if error is not "AbortError"
-                // AbortError usually means we're already cleaning up, so don't try again
-                if (e.name !== 'AbortError' && state.reconnectAttempts < state.maxReconnectAttempts) {
-                    log('Will try again on next attempt', 'CONTROL');
-                    
-                    // Schedule another attempt after a delay
-                    setTimeout(() => {
-                        if (state.isPlaying) {
-                            attemptReconnection();
-                        }
-                    }, baseDelay);
-                } else {
-                    showStatus('Failed to reconnect after multiple attempts. Please try again later.', true);
-                    stopAudio(true);
-                }
-            });
-        }, 300); // Longer delay (300ms) before playing after reconnection
+            state.isReconnecting = false;
+        }, 5000);
     }, delay);
 }
 
@@ -873,14 +1011,36 @@ function updateTrackInfo(info) {
             return;
         }
         
+        // Store the current track as previous
+        if (state.currentTrack) {
+            state.lastTrack = { ...state.currentTrack };
+        }
+        
+        // Store server position for sync
+        if (info.playback_position !== undefined) {
+            state.serverPosition = info.playback_position;
+            state.lastTrackInfoTime = Date.now();
+        }
+        
+        // Store current track info
+        state.currentTrack = info;
+        
         // Store track ID for change detection
         const newTrackId = info.path;
         if (state.currentTrackId !== newTrackId) {
             log("Track changed to: " + info.title, 'TRACK');
             state.currentTrackId = newTrackId;
             
-            // Reset position tracking
+            // Reset position tracking on track change
             state.lastKnownPosition = 0;
+            state.syncedToServerPosition = false;
+            state.needsPositionSync = true;
+            
+            // If we're playing, we need to reconnect to get the new track
+            if (state.isPlaying && state.audioElement && !state.isReconnecting) {
+                log("Track changed, reconnecting to get new audio", 'TRACK');
+                attemptReconnection(0); // Start from beginning of new track
+            }
         }
         
         // Update UI
@@ -893,8 +1053,8 @@ function updateTrackInfo(info) {
             currentDuration.textContent = formatTime(info.duration);
         }
         
-        if (info.playback_position !== undefined) {
-            state.lastKnownPosition = info.playback_position;
+        // Update progress bar if we have position
+        if (info.playback_position !== undefined && info.duration) {
             updateProgressBar(info.playback_position, info.duration);
         }
         
@@ -908,9 +1068,6 @@ function updateTrackInfo(info) {
         
         // Update page title
         document.title = info.title + " - " + info.artist + " | ChillOut Radio";
-        
-        // Update last track info time
-        state.lastTrackInfoTime = Date.now();
     } catch (e) {
         log("Error processing track info: " + e.message, 'TRACK', true);
     }
@@ -919,22 +1076,27 @@ function updateTrackInfo(info) {
 // Fetch now playing info via API
 async function fetchNowPlaying() {
     try {
+        log("Fetching now playing information", 'API');
         const response = await fetch('/api/now-playing');
         if (!response.ok) {
             log("Now playing API error: " + response.status, 'API', true);
-            return;
+            return null;
         }
         
         const data = await response.json();
+        log("Received now playing data: " + JSON.stringify(data), 'API');
         updateTrackInfo(data);
+        return data;
     } catch (error) {
         log("Error fetching now playing: " + error.message, 'API', true);
+        return null;
     }
 }
 
 // Fetch stream status from server for better sync
 async function fetchStreamStatus() {
     try {
+        log("Fetching stream status", 'API');
         const response = await fetch('/stream-status');
         if (!response.ok) {
             log("Stream status API error: " + response.status, 'API', true);
@@ -942,6 +1104,7 @@ async function fetchStreamStatus() {
         }
         
         const data = await response.json();
+        log("Received stream status: " + JSON.stringify(data), 'API');
         
         // Update last status check time
         state.lastStatusCheck = Date.now();
@@ -950,6 +1113,21 @@ async function fetchStreamStatus() {
         if (data.status !== 'streaming' && state.isPlaying) {
             log('Server reports stream is not playing, but we think it is', 'API', true);
             // Don't reconnect immediately, just log the discrepancy
+        }
+        
+        // Store server position
+        if (data.playback_position !== undefined) {
+            state.serverPosition = data.playback_position;
+            
+            // Check if we're significantly out of sync
+            if (state.audioElement && Math.abs(state.serverPosition - state.audioElement.currentTime) > config.SYNC_POSITION_THRESHOLD) {
+                log(`Status check: local=${state.audioElement.currentTime.toFixed(1)}s, server=${state.serverPosition.toFixed(1)}s`, 'SYNC');
+                
+                // Consider syncing if we're playing and out of sync
+                if (state.isPlaying && !state.audioElement.paused && !state.isReconnecting) {
+                    state.needsPositionSync = true;
+                }
+            }
         }
         
         // If we have current track info, update our player
@@ -1005,14 +1183,18 @@ function showStatus(message, isError = false, autoHide = true) {
 
 // Logging function with better formatting
 function log(message, category = 'INFO', isError = false) {
-    const timestamp = new Date().toISOString().substr(11, 8);
-    const style = isError 
-        ? 'color: #e74c3c; font-weight: bold;' 
-        : (category === 'AUDIO' ? 'color: #2ecc71;' : 
-          (category === 'BUFFER' ? 'color: #3498db;' : 
-           (category === 'CONTROL' ? 'color: #9b59b6;' : 'color: #2c3e50;')));
-    
-    console[isError ? 'error' : 'log']("%c[" + timestamp + "] [" + category + "] " + message, style);
+    // Always log errors and important messages during debugging
+    if (isError || state.debugMode) {
+        const timestamp = new Date().toISOString().substr(11, 8);
+        const style = isError 
+            ? 'color: #e74c3c; font-weight: bold;' 
+            : (category === 'AUDIO' ? 'color: #2ecc71;' : 
+            (category === 'BUFFER' ? 'color: #3498db;' : 
+                (category === 'CONTROL' ? 'color: #9b59b6;' : 
+                (category === 'SYNC' ? 'color: #f39c12;' : 'color: #2c3e50;'))));
+        
+        console[isError ? 'error' : 'log']("%c[" + timestamp + "] [" + category + "] " + message, style);
+    }
 }
 
 // Initialize the player on document ready

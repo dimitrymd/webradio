@@ -1,4 +1,4 @@
-// main.rs - Completely rewritten to fix the duplicate module issues
+// main.rs - Updated to fix audio streaming issues
 
 extern crate rocket;
 
@@ -20,10 +20,14 @@ use crate::services::playlist;
 
 #[launch]
 fn rocket() -> rocket::Rocket<rocket::Build> {
+    // Initialize logging
+    env_logger::init();
+    
     println!("============================================================");
     println!("Starting Rust MP3 Web Radio (Direct Streaming Architecture)");
     println!("Music folder: {}", config::MUSIC_FOLDER.display());
     println!("Chunk size: {}, Buffer size: {}", config::CHUNK_SIZE, config::BUFFER_SIZE);
+    println!("WebSocket ping interval: {}ms", config::WS_PING_INTERVAL_MS);
     println!("============================================================");
 
     // Initialize the stream manager with the configuration values
@@ -89,9 +93,9 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
             handlers::index,
             handlers::now_playing,
             handlers::get_stats,
-            // Commenting out the WebSocket endpoint since we're using direct streaming only
-            // handlers::stream_ws,  
+            // Stream endpoints with updated route paths
             direct_stream::direct_stream,
+            direct_stream::direct_stream_range,  // Updated range request endpoint
             direct_stream::direct_stream_head,
             direct_stream::stream_status,
             handlers::static_files,
