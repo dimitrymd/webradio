@@ -1,4 +1,4 @@
-// direct-only-player.js - Fixed version with improved reconnection
+// Complete fixed direct-only-player.js with all necessary variables defined
 
 // Player state and configuration
 const state = {
@@ -17,26 +17,25 @@ const state = {
     currentTrackId: null,
     lastKnownPosition: 0,
     
-    // Tracking variables for health monitoring
-    lastPlaybackTime: 0,
-    poorBufferStartTime: null,
-    stalledStartTime: null,
-    
     // Timers
     nowPlayingTimer: null,
     connectionHealthTimer: null,
     lastErrorTime: 0,
+    
+    // Buffer monitoring
+    lastPlaybackTime: 0,
+    poorBufferStartTime: null,
+    stalledStartTime: null
 };
 
 // Configuration constants 
 const config = {
     // Connection settings
-    NOW_PLAYING_INTERVAL: 10000,     // Check now playing every 10 seconds
-    CONNECTION_CHECK_INTERVAL: 5000, // Check connection every 5 seconds
+    NOW_PLAYING_INTERVAL: 10000,    // Check now playing every 10 seconds
+    CONNECTION_CHECK_INTERVAL: 5000, // Check connection health every 5 seconds
     
     // Debug settings
-    SHOW_DEBUG_INFO: false,          // Set to true to see debug info
-    SHOW_PERFORMANCE_MONITOR: false  // Set to true to show performance monitor
+    SHOW_DEBUG_INFO: true,         // Show debug info in console
 };
 
 // UI Elements
@@ -54,17 +53,14 @@ const currentPosition = document.getElementById('current-position');
 const currentDuration = document.getElementById('current-duration');
 const progressBar = document.getElementById('progress-bar');
 
-// Detect iOS and Safari for platform-specific optimizations
-const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+// Detect platform - DEFINED HERE TO FIX THE REFERENCE ERROR
+const isAppleDevice = /iPad|iPhone|iPod|Mac/.test(navigator.userAgent) && !window.MSStream;
 const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
 const isMobile = /Mobi|Android/i.test(navigator.userAgent);
 
-// Performance monitoring
-let performanceMonitor = null;
-
 // Initialize player
 function initPlayer() {
-    log(`Initializing direct streaming radio player... Platform: ${isMobile ? 'Mobile' : 'Desktop'} (iOS: ${isIOS}, Safari: ${isSafari})`);
+    log(`Initializing direct streaming radio player... Platform: ${isMobile ? 'Mobile' : 'Desktop'} (Apple: ${isAppleDevice}, Safari: ${isSafari})`);
     
     // Set up event listeners
     startBtn.addEventListener('click', toggleConnection);
@@ -108,60 +104,12 @@ function initPlayer() {
     if (navigator.connection) {
         state.connectionType = navigator.connection.effectiveType;
         log(`Network connection type: ${state.connectionType}`);
-        
-        // Listen for connection changes
-        navigator.connection.addEventListener('change', () => {
-            const newType = navigator.connection.effectiveType;
-            log(`Network connection changed from ${state.connectionType} to ${newType}`);
-            state.connectionType = newType;
-        });
-    }
-    
-    // Create performance monitor if enabled
-    if (config.SHOW_PERFORMANCE_MONITOR) {
-        createPerformanceMonitor();
     }
     
     // Fetch initial track info
     fetchNowPlaying();
     
     log('ChillOut Radio player initialized');
-}
-
-// Create performance monitor display
-function createPerformanceMonitor() {
-    // Remove existing monitor if any
-    if (performanceMonitor) {
-        performanceMonitor.remove();
-    }
-    
-    performanceMonitor = document.createElement('div');
-    performanceMonitor.id = 'performance-monitor';
-    performanceMonitor.style.cssText = 'position:fixed; bottom:10px; right:10px; background:rgba(0,0,0,0.8); ' +
-        'color:white; padding:8px; font-size:12px; border-radius:3px; z-index:1000; font-family:monospace;';
-    document.body.appendChild(performanceMonitor);
-    
-    // Update performance stats periodically
-    function updateStats() {
-        if (!state.isPlaying || !state.audioElement) {
-            performanceMonitor.textContent = 'Stream stopped';
-            return;
-        }
-        
-        const bufferInfo = getDetailedBufferInfo();
-        const readyState = ['HAVE_NOTHING', 'HAVE_METADATA', 'HAVE_CURRENT_DATA', 'HAVE_FUTURE_DATA', 'HAVE_ENOUGH_DATA'][state.audioElement.readyState] || 'Unknown';
-        
-        performanceMonitor.innerHTML = 
-            `Network: ${state.connectionType || 'Unknown'}<br>` +
-            `Ready: ${readyState} (${state.audioElement.readyState})<br>` +
-            `Buffer: ${bufferInfo.bufferedRanges.length} ranges<br>` +
-            `Playing: ${!state.audioElement.paused}<br>` +
-            `Reconnects: ${state.reconnectAttempts}`;
-        
-        setTimeout(updateStats, 1000);
-    }
-    
-    updateStats();
 }
 
 // Start audio playback
@@ -184,13 +132,10 @@ function startAudio() {
         state.audioElement.preload = 'auto';
         
         // iOS/Safari specific settings
-        if (isIOS || isSafari) {
+        if (isAppleDevice || isSafari) {
             // These properties can help with iOS playback
             state.audioElement.preload = 'auto';
             state.audioElement.autoplay = false;
-            
-            // iOS requires control interaction, so we add the play button
-            startBtn.disabled = false;
         }
         
         // Add to document but hide visually
@@ -346,7 +291,6 @@ function setupAudioListeners() {
     });
     
     // Extra listeners for better experience
-    
     state.audioElement.addEventListener('canplay', () => {
         log('Audio can play', 'AUDIO');
         showStatus('Stream ready', false, true);
@@ -363,9 +307,9 @@ function setupAudioListeners() {
     
     // Progress monitoring for stats
     state.audioElement.addEventListener('progress', () => {
-        const bufferInfo = getDetailedBufferInfo();
-        if (bufferInfo.bufferedRanges.length > 0) {
-            log(`Buffered ${bufferInfo.bufferedRanges[0].duration.toFixed(1)} seconds of audio`, 'BUFFER');
+        const bufferInfo = getBufferInfo();
+        if (config.SHOW_DEBUG_INFO && Math.random() < 0.2) {
+            log(`Buffered ${bufferInfo.totalSeconds.toFixed(1)} seconds of audio in ${bufferInfo.ranges} ranges`, 'BUFFER');
         }
     });
 }
@@ -375,10 +319,11 @@ function startDirectPlayback() {
     try {
         // Set up audio element for direct streaming
         const timestamp = Date.now(); // Prevent caching
-        state.audioElement.src = `/direct-stream?t=${timestamp}${isIOS ? '&platform=ios' : ''}`;
+        const platformParam = isAppleDevice ? '&platform=ios' : '';
+        state.audioElement.src = `/direct-stream?t=${timestamp}${platformParam}`;
         
         // Platform specific handling
-        if (isIOS || isSafari) {
+        if (isAppleDevice || isSafari) {
             // iOS/Safari may need a user interaction to start playback
             showStatus('Ready - Click play to start streaming', false, false);
             startBtn.textContent = 'Play';
@@ -452,7 +397,7 @@ function startDirectPlayback() {
     }
 }
 
-// Get detailed buffer information for diagnostics
+// Get detailed buffer info
 function getDetailedBufferInfo() {
     if (!state.audioElement || !state.audioElement.buffered) {
         return {
@@ -558,6 +503,25 @@ function checkConnectionHealth() {
     }
 }
 
+// Get buffer information from audio element
+function getBufferInfo() {
+    if (!state.audioElement || !state.audioElement.buffered || state.audioElement.buffered.length === 0) {
+        return { ranges: 0, totalSeconds: 0 };
+    }
+    
+    let totalSeconds = 0;
+    const buffered = state.audioElement.buffered;
+    
+    for (let i = 0; i < buffered.length; i++) {
+        totalSeconds += buffered.end(i) - buffered.start(i);
+    }
+    
+    return {
+        ranges: buffered.length,
+        totalSeconds
+    };
+}
+
 // Attempt reconnection with exponential backoff
 function attemptReconnection() {
     // Don't try to reconnect if we're not supposed to be playing
@@ -619,7 +583,8 @@ function attemptReconnection() {
             
             // Try playback with fresh source and new audio element
             const timestamp = Date.now(); // Prevent caching
-            state.audioElement.src = `/direct-stream?t=${timestamp}${isIOS ? '&platform=ios' : ''}`;
+            const platformParam = isAppleDevice ? '&platform=ios' : '';
+            state.audioElement.src = `/direct-stream?t=${timestamp}${platformParam}`;
             
             // Add a small delay before playing to ensure the browser is ready
             setTimeout(() => {
