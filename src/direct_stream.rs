@@ -92,9 +92,11 @@ impl<'r> Responder<'r, 'static> for DirectStream {
                 
             info!("Starting stream at position {}s (byte offset: {})", server_position, start_position);
             
-            // Instead of streaming manually, just return the file directly
-            // Rocket will handle the streaming for us
-            let mut response = Response::build()
+            // Fix: Create a response builder and store it in a variable
+            let mut response_builder = Response::build();
+            
+            // Add all headers
+            response_builder
                 .header(ContentType::new("audio", "mpeg"))
                 .header(Header::new("Accept-Ranges", "bytes"))
                 .header(Header::new("Content-Disposition", "inline"))
@@ -123,7 +125,7 @@ impl<'r> Responder<'r, 'static> for DirectStream {
                 }
                 
                 // Create the response with the body
-                return Ok(response.sized_body(body.len(), io::Cursor::new(body)).finalize());
+                return Ok(response_builder.sized_body(body.len(), io::Cursor::new(body)).finalize());
             } else {
                 error!("Error opening file: {}", file_path.display());
                 return Err(Status::InternalServerError);
