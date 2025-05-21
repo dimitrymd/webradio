@@ -1,4 +1,4 @@
-// main.rs - Updated to fix audio streaming issues
+// main.rs - Updated for direct streaming
 
 extern crate rocket;
 
@@ -15,7 +15,7 @@ mod utils;
 mod direct_stream; // Import the direct stream module
 
 use crate::services::streamer::StreamManager;
-use crate::services::websocket_bus::WebSocketBus;
+use crate::services::websocket_bus::WebSocketBus; // Keep for backward compatibility
 use crate::services::playlist;
 
 #[launch]
@@ -24,10 +24,9 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     env_logger::init();
     
     println!("============================================================");
-    println!("Starting Rust MP3 Web Radio (Direct Streaming Architecture)");
+    println!("Starting Rust MP3 Web Radio (Universal Streaming Edition)");
     println!("Music folder: {}", config::MUSIC_FOLDER.display());
     println!("Chunk size: {}, Buffer size: {}", config::CHUNK_SIZE, config::BUFFER_SIZE);
-    println!("WebSocket ping interval: {}ms", config::WS_PING_INTERVAL_MS);
     println!("============================================================");
 
     // Initialize the stream manager with the configuration values
@@ -38,8 +37,8 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         config::STREAM_CACHE_TIME,
     ));
     
-    // We still need WebSocketBus for StreamManager integration, 
-    // but clients won't connect to it
+    // We still need WebSocketBus for backward compatibility
+    // but we'll primarily use direct streaming
     let websocket_bus = Arc::new(WebSocketBus::new(stream_manager.clone()));
     
     // Rescan and update durations before starting
@@ -87,17 +86,17 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     // Build and launch the Rocket instance
     rocket::build()
         .manage(stream_manager.clone())
-        .manage(websocket_bus.clone())
-        .attach(WebSocketFairing)  // Keep this for WebSocketBus initialization
+        .manage(websocket_bus.clone()) // Keep for backward compatibility
+        .attach(WebSocketFairing) // Keep for backward compatibility
         .mount("/", routes![
             handlers::index,
             handlers::now_playing,
             handlers::get_stats,
-            // Stream endpoints with updated route paths
+            // Direct streaming endpoints
             direct_stream::direct_stream,
-            direct_stream::direct_stream_range,  // Updated range request endpoint
-            direct_stream::direct_stream_head,
             direct_stream::stream_status,
+            // Keep WebSocket endpoint for backward compatibility
+            handlers::stream_ws, 
             handlers::static_files,
             handlers::diagnostic_page,
         ])
@@ -109,8 +108,7 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         .attach(Template::fairing())
 }
 
-// Keeping the WebSocketFairing for compatibility with existing code
-// We can remove this later when fully migrating away from WebSockets
+// Keep the WebSocketFairing for backward compatibility
 struct WebSocketFairing;
 
 #[rocket::async_trait]
@@ -125,7 +123,7 @@ impl rocket::fairing::Fairing for WebSocketFairing {
     async fn on_ignite(&self, rocket: rocket::Rocket<rocket::Build>) -> rocket::fairing::Result {
         // Get the WebSocketBus from managed state
         if let Some(websocket_bus) = rocket.state::<Arc<WebSocketBus>>() {
-            println!("Starting WebSocket broadcast loop from Rocket runtime...");
+            println!("Starting WebSocket broadcast loop for legacy support...");
             
             // Clone the bus and start the broadcast loop
             let bus = websocket_bus.clone();

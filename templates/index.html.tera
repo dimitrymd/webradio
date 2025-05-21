@@ -1,4 +1,3 @@
-<!-- Updated index.html.tera template -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -39,14 +38,7 @@
             position: relative;
         }
 
-        .logo img {
-            width: 200px;
-            height: auto;
-        }
-
         .logo h1 {
-            position: absolute;
-            bottom: -20px;
             font-size: 28px;
             color: #333;
             font-weight: bold;
@@ -123,6 +115,32 @@
             box-shadow: 0 2px 5px rgba(0,0,0,0.1);
         }
 
+        button:disabled {
+            background-color: #95a5a6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        #start-btn {
+            background-color: #2ecc71;
+        }
+
+        #start-btn:hover {
+            background-color: #27ae60;
+        }
+
+        #start-btn:disabled {
+            background-color: #95a5a6;
+        }
+
+        #mute-btn {
+            background-color: #3498db;
+        }
+
+        #mute-btn:hover {
+            background-color: #2980b9;
+        }
+
         .listeners {
             margin-top: 10px;
             font-size: 14px;
@@ -161,12 +179,35 @@
             font-size: 14px;
             color: #888;
         }
+        
+        /* Mobile optimizations */
+        @media (max-width: 768px) {
+            .player {
+                margin: 15px;
+                padding: 15px;
+                border-radius: 10px;
+            }
+            
+            .controls {
+                flex-direction: column;
+                gap: 10px;
+                align-items: stretch;
+            }
+            
+            .volume-control {
+                width: 100%;
+            }
+            
+            button {
+                width: 100%;
+                padding: 12px;
+            }
+        }
     </style>
 </head>
 <body>
     <div class="player">
         <div class="logo">
-            <img src="/static/images/cillout-radio-logo.png" alt="ChillOut Radio Logo">
             <h1>ChillOut Radio</h1>
         </div>
         
@@ -203,7 +244,7 @@
         </div>
     </div>
 
-    <!-- Direct streaming player (replaces all previous player scripts) -->
-    <script src="/static/js/direct-only-player.js"></script>
+    <!-- Universal player script -->
+    <script src="/static/js/universal-player.js"></script>
 </body>
 </html>
