@@ -1,12 +1,12 @@
-// direct_stream.rs - Fixed implementation for direct streaming
+// direct_stream.rs - Improved implementation for direct streaming
 
 use rocket::http::{ContentType, Header, Status};
 use rocket::response::{self, Responder, Response};
 use rocket::State;
 use rocket::Request;
 use std::sync::Arc;
-use std::time::Instant;
-use log::{info, warn, debug};
+use std::time::{Duration, Instant};
+use log::{info, warn, debug, error};
 
 use crate::services::streamer::StreamManager;
 use crate::config;
@@ -22,13 +22,14 @@ impl DirectStream {
     }
 }
 
-// Client info detection
+// Enhanced client info detection
 struct ClientInfo {
     is_ios: bool,
     is_safari: bool,
     is_mobile: bool,
     is_slow_device: bool,
     supports_ranges: bool,
+    requested_large_buffer: bool,
 }
 
 fn detect_client(request: &Request) -> ClientInfo {
@@ -47,12 +48,31 @@ fn detect_client(request: &Request) -> ClientInfo {
     // Check if client sent range header (supports ranges)
     let supports_ranges = request.headers().get_one("Range").is_some();
     
+    // Check query parameters for buffer and platform settings
+    let requested_large_buffer = request.uri().query()
+        .map(|q| q.contains("buffer=large"))
+        .unwrap_or(false);
+    
+    // Check platform parameter (using Rocket compatible methods)
+    let is_ios_param = request.uri().query()
+        .map(|q| q.contains("platform=ios"))
+        .unwrap_or(false);
+        
+    let is_safari_param = request.uri().query()
+        .map(|q| q.contains("platform=safari"))
+        .unwrap_or(false);
+    
+    // Override detection based on explicit platform parameter
+    let is_ios_override = is_ios_param || is_ios;
+    let is_safari_override = is_safari_param || (is_safari && !is_ios_override);
+    
     ClientInfo {
-        is_ios,
-        is_safari,
+        is_ios: is_ios_override,
+        is_safari: is_safari_override,
         is_mobile,
         is_slow_device,
         supports_ranges,
+        requested_large_buffer,
     }
 }
 
@@ -65,12 +85,13 @@ impl<'r> Responder<'r, 'static> for DirectStream {
         // Detect client browser and capabilities
         let client = detect_client(request);
         
-        // Log connection info
+        // Log connection info with more details
         if client.is_mobile {
-            info!("Direct stream request from mobile device (iOS: {}, Safari: {})", 
-                  client.is_ios, client.is_safari);
+            info!("Direct stream request from mobile device (iOS: {}, Safari: {}, LargeBuffer: {})", 
+                  client.is_ios, client.is_safari, client.requested_large_buffer);
         } else {
-            info!("Direct stream request from desktop (Safari: {})", client.is_safari);
+            info!("Direct stream request from desktop (Safari: {}, LargeBuffer: {})", 
+                  client.is_safari, client.requested_large_buffer);
         }
         
         // Create response with appropriate headers
@@ -90,18 +111,33 @@ impl<'r> Responder<'r, 'static> for DirectStream {
                 .header(Header::new("Accept-Ranges", "bytes"))
                 .header(Header::new("X-Accel-Buffering", "no"));
         }
+        
+        // Add explicit content length for some browsers if we know the playlist duration
+        if let Some(track) = crate::services::playlist::get_current_track(&crate::config::PLAYLIST_FILE, &crate::config::MUSIC_FOLDER) {
+            if track.duration > 0 {
+                // For iOS devices, setting a large content length can help with buffering
+                if client.is_ios {
+                    // Estimate byte size based on bitrate (assuming 128kbps average)
+                    let estimated_bytes = track.duration * 16000; // 16KB per second
+                    response_builder = response_builder.header(Header::new("X-Content-Duration", track.duration.to_string()));
+                }
+            }
+        }
             
         // Create stream body with platform-specific settings
-        let initial_buffer_size = if client.is_ios {
-            // iOS needs more initial buffer
-            debug!("Using larger initial buffer for iOS");
-            30 
+        let initial_buffer_size = if client.is_ios || client.requested_large_buffer {
+            // iOS needs much more initial buffer
+            debug!("Using extra large initial buffer for iOS");
+            60 // Significantly increased from 30
+        } else if client.is_safari {
+            // Safari needs more buffer than Chrome
+            45
         } else if client.is_mobile {
             // Mobile devices need a decent buffer
-            20
+            30 // Increased from 20
         } else {
             // Desktop can start with a smaller buffer as it downloads faster
-            15
+            20 // Increased from 15
         };
         
         // Finalize response with streamed body
@@ -117,9 +153,13 @@ impl<'r> Responder<'r, 'static> for DirectStream {
                 initial_chunks_sent: false,
                 initial_buffer_size,
                 is_ios: client.is_ios,
+                is_safari: client.is_safari,
                 is_mobile: client.is_mobile,
+                requested_large_buffer: client.requested_large_buffer,
                 last_log_time: Instant::now(),
-                buffer: Vec::with_capacity(config::CHUNK_SIZE * 2),
+                buffer: Vec::with_capacity(config::CHUNK_SIZE * 4), // Increased buffer capacity
+                send_delay: if client.is_ios { Duration::from_millis(40) } else { Duration::from_millis(20) },
+                last_send_time: Instant::now(),
             })
             .finalize();
         
@@ -137,9 +177,13 @@ struct DirectStreamBody {
     initial_chunks_sent: bool,
     initial_buffer_size: usize,
     is_ios: bool,
+    is_safari: bool,
     is_mobile: bool,
+    requested_large_buffer: bool,
     last_log_time: Instant,
     buffer: Vec<u8>,
+    send_delay: Duration,
+    last_send_time: Instant,
 }
 
 impl DirectStreamBody {
@@ -178,6 +222,31 @@ impl rocket::tokio::io::AsyncRead for DirectStreamBody {
         // Get a handle to our mutable self without fighting the borrowck
         let this = &mut *self;
         
+        // Implement rate limiting for smoother streaming
+        let now = Instant::now();
+        if now.duration_since(this.last_send_time) < this.send_delay && !this.buffer.is_empty() {
+            // We're sending too fast, wait a bit
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        
+        // If we have data in buffer, send it without fetching more
+        if !this.buffer.is_empty() {
+            let bytes_to_copy = std::cmp::min(this.buffer.len(), buf.remaining());
+            buf.put_slice(&this.buffer[..bytes_to_copy]);
+            this.bytes_sent += bytes_to_copy;
+            
+            // Update buffer if we didn't consume all of it
+            if bytes_to_copy < this.buffer.len() {
+                this.buffer = this.buffer[bytes_to_copy..].to_vec();
+            } else {
+                this.buffer.clear();
+            }
+            
+            this.last_send_time = now;
+            return Poll::Ready(Ok(()));
+        }
+        
         // If this is the first call, send ID3 header
         if !this.id3_header_sent {
             let (id3_header, _saved_chunks) = this.stream_manager.get_chunks_from_current_position();
@@ -198,6 +267,7 @@ impl rocket::tokio::io::AsyncRead for DirectStreamBody {
                 this.id3_header_sent = true;
                 this.chunks_sent += 1;
                 this.bytes_sent += bytes_to_copy;
+                this.last_send_time = now;
                 
                 // Return if we've written anything
                 if bytes_to_copy > 0 {
@@ -215,11 +285,12 @@ impl rocket::tokio::io::AsyncRead for DirectStreamBody {
             let (_, saved_chunks) = this.stream_manager.get_chunks_from_current_position();
             
             if !saved_chunks.is_empty() {
-                // If we have saved chunks and the buffer is empty, fill it with the first chunk
+                // If we have saved chunks and the buffer is empty, fill it with chunks
                 if this.buffer.is_empty() {
-                    // Get a good amount of initial chunks
-                    let start_idx = if saved_chunks.len() > this.initial_buffer_size { 
-                        saved_chunks.len() - this.initial_buffer_size 
+                    // Get a good amount of initial chunks based on device type
+                    let initial_buffer_size = this.initial_buffer_size;
+                    let start_idx = if saved_chunks.len() > initial_buffer_size { 
+                        saved_chunks.len() - initial_buffer_size 
                     } else { 
                         0 
                     };
@@ -230,15 +301,30 @@ impl rocket::tokio::io::AsyncRead for DirectStreamBody {
                             this.buffer.extend_from_slice(chunk);
                             this.chunks_sent += 1;
                             
-                            // If buffer gets big, stop adding more chunks
-                            if this.buffer.len() > config::CHUNK_SIZE * 10 {
+                            // If buffer gets very big, stop adding more chunks
+                            // The buffer size is higher for iOS devices to ensure smooth playback
+                            let max_buffer = if this.is_ios || this.requested_large_buffer {
+                                config::CHUNK_SIZE * 15  // Much larger initial buffer for iOS
+                            } else if this.is_safari {
+                                config::CHUNK_SIZE * 12  // Larger for Safari
+                            } else {
+                                config::CHUNK_SIZE * 10  // Standard for other browsers
+                            };
+                            
+                            if this.buffer.len() > max_buffer {
                                 break;
                             }
                         }
                     }
                     
-                    debug!("Initial buffer filled with {} bytes from {} chunks", 
-                          this.buffer.len(), this.chunks_sent - 1); // -1 because ID3 was counted
+                    debug!("Initial buffer filled with {} bytes from {} chunks (target: {})", 
+                          this.buffer.len(), this.chunks_sent - 1, initial_buffer_size); 
+                    
+                    // If we're on iOS or requested large buffer, log more detailed info
+                    if this.is_ios || this.requested_large_buffer {
+                        info!("iOS device: Prepared large initial buffer of {} bytes from {} chunks", 
+                              this.buffer.len(), this.chunks_sent - 1);
+                    }
                 }
                 
                 // If we have data in the buffer, send it
@@ -246,13 +332,20 @@ impl rocket::tokio::io::AsyncRead for DirectStreamBody {
                     let bytes_to_copy = std::cmp::min(this.buffer.len(), buf.remaining());
                     buf.put_slice(&this.buffer[..bytes_to_copy]);
                     this.bytes_sent += bytes_to_copy;
+                    this.last_send_time = now;
                     
                     // Update buffer if we didn't consume all of it
                     if bytes_to_copy < this.buffer.len() {
                         this.buffer = this.buffer[bytes_to_copy..].to_vec();
                     } else {
                         this.buffer.clear();
-                        this.initial_chunks_sent = true; // Mark initial chunks as sent if buffer is empty
+                        
+                        // Only mark initial chunks as sent if we've sent enough of them
+                        // For iOS, we need to be more conservative to ensure smooth playback
+                        if this.chunks_sent > this.initial_buffer_size / 2 {
+                            this.initial_chunks_sent = true;
+                            debug!("Initial buffer fully sent, switching to stream mode");
+                        }
                     }
                     
                     return Poll::Ready(Ok(()));
@@ -264,22 +357,6 @@ impl rocket::tokio::io::AsyncRead for DirectStreamBody {
                 // No saved chunks, mark as sent anyway
                 this.initial_chunks_sent = true;
             }
-        }
-        
-        // After initial data, if buffer still has data, send it
-        if !this.buffer.is_empty() {
-            let bytes_to_copy = std::cmp::min(this.buffer.len(), buf.remaining());
-            buf.put_slice(&this.buffer[..bytes_to_copy]);
-            this.bytes_sent += bytes_to_copy;
-            
-            // Update buffer if we didn't consume all of it
-            if bytes_to_copy < this.buffer.len() {
-                this.buffer = this.buffer[bytes_to_copy..].to_vec();
-            } else {
-                this.buffer.clear();
-            }
-            
-            return Poll::Ready(Ok(()));
         }
         
         // Get a broadcast receiver to receive new chunks
@@ -294,6 +371,7 @@ impl rocket::tokio::io::AsyncRead for DirectStreamBody {
                     buf.put_slice(&chunk[..bytes_to_copy]);
                     this.chunks_sent += 1;
                     this.bytes_sent += bytes_to_copy;
+                    this.last_send_time = now;
                     
                     // If we didn't copy the whole chunk, save the rest
                     if bytes_to_copy < chunk.len() {
@@ -332,7 +410,17 @@ impl rocket::tokio::io::AsyncRead for DirectStreamBody {
                 warn!("Direct stream lagged behind by {} messages", skipped);
                 
                 // Reset receiver
-                let _ = this.stream_manager.get_broadcast_receiver();
+                broadcast_rx = this.stream_manager.get_broadcast_receiver();
+                
+                // For iOS devices, we need to be more careful about lagging
+                if this.is_ios && skipped > 100 {
+                    error!("iOS device experienced significant lag ({} messages). Sending signal to restart", skipped);
+                    // Send a special signal to force client to reconnect
+                    let error_signal = vec![0xFF, 0xFF, 0xFF, 0xFF];
+                    let bytes_to_copy = std::cmp::min(error_signal.len(), buf.remaining());
+                    buf.put_slice(&error_signal[..bytes_to_copy]);
+                    return Poll::Ready(Ok(()));
+                }
                 
                 // Keep polling
                 cx.waker().wake_by_ref();
@@ -354,9 +442,32 @@ pub fn direct_stream(stream_manager: &State<Arc<StreamManager>>) -> DirectStream
 
 // Add additional route to help with browser quirks
 #[rocket::head("/direct-stream")]
-pub fn direct_stream_head(stream_manager: &State<Arc<StreamManager>>) -> response::status::Accepted<&'static str> {
+pub fn direct_stream_head(stream_manager: &State<Arc<StreamManager>>) -> rocket::serde::json::Json<serde_json::Value> {
     // Some browsers send HEAD requests before streaming
-    response::status::Accepted("Audio stream available")
+    // Return metadata about the current track
+    let active_listeners = stream_manager.get_active_listeners();
+    let current_bitrate = stream_manager.get_current_bitrate() / 1000; // Convert to kbps
+    
+    // Get current track info
+    let track_info = if let Some(track) = crate::services::playlist::get_current_track(&crate::config::PLAYLIST_FILE, &crate::config::MUSIC_FOLDER) {
+        serde_json::json!({
+            "title": track.title,
+            "artist": track.artist,
+            "album": track.album,
+            "duration": track.duration
+        })
+    } else {
+        serde_json::json!({ "error": "No track available" })
+    };
+    
+    rocket::serde::json::Json(serde_json::json!({
+        "status": "available",
+        "listeners": active_listeners,
+        "bitrate": current_bitrate,
+        "current_track": track_info,
+        "stream_url": "/direct-stream",
+        "server_time": chrono::Local::now().to_rfc3339()
+    }))
 }
 
 // Add route for checking stream status (for player healthchecks)
@@ -365,12 +476,29 @@ pub fn stream_status(stream_manager: &State<Arc<StreamManager>>) -> rocket::serd
     let sm = stream_manager.inner();
     let is_streaming = sm.is_streaming();
     let active_listeners = sm.get_active_listeners();
-    let _current_track = sm.get_track_info();
+    let current_bitrate = sm.get_current_bitrate() / 1000; // Convert to kbps
+    let playback_position = sm.get_playback_position();
+    
+    // Get detailed track info
+    let track_info = if let Some(track) = crate::services::playlist::get_current_track(&crate::config::PLAYLIST_FILE, &crate::config::MUSIC_FOLDER) {
+        serde_json::json!({
+            "title": track.title,
+            "artist": track.artist,
+            "album": track.album,
+            "duration": track.duration,
+            "position": playback_position
+        })
+    } else {
+        serde_json::json!(null)
+    };
     
     let status = serde_json::json!({
         "status": if is_streaming { "streaming" } else { "stopped" },
         "active_listeners": active_listeners,
         "stream_available": true,
+        "playback_position": playback_position,
+        "bitrate_kbps": current_bitrate,
+        "current_track": track_info,
         "server_time": chrono::Local::now().to_rfc3339()
     });
     
