@@ -1,5 +1,7 @@
-use std::fs::{self, DirEntry};
-use std::path::{Path, PathBuf};
+// src/utils/mp3_scanner.rs - Fixed imports
+
+use std::fs;
+use std::path::Path;
 use id3::{Tag, TagLike};
 use mp3_duration;
 use log::{info, error};
