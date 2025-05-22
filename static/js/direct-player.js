@@ -1,4 +1,4 @@
-// static/js/direct-player.js - Clean direct streaming only player
+// static/js/direct-player.js - Complete enhanced version with position persistence and better sync
 
 // Configuration constants
 const config = {
@@ -13,15 +13,17 @@ const config = {
     RECONNECT_MIN_DELAY: 1000,       // Minimum reconnection delay
     RECONNECT_MAX_DELAY: 8000,       // Maximum reconnection delay
     
-    // Track transition
+    // Track transition and position sync
     TRACK_CHANGE_GRACE_PERIOD: 2000, // Time to wait before reconnecting on track change
+    POSITION_SYNC_TOLERANCE: 3,      // Seconds tolerance for position synchronization
+    POSITION_SAVE_INTERVAL: 5000,    // How often to save position to localStorage
     
     // iOS-specific settings
     IOS_INTERACTION_TIMEOUT: 10000,  // How long to wait for user interaction on iOS
     IOS_RETRY_DELAY: 2000,           // Delay before retrying on iOS
 };
 
-// Player state
+// Enhanced player state with position persistence
 const state = {
     // Audio element and management
     audioElement: null,
@@ -38,16 +40,30 @@ const state = {
     reconnectAttempts: 0,
     isReconnecting: false,
     
-    // Track info and transitions
+    // Enhanced track info and position tracking
     currentTrackId: null,
     currentTrack: null,
     serverPosition: 0,
+    serverPositionMs: 0,
     trackChangeDetected: false,
     trackChangeTime: 0,
+    
+    // Position persistence and synchronization
+    lastKnownPosition: 0,
+    positionSyncTime: 0,
+    disconnectionTime: null,
+    maxReconnectGap: 10000, // 10 seconds max gap for position continuity
+    lastPositionSave: 0,
+    positionDriftCorrection: 0,
+    
+    // Client-side position estimation
+    clientStartTime: null,
+    clientPositionOffset: 0,
     
     // Timers
     nowPlayingTimer: null,
     connectionHealthTimer: null,
+    positionSaveTimer: null,
     
     // Platform detection
     isIOS: /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream,
@@ -76,7 +92,7 @@ const progressBar = document.getElementById('progress-bar');
 
 // Initialize the player
 function initPlayer() {
-    log("Initializing ChillOut Radio player");
+    log("Initializing ChillOut Radio player with enhanced position sync");
     log(`Platform: ${state.isMobile ? 'Mobile' : 'Desktop'}, iOS: ${state.isIOS}, Safari: ${state.isSafari}`);
     
     // Verify all required elements are present
@@ -94,13 +110,17 @@ function initPlayer() {
         setupIOSOptimizations();
     }
     
-    // Load saved settings
+    // Load saved settings and position
     loadSavedSettings();
+    loadPositionFromStorage();
+    
+    // Set up position saving timer
+    state.positionSaveTimer = setInterval(savePositionToStorage, config.POSITION_SAVE_INTERVAL);
     
     // Fetch initial track info
     fetchNowPlaying();
     
-    log('ChillOut Radio player initialized successfully');
+    log('ChillOut Radio player initialized successfully with position persistence');
     showStatus('Player ready - click Connect to start streaming', false, false);
 }
 
@@ -160,7 +180,7 @@ function setupEventListeners() {
 
 // iOS-specific optimizations
 function setupIOSOptimizations() {
-    log("Setting up iOS optimizations", 'IOS');
+    log("Setting up iOS optimizations with position sync", 'IOS');
     
     // Prevent iOS from sleeping during playback
     if ('wakeLock' in navigator) {
@@ -173,9 +193,11 @@ function setupIOSOptimizations() {
     document.addEventListener('visibilitychange', function() {
         if (state.isPlaying && state.audioElement) {
             if (document.hidden) {
-                log("App went to background", 'IOS');
+                log("App went to background, recording position", 'IOS');
+                state.disconnectionTime = Date.now();
+                state.lastKnownPosition = getCurrentEstimatedPosition();
             } else {
-                log("App came to foreground", 'IOS');
+                log("App came to foreground, checking position sync", 'IOS');
                 setTimeout(() => {
                     if (state.isPlaying && state.audioElement && state.audioElement.paused) {
                         log("Audio paused after background return, attempting recovery", 'IOS');
@@ -215,6 +237,43 @@ function unlockIOSAudio(event) {
     }
 }
 
+// Enhanced position estimation
+function getCurrentEstimatedPosition() {
+    if (!state.clientStartTime) {
+        return state.serverPosition;
+    }
+    
+    const clientElapsed = (Date.now() - state.clientStartTime) / 1000;
+    const estimatedPosition = state.clientPositionOffset + clientElapsed;
+    
+    // Apply any drift correction
+    const correctedPosition = estimatedPosition + state.positionDriftCorrection;
+    
+    // Bound by track duration
+    if (state.currentTrack && state.currentTrack.duration) {
+        return Math.min(correctedPosition, state.currentTrack.duration);
+    }
+    
+    return Math.max(0, correctedPosition);
+}
+
+// Calculate position drift and apply correction
+function calculatePositionDrift(serverPosition, clientEstimate) {
+    const drift = serverPosition - clientEstimate;
+    const absDrift = Math.abs(drift);
+    
+    if (absDrift > config.POSITION_SYNC_TOLERANCE) {
+        log(`Position drift detected: ${drift.toFixed(2)}s (server: ${serverPosition}s, client: ${clientEstimate.toFixed(2)}s)`, 'SYNC');
+        
+        // Apply gradual correction to avoid jarring jumps
+        state.positionDriftCorrection += drift * 0.1; // 10% correction per update
+        
+        return true; // Significant drift detected
+    }
+    
+    return false; // Within tolerance
+}
+
 // Load saved settings from localStorage
 function loadSavedSettings() {
     try {
@@ -234,9 +293,52 @@ function loadSavedSettings() {
     }
 }
 
-// Start audio playback with fresh position sync
+// Load position from localStorage
+function loadPositionFromStorage() {
+    try {
+        const saved = localStorage.getItem('radioPosition');
+        if (saved) {
+            const data = JSON.parse(saved);
+            const age = Date.now() - data.timestamp;
+            
+            // Only use if less than 30 seconds old
+            if (age < 30000) {
+                state.lastKnownPosition = data.position + Math.floor(age / 1000);
+                log(`Loaded saved position: ${state.lastKnownPosition}s (age: ${Math.floor(age/1000)}s)`, 'STORAGE');
+                return data;
+            }
+        }
+    } catch (e) {
+        log(`Error loading position: ${e.message}`, 'STORAGE');
+    }
+    return null;
+}
+
+// Save position to localStorage
+function savePositionToStorage() {
+    try {
+        if (state.currentTrackId && state.isPlaying) {
+            const currentPos = getCurrentEstimatedPosition();
+            const positionData = {
+                trackId: state.currentTrackId,
+                position: currentPos,
+                timestamp: Date.now()
+            };
+            localStorage.setItem('radioPosition', JSON.stringify(positionData));
+            state.lastPositionSave = Date.now();
+            
+            if (config.DEBUG_MODE) {
+                log(`Saved position: ${currentPos.toFixed(1)}s`, 'STORAGE');
+            }
+        }
+    } catch (e) {
+        // Ignore storage errors
+    }
+}
+
+// Start audio playback with enhanced position sync
 function startAudio() {
-    log('Starting audio playback', 'CONTROL');
+    log('Starting audio playback with enhanced position sync', 'CONTROL');
     
     if (state.isPlaying || state.isReconnecting) {
         log('Already playing or reconnecting, ignoring start request', 'CONTROL');
@@ -252,10 +354,15 @@ function startAudio() {
     state.reconnectAttempts = 0;
     state.trackChangeDetected = false;
     state.pendingPlay = false;
+    state.positionDriftCorrection = 0;
     
     // Get fresh track info and position before starting playback
     fetchNowPlaying().then(() => {
-        log(`Starting playback with server position: ${state.serverPosition}s`, 'CONTROL');
+        log(`Starting playback with server position: ${state.serverPosition}s + ${state.serverPositionMs}ms`, 'CONTROL');
+        
+        // Initialize client position tracking
+        state.clientStartTime = Date.now();
+        state.clientPositionOffset = state.serverPosition;
         
         // Clean up existing audio element safely
         cleanupAudioElement().then(() => {
@@ -266,6 +373,16 @@ function startAudio() {
     }).catch(() => {
         // If fetch fails, still try to start with current position
         log('Failed to fetch current position, using last known position', 'CONTROL');
+        
+        // Use saved position if available
+        const savedPos = loadPositionFromStorage();
+        if (savedPos && savedPos.trackId === state.currentTrackId) {
+            state.serverPosition = savedPos.position;
+            log(`Using saved position: ${state.serverPosition}s`, 'CONTROL');
+        }
+        
+        state.clientStartTime = Date.now();
+        state.clientPositionOffset = state.serverPosition;
         
         cleanupAudioElement().then(() => {
             createAudioElement();
@@ -316,6 +433,9 @@ function setupAudioListeners() {
         showStatus('Audio playing');
         state.trackChangeDetected = false;
         state.pendingPlay = false;
+        
+        // Reset position tracking when playback starts
+        state.clientStartTime = Date.now();
     });
     
     state.audioElement.addEventListener('waiting', () => {
@@ -373,16 +493,22 @@ function setupAudioListeners() {
         }
     });
     
-    // Progress monitoring
+    // Enhanced progress monitoring with client-side estimation
     state.audioElement.addEventListener('timeupdate', () => {
         if (state.audioElement && !state.isCleaningUp && state.currentTrack && state.currentTrack.duration) {
-            updateProgressBar(state.audioElement.currentTime, state.currentTrack.duration);
+            // Use client-side position estimation for smoother progress
+            const estimatedPosition = getCurrentEstimatedPosition();
+            updateProgressBar(estimatedPosition, state.currentTrack.duration);
         }
     });
 }
 
 // Handle iOS-specific errors
 function handleIOSError(errorCode, errorMsg) {
+    // Record position before handling error
+    state.lastKnownPosition = getCurrentEstimatedPosition();
+    state.disconnectionTime = Date.now();
+    
     if (errorCode === 4) {
         if (state.trackChangeDetected && Date.now() - state.trackChangeTime < config.TRACK_CHANGE_GRACE_PERIOD) {
             log('iOS: Error during track change grace period, waiting...', 'IOS');
@@ -404,6 +530,10 @@ function handleIOSError(errorCode, errorMsg) {
 
 // Handle standard browser errors
 function handleStandardError(errorCode, errorMsg) {
+    // Record position before handling error
+    state.lastKnownPosition = getCurrentEstimatedPosition();
+    state.disconnectionTime = Date.now();
+    
     if (errorCode === 4) {
         if (state.trackChangeDetected && Date.now() - state.trackChangeTime < config.TRACK_CHANGE_GRACE_PERIOD) {
             log('Error during track change grace period, waiting...', 'AUDIO');
@@ -491,6 +621,15 @@ function setupTimers() {
 function stopAudio(isError = false) {
     log(`Stopping audio playback${isError ? ' (due to error)' : ''}`, 'CONTROL');
     
+    // Record disconnection time and position for continuity
+    if (isError && state.isPlaying) {
+        state.disconnectionTime = Date.now();
+        state.lastKnownPosition = getCurrentEstimatedPosition();
+        log(`Recorded disconnection at position ${state.lastKnownPosition.toFixed(1)}s`, 'SYNC');
+    } else {
+        state.disconnectionTime = null;
+    }
+    
     state.isPlaying = false;
     state.isReconnecting = false;
     state.pendingPlay = false;
@@ -534,7 +673,7 @@ function toggleConnection() {
     }
 }
 
-// Start direct HTTP streaming with position synchronization
+// Start direct HTTP streaming with enhanced position synchronization
 function startDirectPlayback() {
     if (!state.audioElement) {
         log('No audio element available for playback', 'PLAYBACK', true);
@@ -544,16 +683,30 @@ function startDirectPlayback() {
     try {
         const timestamp = Date.now();
         
-        // Always use the most current server position for synchronization
-        const position = state.serverPosition || 0;
+        // Determine the best position for synchronization
+        let syncPosition = state.serverPosition;
         
-        // Create URL with platform-specific parameters for chunked streaming
+        // If this is a reconnection within the gap threshold, try to use estimated position
+        if (state.disconnectionTime && (timestamp - state.disconnectionTime) < state.maxReconnectGap) {
+            const timeSinceDisconnect = (timestamp - state.disconnectionTime) / 1000;
+            const estimatedPosition = state.lastKnownPosition + timeSinceDisconnect;
+            
+            // Use estimated position if it's reasonable and close to server position
+            if (Math.abs(estimatedPosition - state.serverPosition) < config.POSITION_SYNC_TOLERANCE) {
+                syncPosition = Math.floor(estimatedPosition);
+                log(`Using continuity position: ${syncPosition}s (estimated: ${estimatedPosition.toFixed(1)}s, server: ${state.serverPosition}s)`, 'SYNC');
+            } else {
+                log(`Position gap too large, using server position: ${state.serverPosition}s (estimated: ${estimatedPosition.toFixed(1)}s)`, 'SYNC');
+            }
+        }
+        
+        // Create URL with enhanced position synchronization
         let streamUrl = `/direct-stream?t=${timestamp}`;
         
-        // Always include position for synchronization (don't make it conditional)
-        streamUrl += `&position=${position}`;
+        // Always include position for synchronization
+        streamUrl += `&position=${syncPosition}`;
         
-        // Add platform info
+        // Add platform info for optimized streaming
         if (state.isIOS) {
             streamUrl += '&platform=ios';
         } else if (state.isSafari) {
@@ -562,7 +715,12 @@ function startDirectPlayback() {
             streamUrl += '&platform=mobile';
         }
         
-        log(`Using position-synchronized stream URL: ${streamUrl} (position: ${position}s)`, 'PLAYBACK');
+        log(`Using enhanced position-synchronized stream URL: ${streamUrl} (position: ${syncPosition}s)`, 'PLAYBACK');
+        
+        // Update client position tracking
+        state.clientStartTime = Date.now();
+        state.clientPositionOffset = syncPosition;
+        state.disconnectionTime = null;
         
         // Set the audio source safely
         if (state.audioElement && !state.isCleaningUp) {
@@ -811,7 +969,7 @@ function checkStandardHealth() {
     }
 }
 
-// Attempt reconnection
+// Enhanced reconnection with position continuity
 function attemptReconnection(reason = 'unknown') {
     if (state.isReconnecting) {
         log(`Reconnection already in progress, ignoring request (reason: ${reason})`, 'CONTROL');
@@ -830,6 +988,10 @@ function attemptReconnection(reason = 'unknown') {
         return;
     }
     
+    // Record position and time for continuity
+    state.lastKnownPosition = getCurrentEstimatedPosition();
+    state.disconnectionTime = Date.now();
+    
     state.isReconnecting = true;
     state.reconnectAttempts++;
     
@@ -841,7 +1003,7 @@ function attemptReconnection(reason = 'unknown') {
     const iosMultiplier = state.isIOS ? 1.5 : 1;
     const delay = (baseDelay * iosMultiplier) + (Math.random() * 500);
     
-    log(`Reconnection attempt ${state.reconnectAttempts}/${config.RECONNECT_ATTEMPTS} in ${delay/1000}s (reason: ${reason})`, 'CONTROL');
+    log(`Reconnection attempt ${state.reconnectAttempts}/${config.RECONNECT_ATTEMPTS} in ${delay/1000}s (reason: ${reason}, pos: ${state.lastKnownPosition.toFixed(1)}s)`, 'CONTROL');
     showStatus(`Reconnecting (${state.reconnectAttempts}/${config.RECONNECT_ATTEMPTS})...`, true, false);
     
     cleanupAudioElement().then(() => {
@@ -873,7 +1035,7 @@ function attemptReconnection(reason = 'unknown') {
     });
 }
 
-// Update track info with better position synchronization
+// Enhanced track info update with position synchronization
 function updateTrackInfo(info) {
     try {
         if (info.error) {
@@ -884,18 +1046,59 @@ function updateTrackInfo(info) {
         const previousTrackId = state.currentTrackId;
         state.currentTrack = info;
         
-        // Always update server position when we get track info
+        // Enhanced position synchronization
         if (info.playback_position !== undefined) {
-            const oldPosition = state.serverPosition;
-            state.serverPosition = info.playback_position;
-            state.lastTrackInfoTime = Date.now();
+            const serverPosition = info.playback_position;
+            const serverPositionMs = info.playback_position_ms || 0;
+            const now = Date.now();
             
-            // Log position updates for debugging
-            if (config.DEBUG_MODE && Math.abs(oldPosition - state.serverPosition) > 2) {
-                log(`Server position updated: ${oldPosition}s -> ${state.serverPosition}s`, 'SYNC');
+            // Calculate client-side estimated position
+            const clientEstimate = getCurrentEstimatedPosition();
+            
+            // Check for position drift and apply correction
+            const significantDrift = calculatePositionDrift(serverPosition, clientEstimate);
+            
+            // Handle reconnections with position continuity
+            if (state.disconnectionTime && (now - state.disconnectionTime) < state.maxReconnectGap) {
+                const timeSinceDisconnect = (now - state.disconnectionTime) / 1000;
+                const continuityPosition = state.lastKnownPosition + timeSinceDisconnect;
+                
+                // Use continuity position if it's close to server position
+                if (Math.abs(continuityPosition - serverPosition) < config.POSITION_SYNC_TOLERANCE) {
+                    log(`Using position continuity: ${continuityPosition.toFixed(1)}s vs server: ${serverPosition}s`, 'SYNC');
+                    state.serverPosition = Math.floor(continuityPosition);
+                } else {
+                    log(`Position gap too large for continuity, syncing to server: ${serverPosition}s`, 'SYNC');
+                    state.serverPosition = serverPosition;
+                    // Reset client tracking
+                    state.clientStartTime = now;
+                    state.clientPositionOffset = serverPosition;
+                    state.positionDriftCorrection = 0;
+                }
+            } else {
+                // Normal position update
+                const oldPosition = state.serverPosition;
+                state.serverPosition = serverPosition;
+                state.serverPositionMs = serverPositionMs;
+                
+                if (significantDrift) {
+                    log(`Applying position correction due to drift`, 'SYNC');
+                    state.clientStartTime = now;
+                    state.clientPositionOffset = serverPosition;
+                }
+                
+                // Log significant position jumps for debugging
+                if (config.DEBUG_MODE && Math.abs(oldPosition - serverPosition) > 2) {
+                    log(`Server position update: ${oldPosition}s -> ${serverPosition}s`, 'SYNC');
+                }
             }
+            
+            state.lastKnownPosition = state.serverPosition;
+            state.lastTrackInfoTime = now;
+            state.disconnectionTime = null;
         }
         
+        // Track change detection
         const newTrackId = info.path;
         if (state.currentTrackId !== newTrackId) {
             log(`Track changed from "${previousTrackId}" to "${newTrackId}": ${info.title}`, 'TRACK');
@@ -904,8 +1107,12 @@ function updateTrackInfo(info) {
             state.trackChangeDetected = true;
             state.trackChangeTime = Date.now();
             
-            // Reset server position for new track
+            // Reset position tracking for new track
             state.serverPosition = 0;
+            state.serverPositionMs = 0;
+            state.clientStartTime = Date.now();
+            state.clientPositionOffset = 0;
+            state.positionDriftCorrection = 0;
             
             if (state.isPlaying && state.audioElement && !state.isReconnecting) {
                 const graceDelay = state.isIOS ? config.TRACK_CHANGE_GRACE_PERIOD * 1.5 : config.TRACK_CHANGE_GRACE_PERIOD;
@@ -932,9 +1139,10 @@ function updateTrackInfo(info) {
             currentDuration.textContent = formatTime(info.duration);
         }
         
-        // Update progress bar with server position (more accurate than audio element time)
-        if (state.serverPosition !== undefined && info.duration) {
-            updateProgressBar(state.serverPosition, info.duration);
+        // Update progress bar with enhanced position (client-side estimation)
+        if (state.currentTrack && state.currentTrack.duration) {
+            const displayPosition = getCurrentEstimatedPosition();
+            updateProgressBar(displayPosition, info.duration);
         }
         
         if (info.active_listeners !== undefined) {
@@ -970,7 +1178,7 @@ async function fetchNowPlaying() {
     }
 }
 
-// Update the progress bar
+// Update the progress bar with smooth client-side estimation
 function updateProgressBar(position, duration) {
     if (progressBar && duration > 0) {
         const percent = (position / duration) * 100;
@@ -1026,7 +1234,7 @@ function getErrorMessage(error) {
     }
 }
 
-// Logging function
+// Enhanced logging function
 function log(message, category = 'INFO', isError = false) {
     if (isError || config.DEBUG_MODE) {
         const timestamp = new Date().toISOString().substr(11, 8);
@@ -1035,11 +1243,27 @@ function log(message, category = 'INFO', isError = false) {
             : (category === 'IOS' ? 'color: #ff6b6b; font-weight: bold;' :
                category === 'AUDIO' ? 'color: #2ecc71;' : 
                category === 'CONTROL' ? 'color: #9b59b6;' : 
-               category === 'TRACK' ? 'color: #f39c12;' : 'color: #2c3e50;');
+               category === 'TRACK' ? 'color: #f39c12;' : 
+               category === 'SYNC' ? 'color: #3498db; font-weight: bold;' :
+               category === 'STORAGE' ? 'color: #95a5a6;' : 'color: #2c3e50;');
         
         console[isError ? 'error' : 'log'](`%c[${timestamp}] [${category}] ${message}`, style);
     }
 }
+
+// Cleanup function for position save timer
+function cleanup() {
+    if (state.positionSaveTimer) {
+        clearInterval(state.positionSaveTimer);
+        state.positionSaveTimer = null;
+    }
+}
+
+// Handle page unload
+window.addEventListener('beforeunload', () => {
+    savePositionToStorage();
+    cleanup();
+});
 
 // Initialize the player when the document is ready
 document.addEventListener('DOMContentLoaded', initPlayer);

@@ -1,4 +1,4 @@
-// src/handlers.rs - Clean version without WebSocket, fixed imports
+// src/handlers.rs - Complete enhanced version with precise position tracking
 
 use rocket::State;
 use rocket::serde::json::Json;
@@ -15,7 +15,7 @@ use crate::config;
 #[get("/")]
 pub async fn index() -> Template {
     Template::render("index", context! {
-        title: "ChillOut Radio - Direct Streaming",
+        title: "ChillOut Radio - Enhanced Position Sync",
     })
 }
 
@@ -23,27 +23,48 @@ pub async fn index() -> Template {
 pub async fn now_playing(stream_manager: &State<Arc<StreamManager>>) -> Json<serde_json::Value> {
     let sm = stream_manager.as_ref();
     
-    // Get the actual current track from the stream manager's state
-    let track_info = sm.get_track_info();
-    let playback_position = sm.get_playback_position();
+    // Get comprehensive track state with precise timing
+    let track_state = sm.get_track_state();
     let active_listeners = sm.get_active_listeners();
-    let current_bitrate = sm.get_current_bitrate();
     
-    // If we have track info from the stream manager, parse and use it
-    if let Some(track_json) = track_info {
-        if let Ok(mut track_value) = serde_json::from_str::<serde_json::Value>(&track_json) {
+    // Get track info from stream manager's state
+    if let Some(track_json) = &track_state.track_info {
+        if let Ok(mut track_value) = serde_json::from_str::<serde_json::Value>(track_json) {
             if let serde_json::Value::Object(ref mut map) = track_value {
+                // Enhanced position information
+                map.insert(
+                    "playback_position".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(track_state.position_seconds))
+                );
+                map.insert(
+                    "playback_position_ms".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(track_state.position_milliseconds))
+                );
                 map.insert(
                     "active_listeners".to_string(), 
                     serde_json::Value::Number(serde_json::Number::from(active_listeners))
                 );
                 map.insert(
-                    "playback_position".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(playback_position))
+                    "bitrate".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(track_state.bitrate / 1000))
                 );
                 map.insert(
-                    "bitrate".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(current_bitrate / 1000))
+                    "is_near_end".to_string(),
+                    serde_json::Value::Bool(track_state.is_near_end)
+                );
+                map.insert(
+                    "remaining_time".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(track_state.remaining_time))
+                );
+                // Server timestamp for client synchronization
+                map.insert(
+                    "server_timestamp".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64
+                    ))
                 );
             }
             return Json(track_value);
@@ -55,26 +76,53 @@ pub async fn now_playing(stream_manager: &State<Arc<StreamManager>>) -> Json<ser
     
     match track {
         Some(track) => {
+            let (position_secs, position_ms) = sm.get_precise_position();
+            
             let mut track_json = serde_json::to_value(track).unwrap_or_default();
             if let serde_json::Value::Object(ref mut map) = track_json {
+                map.insert(
+                    "playback_position".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(position_secs))
+                );
+                map.insert(
+                    "playback_position_ms".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(position_ms))
+                );
                 map.insert(
                     "active_listeners".to_string(), 
                     serde_json::Value::Number(serde_json::Number::from(active_listeners))
                 );
                 map.insert(
-                    "playback_position".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(playback_position))
+                    "bitrate".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(sm.get_current_bitrate() / 1000))
                 );
                 map.insert(
-                    "bitrate".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(current_bitrate / 1000))
+                    "is_near_end".to_string(),
+                    serde_json::Value::Bool(sm.is_near_track_end(10))
+                );
+                map.insert(
+                    "remaining_time".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(sm.get_remaining_time()))
+                );
+                map.insert(
+                    "server_timestamp".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64
+                    ))
                 );
             }
             
             Json(track_json)
         },
         None => Json(serde_json::json!({
-            "error": "No tracks available"
+            "error": "No tracks available",
+            "server_timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
         }))
     }
 }
@@ -83,23 +131,104 @@ pub async fn now_playing(stream_manager: &State<Arc<StreamManager>>) -> Json<ser
 pub async fn get_stats(stream_manager: &State<Arc<StreamManager>>) -> Json<serde_json::Value> {
     let sm = stream_manager.as_ref();
     
-    // Collect stats
+    // Get comprehensive streaming statistics
+    let track_state = sm.get_track_state();
     let active_listeners = sm.get_active_listeners();
     let is_streaming = sm.is_streaming();
     let track_ended = sm.track_ended();
-    let current_bitrate = sm.get_current_bitrate();
-    let playback_position = sm.get_playback_position();
     
     Json(serde_json::json!({
         "active_listeners": active_listeners,
         "max_concurrent_users": config::MAX_CONCURRENT_USERS,
         "streaming": is_streaming,
         "track_ended": track_ended,
-        "bitrate_kbps": current_bitrate / 1000,
-        "playback_position": playback_position,
-        "streaming_method": "direct_chunked",
-        "server_time": chrono::Local::now().to_rfc3339()
+        "bitrate_kbps": track_state.bitrate / 1000,
+        "playback_position": track_state.position_seconds,
+        "playback_position_ms": track_state.position_milliseconds,
+        "track_duration": track_state.duration,
+        "remaining_time": track_state.remaining_time,
+        "is_near_track_end": track_state.is_near_end,
+        "streaming_method": "enhanced_position_sync",
+        "position_accuracy": "millisecond",
+        "server_time": chrono::Local::now().to_rfc3339(),
+        "server_timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        "features": {
+            "position_persistence": true,
+            "millisecond_precision": true,
+            "drift_correction": true,
+            "ios_optimized": true,
+            "continuity_on_reconnect": true
+        }
     }))
+}
+
+// Enhanced API endpoint for detailed position information
+#[get("/api/position")]
+pub async fn get_position(stream_manager: &State<Arc<StreamManager>>) -> Json<serde_json::Value> {
+    let sm = stream_manager.as_ref();
+    let track_state = sm.get_track_state();
+    
+    Json(serde_json::json!({
+        "position_seconds": track_state.position_seconds,
+        "position_milliseconds": track_state.position_milliseconds,
+        "duration": track_state.duration,
+        "remaining_time": track_state.remaining_time,
+        "progress_percentage": if track_state.duration > 0 {
+            (track_state.position_seconds as f64 / track_state.duration as f64) * 100.0
+        } else {
+            0.0
+        },
+        "is_near_end": track_state.is_near_end,
+        "bitrate": track_state.bitrate,
+        "server_timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    }))
+}
+
+// API endpoint for client position sync verification
+#[get("/api/sync-check?<client_position>&<client_timestamp>")]
+pub async fn sync_check(
+    client_position: Option<u64>,
+    client_timestamp: Option<u64>,
+    stream_manager: &State<Arc<StreamManager>>
+) -> Json<serde_json::Value> {
+    let sm = stream_manager.as_ref();
+    let track_state = sm.get_track_state();
+    let server_timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    
+    let mut response = serde_json::json!({
+        "server_position": track_state.position_seconds,
+        "server_position_ms": track_state.position_milliseconds,
+        "server_timestamp": server_timestamp,
+        "track_duration": track_state.duration
+    });
+    
+    // Calculate drift if client provided position and timestamp
+    if let (Some(client_pos), Some(client_ts)) = (client_position, client_timestamp) {
+        let time_diff = (server_timestamp as i64 - client_ts as i64) / 1000; // seconds
+        let expected_client_pos = (client_pos as i64 + time_diff) as u64;
+        let server_pos = track_state.position_seconds;
+        let drift = server_pos as i64 - expected_client_pos as i64;
+        
+        if let serde_json::Value::Object(ref mut map) = response {
+            map.insert("client_position".to_string(), serde_json::Value::Number(serde_json::Number::from(client_pos)));
+            map.insert("client_timestamp".to_string(), serde_json::Value::Number(serde_json::Number::from(client_ts)));
+            map.insert("time_diff_ms".to_string(), serde_json::Value::Number(serde_json::Number::from(server_timestamp as i64 - client_ts as i64)));
+            map.insert("expected_client_position".to_string(), serde_json::Value::Number(serde_json::Number::from(expected_client_pos)));
+            map.insert("position_drift_seconds".to_string(), serde_json::Value::Number(serde_json::Number::from(drift)));
+            map.insert("drift_significant".to_string(), serde_json::Value::Bool(drift.abs() > 3));
+        }
+    }
+    
+    Json(response)
 }
 
 #[get("/diag")]

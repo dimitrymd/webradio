@@ -1,4 +1,4 @@
-// src/main.rs - Clean direct streaming only
+// src/main.rs - Enhanced with position synchronization features
 
 extern crate rocket;
 
@@ -23,17 +23,20 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     env_logger::init();
     
     println!("============================================================");
-    println!("Starting Rust MP3 Web Radio (Direct Streaming Edition)");
+    println!("Starting Rust MP3 Web Radio (Enhanced Position Sync Edition)");
     println!("Music folder: {}", config::MUSIC_FOLDER.display());
     println!("Chunk size: {} KB", config::CHUNK_SIZE / 1024);
     println!("Features enabled:");
-    println!("  ✓ Chunked direct streaming (memory efficient)");
-    println!("  ✓ iOS Safari compatibility");
+    println!("  ✓ Enhanced position synchronization (millisecond precision)");
+    println!("  ✓ Position persistence across reconnections");
+    println!("  ✓ Client-side position estimation with drift correction");
+    println!("  ✓ Improved MP3 frame-aligned streaming");
+    println!("  ✓ Accurate ID3 tag detection");
+    println!("  ✓ iOS Safari optimization with continuity");
     println!("  ✓ HTTP Range request support");
-    println!("  ✓ Position-synchronized playback");
     println!("============================================================");
 
-    // Initialize the stream manager (simplified for direct streaming only)
+    // Initialize the enhanced stream manager
     let stream_manager = Arc::new(StreamManager::new(
         &config::MUSIC_FOLDER,
         config::CHUNK_SIZE,
@@ -45,9 +48,21 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     println!("Checking and updating track durations...");
     playlist::rescan_and_update_durations(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER);
 
+    // Verify track durations for debugging
+    println!("Verifying track duration accuracy...");
+    playlist::verify_track_durations(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER);
+
     // Ensure we have tracks to play
     let has_tracks = if let Some(track) = playlist::get_current_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER) {
         println!("✓ Initial track ready: \"{}\" by {} ({}s)", track.title, track.artist, track.duration);
+        
+        // Validate track duration
+        if track.duration == 0 {
+            println!("⚠ WARNING: Track has zero duration, position sync may be affected");
+        } else if track.duration < 10 {
+            println!("⚠ WARNING: Track duration is very short ({}s), may cause rapid transitions", track.duration);
+        }
+        
         true
     } else {
         println!("⚠ WARNING: No tracks available for initial playback");
@@ -69,8 +84,19 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     
     // Start the internal track management thread only if we have tracks
     if has_tracks {
-        println!("Starting internal track management...");
+        println!("Starting enhanced track management with millisecond precision...");
         stream_manager.start_broadcast_thread();
+        
+        // Give the thread a moment to initialize
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        
+        // Verify stream manager is working
+        if stream_manager.is_streaming() {
+            let (pos_secs, pos_ms) = stream_manager.get_precise_position();
+            println!("✓ Stream manager initialized - Position: {}s + {}ms", pos_secs, pos_ms);
+        } else {
+            println!("⚠ WARNING: Stream manager may not have started properly");
+        }
     } else {
         println!("Skipping track management - no tracks available");
         println!("The server will start but won't stream audio until tracks are added");
@@ -79,25 +105,28 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     // Start track monitoring and switching thread
     let stream_manager_for_monitor = stream_manager.clone();
     thread::spawn(move || {
-        println!("Starting track monitoring thread...");
+        println!("Starting enhanced track monitoring thread...");
         crate::services::playlist::track_switcher(stream_manager_for_monitor);
     });
     
-    println!("Server components initialized successfully");
+    println!("Enhanced server components initialized successfully");
+    println!("Position sync accuracy: Millisecond precision with drift correction");
     println!("Starting Rocket web server on http://{}:{}...", config::HOST, config::PORT);
     
-    // Build and launch the Rocket instance - clean and minimal
+    // Build and launch the Rocket instance with enhanced endpoints
     rocket::build()
         .manage(stream_manager.clone())
         .mount("/", routes![
             // Main web interface
             handlers::index,
             
-            // API endpoints
+            // Enhanced API endpoints
             handlers::now_playing,
             handlers::get_stats,
+            handlers::get_position,          // New: Detailed position info
+            handlers::sync_check,            // New: Client sync verification
             
-            // Direct streaming endpoints (primary method)
+            // Direct streaming endpoints (enhanced)
             direct_stream::direct_stream,
             direct_stream::direct_stream_options,
             direct_stream::stream_status,
