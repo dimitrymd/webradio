@@ -1,4 +1,4 @@
-// src/direct_stream.rs - Fixed version with accurate position synchronization
+// src/direct_stream.rs - Fixed version with Android position synchronization
 
 use rocket::http::{ContentType, Header, Status};
 use rocket::response::{self, Responder, Response};
@@ -40,6 +40,52 @@ impl DirectStream {
         info!("Position-synchronized streaming: {} by {} (platform: {:?})", 
               track.title, track.artist, platform);
         
+        // FIXED: Always use server position as authoritative source
+        let (server_position_secs, server_position_ms) = stream_manager.get_precise_position();
+        
+        // Enhanced platform detection
+        let is_android = platform.as_deref().map(|p| 
+            p.contains("android") || p.contains("Android")
+        ).unwrap_or(false);
+        
+        let is_ios = platform.as_deref() == Some("ios") || platform.as_deref() == Some("safari");
+        
+        // ANDROID FIX: Only use requested position if it's very close to server position
+        // This prevents Android from using stale cached positions
+        let server_position = if let Some(req_pos) = requested_position {
+            let diff = (req_pos as i64 - server_position_secs as i64).abs();
+            
+            if is_android {
+                // Android: Be more strict about position validation
+                if diff <= 3 {
+                    info!("Android: Using requested position {}s (close to server {}s)", req_pos, server_position_secs);
+                    req_pos
+                } else {
+                    warn!("Android: Requested position {}s differs too much from server {}s, using server position", 
+                          req_pos, server_position_secs);
+                    server_position_secs
+                }
+            } else {
+                // Other platforms: More lenient
+                if diff <= 5 {
+                    info!("Using requested position {}s (close to server {}s)", req_pos, server_position_secs);
+                    req_pos
+                } else {
+                    warn!("Requested position {}s differs too much from server {}s, using server position", 
+                          req_pos, server_position_secs);
+                    server_position_secs
+                }
+            }
+        } else {
+            info!("No requested position, using server position: {}s", server_position_secs);
+            server_position_secs
+        };
+        
+        if is_android {
+            info!("Android client - Server pos: {}s+{}ms, Requested: {:?}, Final: {}s", 
+                  server_position_secs, server_position_ms, requested_position, server_position);
+        }
+        
         // Create the full path to the MP3 file
         let file_path = config::MUSIC_FOLDER.join(&track.path);
         
@@ -62,11 +108,8 @@ impl DirectStream {
         // Calculate more accurate bitrate
         let bitrate_kbps = Self::calculate_accurate_bitrate(&file_path, &track, file_size);
         
-        // Get precise server position with millisecond accuracy
-        let (server_position_secs, server_position_ms) = stream_manager.get_precise_position();
-        let server_position = requested_position.unwrap_or(server_position_secs);
-        
-        info!("Server position: {}s + {}ms", server_position_secs, server_position_ms);
+        info!("Streaming with position: {}s, bitrate: {}kbps, file size: {} bytes", 
+              server_position, bitrate_kbps, file_size);
         
         // Determine start and end bytes based on range header or position
         let (start_byte, end_byte, is_partial) = if let Some(range) = &range_header {
@@ -136,8 +179,13 @@ impl DirectStream {
         headers.push(Header::new("Content-Length", bytes_read.to_string()));
         
         // Platform-specific headers
-        let is_ios = platform.as_deref() == Some("ios") || platform.as_deref() == Some("safari");
-        if is_ios {
+        if is_android {
+            // Android-specific optimizations
+            headers.push(Header::new("Cache-Control", "no-cache, no-store, must-revalidate"));
+            headers.push(Header::new("Pragma", "no-cache"));
+            headers.push(Header::new("Connection", "keep-alive"));
+            headers.push(Header::new("X-Android-Optimized", "true"));
+        } else if is_ios {
             // iOS prefers some caching for smoother playback
             headers.push(Header::new("Cache-Control", "public, max-age=3600"));
             headers.push(Header::new("Connection", "keep-alive"));
@@ -160,11 +208,16 @@ impl DirectStream {
         headers.push(Header::new("X-Start-Byte", start_byte.to_string()));
         headers.push(Header::new("X-Content-Length", bytes_read.to_string()));
         headers.push(Header::new("X-Streaming-Method", "position_sync_chunked"));
-        headers.push(Header::new("X-Server-Position", server_position.to_string()));
-        headers.push(Header::new("X-Position-Accuracy", "improved"));
+        headers.push(Header::new("X-Server-Position", server_position_secs.to_string()));
+        headers.push(Header::new("X-Server-Position-Ms", server_position_ms.to_string()));
+        headers.push(Header::new("X-Position-Used", server_position.to_string()));
+        headers.push(Header::new("X-Position-Source", 
+            if requested_position.is_some() { "validated_request" } else { "server_authoritative" }));
         
-        if is_ios {
-            headers.push(Header::new("X-iOS-Optimized", "true"));
+        if is_android {
+            headers.push(Header::new("X-Android-Debug", "position_sync_fixed"));
+            headers.push(Header::new("X-Android-Position-Validation", 
+                if requested_position.is_some() { "strict" } else { "server_only" }));
         }
         
         // Set appropriate status code
@@ -330,6 +383,10 @@ impl DirectStream {
     // Calculate optimal chunk size based on platform and bitrate
     fn calculate_optimal_chunk_size(platform: &Option<String>, bitrate_kbps: u64, max_content: u64) -> usize {
         let base_size = match platform.as_deref() {
+            Some(p) if p.contains("android") || p.contains("Android") => {
+                // Android needs smaller, more frequent chunks for better position accuracy
+                config::MOBILE_INITIAL_BUFFER_SIZE * config::CHUNK_SIZE / 2
+            },
             Some("ios") => config::IOS_INITIAL_BUFFER_SIZE * config::CHUNK_SIZE,
             Some("safari") => config::SAFARI_INITIAL_BUFFER_SIZE * config::CHUNK_SIZE,
             Some("mobile") => config::MOBILE_INITIAL_BUFFER_SIZE * config::CHUNK_SIZE,
@@ -344,7 +401,7 @@ impl DirectStream {
         adjusted_size.min(max_content as usize).max(config::CHUNK_SIZE)
     }
     
-    // Parse HTTP Range header for partial content requests (unchanged)
+    // Parse HTTP Range header for partial content requests
     fn parse_range_header(range: &str, file_size: u64) -> (u64, u64, bool) {
         if range.starts_with("bytes=") {
             let range_spec = &range[6..];
@@ -394,7 +451,7 @@ impl<'r> Responder<'r, 'static> for DirectStream {
     }
 }
 
-// Range header guard to extract Range header from request (unchanged)
+// Range header guard to extract Range header from request
 #[derive(Debug)]
 pub struct RangeHeader(pub Option<String>);
 
@@ -408,7 +465,7 @@ impl<'r> rocket::request::FromRequest<'r> for RangeHeader {
     }
 }
 
-// Main direct streaming endpoint (unchanged)
+// Main direct streaming endpoint
 #[rocket::get("/direct-stream?<position>&<platform>")]
 pub fn direct_stream(
     position: Option<u64>,
@@ -416,9 +473,13 @@ pub fn direct_stream(
     range_header: RangeHeader,
     stream_manager: &State<Arc<StreamManager>>
 ) -> Result<DirectStream, Status> {
-    // Log the request for debugging
+    // Enhanced logging for Android debugging
     if let Some(ref platform_str) = platform {
-        info!("Direct stream request from platform: {}", platform_str);
+        if platform_str.contains("android") || platform_str.contains("Android") {
+            info!("Android direct stream request - position: {:?}, platform: {}", position, platform_str);
+        } else {
+            info!("Direct stream request from platform: {}", platform_str);
+        }
     }
     
     if let Some(ref range) = range_header.0 {
@@ -473,14 +534,20 @@ pub fn stream_status(stream_manager: &State<Arc<StreamManager>>) -> rocket::serd
         "supports_range_requests": true,
         "chunked_streaming": true,
         "ios_optimized": true,
-        "streaming_method": "position_sync_chunked",
-        "position_accuracy": "millisecond"
+        "android_optimized": true,
+        "streaming_method": "position_sync_chunked_android_fixed",
+        "position_accuracy": "millisecond",
+        "android_fixes": {
+            "server_authoritative_position": true,
+            "strict_position_validation": true,
+            "enhanced_debug_headers": true
+        }
     });
     
     rocket::serde::json::Json(status)
 }
 
-// CORS preflight handler (unchanged)
+// CORS preflight handler
 #[rocket::options("/direct-stream")]
 pub fn direct_stream_options() -> rocket::response::status::NoContent {
     rocket::response::status::NoContent

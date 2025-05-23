@@ -1,4 +1,4 @@
-// src/main.rs - Enhanced with position synchronization features
+// src/main.rs - Enhanced with Android position synchronization fixes
 
 extern crate rocket;
 
@@ -23,7 +23,7 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     env_logger::init();
     
     println!("============================================================");
-    println!("Starting Rust MP3 Web Radio (Enhanced Position Sync Edition)");
+    println!("Starting Rust MP3 Web Radio (Android Position Sync Fixed Edition)");
     println!("Music folder: {}", config::MUSIC_FOLDER.display());
     println!("Chunk size: {} KB", config::CHUNK_SIZE / 1024);
     println!("Features enabled:");
@@ -33,7 +33,9 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     println!("  ✓ Improved MP3 frame-aligned streaming");
     println!("  ✓ Accurate ID3 tag detection");
     println!("  ✓ iOS Safari optimization with continuity");
+    println!("  ✓ Android position sync fixes - server authoritative");
     println!("  ✓ HTTP Range request support");
+    println!("  ✓ Platform-specific optimizations");
     println!("============================================================");
 
     // Initialize the enhanced stream manager
@@ -63,6 +65,11 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
             println!("⚠ WARNING: Track duration is very short ({}s), may cause rapid transitions", track.duration);
         }
         
+        // Additional Android-specific warnings
+        if track.duration > 0 {
+            println!("✓ Android position sync: Track duration is valid for accurate position calculation");
+        }
+        
         true
     } else {
         println!("⚠ WARNING: No tracks available for initial playback");
@@ -85,6 +92,7 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     // Start the internal track management thread only if we have tracks
     if has_tracks {
         println!("Starting enhanced track management with millisecond precision...");
+        println!("Android optimization: Server-authoritative position tracking enabled");
         stream_manager.start_broadcast_thread();
         
         // Give the thread a moment to initialize
@@ -94,6 +102,7 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         if stream_manager.is_streaming() {
             let (pos_secs, pos_ms) = stream_manager.get_precise_position();
             println!("✓ Stream manager initialized - Position: {}s + {}ms", pos_secs, pos_ms);
+            println!("✓ Android clients will receive server-authoritative position data");
         } else {
             println!("⚠ WARNING: Stream manager may not have started properly");
         }
@@ -111,6 +120,7 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     
     println!("Enhanced server components initialized successfully");
     println!("Position sync accuracy: Millisecond precision with drift correction");
+    println!("Android fixes: Server-authoritative position, strict validation, enhanced debugging");
     println!("Starting Rocket web server on http://{}:{}...", config::HOST, config::PORT);
     
     // Build and launch the Rocket instance with enhanced endpoints
@@ -120,13 +130,14 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
             // Main web interface
             handlers::index,
             
-            // Enhanced API endpoints
+            // Enhanced API endpoints with Android support
             handlers::now_playing,
             handlers::get_stats,
-            handlers::get_position,          // New: Detailed position info
-            handlers::sync_check,            // New: Client sync verification
+            handlers::get_position,          // Detailed position info
+            handlers::android_position,     // Android-specific position endpoint
+            handlers::sync_check,            // Client sync verification
             
-            // Direct streaming endpoints (enhanced)
+            // Direct streaming endpoints (Android-enhanced)
             direct_stream::direct_stream,
             direct_stream::direct_stream_options,
             direct_stream::stream_status,
