@@ -2,8 +2,7 @@
 
 // Import all modules
 import { mainPlayer } from './player/main-player.js';
-import { iosManager } from './player/ios-manager.js';
-import { iosStreamingManager } from './player/ios-streaming-fixes.js';
+import { iosStreamingManager } from './player/ios-manager.js';
 
 // Export for global access if needed
 window.ChillOutRadio = {

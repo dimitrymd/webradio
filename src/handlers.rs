@@ -1,4 +1,4 @@
-// src/handlers.rs - Fixed version with heartbeat support and accurate listener tracking
+// src/handlers.rs - Updated for radio-style streaming (current time only)
 
 use rocket::State;
 use rocket::serde::json::Json;
@@ -15,14 +15,15 @@ use crate::config;
 #[get("/")]
 pub async fn index() -> Template {
     Template::render("index", context! {
-        title: "ChillOut Radio - Mobile-Optimized with Fixed Listener Count",
-        version: "2.1.0-mobile-fixed",
+        title: "ChillOut Radio - Live Radio Stream",
+        version: "2.2.0-radio-mode",
         features: vec![
-            "Mobile-optimized streaming",
+            "Live radio-style streaming",
+            "All listeners synchronized to current time",
+            "No seeking - tune in to what's playing now",
+            "Mobile-optimized experience",
             "Accurate listener count tracking",
             "Connection heartbeat system",
-            "Improved error recovery",
-            "Battery-friendly operation",
             "Cross-platform compatibility"
         ]
     })
@@ -41,11 +42,11 @@ pub async fn now_playing(
     
     // Get comprehensive track state
     let track_state = sm.get_track_state();
-    let active_listeners = sm.get_active_listeners(); // Now returns accurate count
+    let active_listeners = sm.get_active_listeners();
     let is_mobile = mobile_client.unwrap_or(false) || android_client.unwrap_or(false);
     
     if is_mobile {
-        log::debug!("Mobile client position request - Server: {}s + {}ms, Listeners: {}", 
+        log::debug!("Mobile client now-playing request - Radio time: {}s + {}ms, Listeners: {}", 
                    track_state.position_seconds, track_state.position_milliseconds, active_listeners);
     }
     
@@ -53,7 +54,17 @@ pub async fn now_playing(
     if let Some(track_json) = &track_state.track_info {
         if let Ok(mut track_value) = serde_json::from_str::<serde_json::Value>(track_json) {
             if let serde_json::Value::Object(ref mut map) = track_value {
-                // Enhanced position information
+                // Current radio position (same for all clients)
+                map.insert(
+                    "radio_position".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(track_state.position_seconds))
+                );
+                map.insert(
+                    "radio_position_ms".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(track_state.position_milliseconds))
+                );
+                
+                // Legacy field names for compatibility
                 map.insert(
                     "playback_position".to_string(),
                     serde_json::Value::Number(serde_json::Number::from(track_state.position_seconds))
@@ -62,6 +73,7 @@ pub async fn now_playing(
                     "playback_position_ms".to_string(),
                     serde_json::Value::Number(serde_json::Number::from(track_state.position_milliseconds))
                 );
+                
                 map.insert(
                     "active_listeners".to_string(), 
                     serde_json::Value::Number(serde_json::Number::from(active_listeners))
@@ -79,7 +91,7 @@ pub async fn now_playing(
                     serde_json::Value::Number(serde_json::Number::from(track_state.remaining_time))
                 );
                 
-                // Add precise timestamps for mobile sync
+                // Add precise timestamps for sync
                 let server_timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default();
@@ -89,6 +101,20 @@ pub async fn now_playing(
                     serde_json::Value::Number(serde_json::Number::from(server_timestamp.as_millis() as u64))
                 );
                 
+                // Radio-specific metadata
+                map.insert(
+                    "streaming_mode".to_string(),
+                    serde_json::Value::String("radio".to_string())
+                );
+                map.insert(
+                    "seeking_enabled".to_string(),
+                    serde_json::Value::Bool(false)
+                );
+                map.insert(
+                    "synchronized_playback".to_string(),
+                    serde_json::Value::Bool(true)
+                );
+                
                 // Mobile-specific optimizations
                 if is_mobile {
                     map.insert(
@@ -96,11 +122,7 @@ pub async fn now_playing(
                         serde_json::Value::Bool(true)
                     );
                     map.insert(
-                        "position_tolerance".to_string(),
-                        serde_json::Value::Number(serde_json::Number::from(5)) // 5 second tolerance for mobile
-                    );
-                    map.insert(
-                        "heartbeat_required".to_string(),
+                        "radio_mode".to_string(),
                         serde_json::Value::Bool(true)
                     );
                 }
@@ -135,6 +157,14 @@ pub async fn now_playing(
             let mut track_json = serde_json::to_value(track).unwrap_or_default();
             if let serde_json::Value::Object(ref mut map) = track_json {
                 map.insert(
+                    "radio_position".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(position_secs))
+                );
+                map.insert(
+                    "radio_position_ms".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(position_ms))
+                );
+                map.insert(
                     "playback_position".to_string(),
                     serde_json::Value::Number(serde_json::Number::from(position_secs))
                 );
@@ -160,14 +190,28 @@ pub async fn now_playing(
                     ))
                 );
                 
+                // Radio mode indicators
+                map.insert(
+                    "streaming_mode".to_string(),
+                    serde_json::Value::String("radio".to_string())
+                );
+                map.insert(
+                    "seeking_enabled".to_string(),
+                    serde_json::Value::Bool(false)
+                );
+                map.insert(
+                    "synchronized_playback".to_string(),
+                    serde_json::Value::Bool(true)
+                );
+                
                 if is_mobile {
                     map.insert(
                         "mobile_optimized".to_string(),
                         serde_json::Value::Bool(true)
                     );
                     map.insert(
-                        "position_tolerance".to_string(),
-                        serde_json::Value::Number(serde_json::Number::from(5))
+                        "radio_mode".to_string(),
+                        serde_json::Value::Bool(true)
                     );
                 }
                 
@@ -185,7 +229,9 @@ pub async fn now_playing(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis(),
-            "mobile_fallback": is_mobile,
+            "streaming_mode": "radio",
+            "seeking_enabled": false,
+            "synchronized_playback": true,
             "streaming": false,
             "active_listeners": active_listeners
         }))
@@ -206,7 +252,7 @@ pub async fn heartbeat(
     if let Some(conn_id) = connection_id {
         // Update heartbeat for this connection
         sm.update_listener_heartbeat(&conn_id);
-        log::debug!("Heartbeat received from connection: {}", &conn_id[..8]);
+        log::debug!("Radio heartbeat from connection: {}", &conn_id[..8]);
     }
     
     let active_listeners = sm.get_active_listeners();
@@ -219,10 +265,13 @@ pub async fn heartbeat(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis(),
-        "position_seconds": position_secs,
-        "position_milliseconds": position_ms,
+        "radio_position": position_secs,
+        "radio_position_ms": position_ms,
         "streaming": sm.is_streaming(),
-        "heartbeat_interval_ms": 15000 // Recommended heartbeat interval
+        "streaming_mode": "radio",
+        "seeking_enabled": false,
+        "synchronized_playback": true,
+        "heartbeat_interval_ms": 15000
     }))
 }
 
@@ -244,12 +293,15 @@ pub async fn get_stats(stream_manager: &State<Arc<StreamManager>>) -> Json<serde
         "streaming": is_streaming,
         "track_ended": track_ended,
         "bitrate_kbps": track_state.bitrate / 1000,
-        "playback_position": track_state.position_seconds,
-        "playback_position_ms": track_state.position_milliseconds,
+        "radio_position": track_state.position_seconds,
+        "radio_position_ms": track_state.position_milliseconds,
         "track_duration": track_state.duration,
         "remaining_time": track_state.remaining_time,
         "is_near_track_end": track_state.is_near_end,
-        "streaming_method": "mobile_optimized_with_heartbeat",
+        "streaming_method": "radio_synchronized",
+        "streaming_mode": "radio",
+        "seeking_enabled": false,
+        "synchronized_playback": true,
         "position_accuracy": "millisecond",
         "server_time": chrono::Local::now().to_rfc3339(),
         "server_timestamp": std::time::SystemTime::now()
@@ -257,13 +309,14 @@ pub async fn get_stats(stream_manager: &State<Arc<StreamManager>>) -> Json<serde
             .unwrap_or_default()
             .as_millis(),
         "features": {
+            "radio_streaming": true,
+            "synchronized_playback": true,
             "connection_tracking": true,
             "heartbeat_system": true,
             "accurate_listener_count": true,
             "mobile_optimized": true,
             "stale_connection_cleanup": true,
-            "position_persistence": true,
-            "drift_correction": true
+            "seeking_disabled": true
         },
         "connection_info": {
             "heartbeat_interval_seconds": 15,
@@ -273,15 +326,15 @@ pub async fn get_stats(stream_manager: &State<Arc<StreamManager>>) -> Json<serde
     }))
 }
 
-// Enhanced position endpoint
+// Enhanced position endpoint (radio time only)
 #[get("/api/position")]
 pub async fn get_position(stream_manager: &State<Arc<StreamManager>>) -> Json<serde_json::Value> {
     let sm = stream_manager.as_ref();
     let track_state = sm.get_track_state();
     
     Json(serde_json::json!({
-        "position_seconds": track_state.position_seconds,
-        "position_milliseconds": track_state.position_milliseconds,
+        "radio_position": track_state.position_seconds,
+        "radio_position_ms": track_state.position_milliseconds,
         "duration": track_state.duration,
         "remaining_time": track_state.remaining_time,
         "progress_percentage": if track_state.duration > 0 {
@@ -295,63 +348,15 @@ pub async fn get_position(stream_manager: &State<Arc<StreamManager>>) -> Json<se
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis(),
+        "streaming_mode": "radio",
+        "seeking_enabled": false,
+        "synchronized_playback": true,
         "precision": "millisecond",
-        "source": "stream_manager"
+        "source": "radio_server"
     }))
 }
 
-// Connection management endpoint
-#[get("/api/connections")]
-pub async fn get_connections(stream_manager: &State<Arc<StreamManager>>) -> Json<serde_json::Value> {
-    let sm = stream_manager.as_ref();
-    
-    // Clean up stale connections
-    sm.cleanup_stale_connections();
-    
-    let active_listeners = sm.get_active_listeners();
-    
-    Json(serde_json::json!({
-        "active_connections": active_listeners,
-        "cleanup_performed": true,
-        "connection_timeout_seconds": 60,
-        "heartbeat_required": true,
-        "server_timestamp": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    }))
-}
-
-// Playlist endpoint
-#[get("/api/playlist")]
-pub async fn get_playlist() -> Json<serde_json::Value> {
-    let playlist_data = playlist::get_playlist(&config::PLAYLIST_FILE);
-    let current_track = playlist::get_current_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER);
-    
-    if playlist_data.tracks.is_empty() {
-        Json(serde_json::json!({
-            "error": "No tracks available in playlist",
-            "tracks": [],
-            "total_tracks": 0,
-            "current_track": null,
-            "playlist_duration": 0
-        }))
-    } else {
-        Json(serde_json::json!({
-            "tracks": playlist_data.tracks,
-            "total_tracks": playlist_data.tracks.len(),
-            "current_track_index": current_track.as_ref().map(|t| {
-                playlist_data.tracks.iter().position(|track| track.path == t.path).unwrap_or(0)
-            }).unwrap_or(0),
-            "current_track": current_track,
-            "shuffle_enabled": false,
-            "repeat_enabled": true,
-            "playlist_duration": playlist_data.tracks.iter().map(|t| t.duration).sum::<u64>()
-        }))
-    }
-}
-
-// Android-specific position endpoint for debugging
+// Android-specific position endpoint (radio time only)
 #[get("/api/android-position")]
 pub async fn android_position(stream_manager: &State<Arc<StreamManager>>) -> Json<serde_json::Value> {
     let sm = stream_manager.as_ref();
@@ -362,20 +367,23 @@ pub async fn android_position(stream_manager: &State<Arc<StreamManager>>) -> Jso
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     
-    log::info!("Android position request: {}s + {}ms at timestamp {}ms", 
+    log::info!("Android radio position request: {}s + {}ms at timestamp {}ms", 
                track_state.position_seconds, 
                track_state.position_milliseconds,
                server_timestamp.as_millis());
     
     Json(serde_json::json!({
-        "position_seconds": track_state.position_seconds,
-        "position_milliseconds": track_state.position_milliseconds,
+        "radio_position": track_state.position_seconds,
+        "radio_position_ms": track_state.position_milliseconds,
         "duration": track_state.duration,
         "server_timestamp_ms": server_timestamp.as_millis(),
         "server_timestamp_ns": server_timestamp.as_nanos(),
         "bitrate": track_state.bitrate,
         "android_optimized": true,
-        "position_authority": "server", // Always server-authoritative for Android
+        "streaming_mode": "radio",
+        "seeking_enabled": false,
+        "synchronized_playback": true,
+        "position_authority": "radio_server",
         "debug_info": {
             "streaming": sm.is_streaming(),
             "near_end": track_state.is_near_end,
@@ -386,24 +394,20 @@ pub async fn android_position(stream_manager: &State<Arc<StreamManager>>) -> Jso
         "validation": {
             "position_validated": true,
             "precision": "millisecond",
-            "source": "stream_manager",
-            "authority": "server"
+            "source": "radio_server",
+            "authority": "radio_server"
         },
         "timing": {
             "request_time": server_timestamp.as_millis(),
-            "position_time": track_state.position_seconds * 1000 + track_state.position_milliseconds as u64,
-            "sync_accuracy": "high"
+            "radio_time": track_state.position_seconds * 1000 + track_state.position_milliseconds as u64,
+            "sync_accuracy": "radio_synchronized"
         }
     }))
 }
 
-// API endpoint for client position sync verification
-#[get("/api/sync-check?<client_position>&<client_timestamp>")]
-pub async fn sync_check(
-    client_position: Option<u64>,
-    client_timestamp: Option<u64>,
-    stream_manager: &State<Arc<StreamManager>>
-) -> Json<serde_json::Value> {
+// API endpoint for radio sync verification (no client position needed)
+#[get("/api/sync-check")]
+pub async fn sync_check(stream_manager: &State<Arc<StreamManager>>) -> Json<serde_json::Value> {
     let sm = stream_manager.as_ref();
     let track_state = sm.get_track_state();
     let server_timestamp = std::time::SystemTime::now()
@@ -411,56 +415,20 @@ pub async fn sync_check(
         .unwrap_or_default()
         .as_millis() as u64;
     
-    let mut response = serde_json::json!({
-        "server_position": track_state.position_seconds,
-        "server_position_ms": track_state.position_milliseconds,
+    Json(serde_json::json!({
+        "radio_position": track_state.position_seconds,
+        "radio_position_ms": track_state.position_milliseconds,
         "server_timestamp": server_timestamp,
         "track_duration": track_state.duration,
-        "sync_status": "ok"
-    });
-    
-    // Calculate drift if client provided position and timestamp
-    if let (Some(client_pos), Some(client_ts)) = (client_position, client_timestamp) {
-        let time_diff = (server_timestamp as i64 - client_ts as i64) / 1000; // seconds
-        let expected_client_pos = (client_pos as i64 + time_diff) as u64;
-        let server_pos = track_state.position_seconds;
-        let drift = server_pos as i64 - expected_client_pos as i64;
-        
-        if let serde_json::Value::Object(ref mut map) = response {
-            map.insert("client_position".to_string(), serde_json::Value::Number(serde_json::Number::from(client_pos)));
-            map.insert("client_timestamp".to_string(), serde_json::Value::Number(serde_json::Number::from(client_ts)));
-            map.insert("time_diff_ms".to_string(), serde_json::Value::Number(serde_json::Number::from(server_timestamp as i64 - client_ts as i64)));
-            map.insert("expected_client_position".to_string(), serde_json::Value::Number(serde_json::Number::from(expected_client_pos)));
-            map.insert("position_drift_seconds".to_string(), serde_json::Value::Number(serde_json::Number::from(drift)));
-            map.insert("drift_significant".to_string(), serde_json::Value::Bool(drift.abs() > 3));
-            
-            // Sync status based on drift
-            let sync_status = if drift.abs() <= 1 {
-                "excellent"
-            } else if drift.abs() <= 3 {
-                "good"
-            } else if drift.abs() <= 5 {
-                "fair"
-            } else {
-                "poor"
-            };
-            map.insert("sync_status".to_string(), serde_json::Value::String(sync_status.to_string()));
-            
-            // Android-specific drift analysis
-            if drift.abs() > 5 {
-                map.insert("android_recommendation".to_string(), serde_json::Value::String("reconnect_with_server_position".to_string()));
-            } else if drift.abs() > 3 {
-                map.insert("android_recommendation".to_string(), serde_json::Value::String("apply_drift_correction".to_string()));
-            } else {
-                map.insert("android_recommendation".to_string(), serde_json::Value::String("maintain_current_sync".to_string()));
-            }
-        }
-    }
-    
-    Json(response)
+        "streaming_mode": "radio",
+        "seeking_enabled": false,
+        "synchronized_playback": true,
+        "sync_status": "radio_synchronized",
+        "message": "All clients synchronized to radio time - no individual positioning"
+    }))
 }
 
-// Health check endpoint with connection info
+// Health check endpoint with radio info
 #[get("/api/health")]
 pub async fn health_check(stream_manager: &State<Arc<StreamManager>>) -> Json<serde_json::Value> {
     let sm = stream_manager.as_ref();
@@ -488,14 +456,20 @@ pub async fn health_check(stream_manager: &State<Arc<StreamManager>>) -> Json<se
         "streaming": sm.is_streaming(),
         "active_listeners": active_listeners,
         "current_track_duration": track_state.duration,
-        "current_position": track_state.position_seconds,
+        "radio_position": track_state.position_seconds,
         "track_ended": sm.track_ended(),
-        "version": "2.1.0-mobile-fixed",
+        "version": "2.2.0-radio-mode",
+        "streaming_mode": "radio",
+        "seeking_enabled": false,
+        "synchronized_playback": true,
         "features": {
+            "radio_streaming": true,
+            "synchronized_playback": true,
             "mobile_optimized": true,
             "heartbeat_system": true,
             "accurate_listener_count": true,
-            "connection_cleanup": true
+            "connection_cleanup": true,
+            "seeking_disabled": true
         },
         "connection_health": {
             "active_connections": active_listeners,
@@ -503,6 +477,65 @@ pub async fn health_check(stream_manager: &State<Arc<StreamManager>>) -> Json<se
             "stale_cleanup": "automatic"
         }
     }))
+}
+
+// Connection management endpoint
+#[get("/api/connections")]
+pub async fn get_connections(stream_manager: &State<Arc<StreamManager>>) -> Json<serde_json::Value> {
+    let sm = stream_manager.as_ref();
+    
+    // Clean up stale connections
+    sm.cleanup_stale_connections();
+    
+    let active_listeners = sm.get_active_listeners();
+    
+    Json(serde_json::json!({
+        "active_connections": active_listeners,
+        "cleanup_performed": true,
+        "connection_timeout_seconds": 60,
+        "heartbeat_required": true,
+        "streaming_mode": "radio",
+        "seeking_enabled": false,
+        "synchronized_playback": true,
+        "server_timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    }))
+}
+
+// Playlist endpoint
+#[get("/api/playlist")]
+pub async fn get_playlist() -> Json<serde_json::Value> {
+    let playlist_data = playlist::get_playlist(&config::PLAYLIST_FILE);
+    let current_track = playlist::get_current_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER);
+    
+    if playlist_data.tracks.is_empty() {
+        Json(serde_json::json!({
+            "error": "No tracks available in playlist",
+            "tracks": [],
+            "total_tracks": 0,
+            "current_track": null,
+            "playlist_duration": 0,
+            "streaming_mode": "radio",
+            "seeking_enabled": false
+        }))
+    } else {
+        Json(serde_json::json!({
+            "tracks": playlist_data.tracks,
+            "total_tracks": playlist_data.tracks.len(),
+            "current_track_index": current_track.as_ref().map(|t| {
+                playlist_data.tracks.iter().position(|track| track.path == t.path).unwrap_or(0)
+            }).unwrap_or(0),
+            "current_track": current_track,
+            "shuffle_enabled": false,
+            "repeat_enabled": true,
+            "playlist_duration": playlist_data.tracks.iter().map(|t| t.duration).sum::<u64>(),
+            "streaming_mode": "radio",
+            "seeking_enabled": false,
+            "synchronized_playback": true
+        }))
+    }
 }
 
 // Diagnostic page
@@ -530,7 +563,10 @@ pub async fn debug_connections(stream_manager: &State<Arc<StreamManager>>) -> Js
             .unwrap_or_default()
             .as_millis(),
         "connection_timeout_seconds": 60,
-        "heartbeat_interval_seconds": 15
+        "heartbeat_interval_seconds": 15,
+        "streaming_mode": "radio",
+        "seeking_enabled": false,
+        "synchronized_playback": true
     }))
 }
 

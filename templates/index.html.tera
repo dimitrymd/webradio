@@ -45,30 +45,37 @@
             background: rgba(255, 255, 255, 0.8);
             padding: 5px 15px;
             border-radius: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
         }
 
-        /* Styling improvements */
+        /* Radio-specific styling */
         body {
-            background-color: #f5f5f5;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             font-family: Arial, sans-serif;
             color: #333;
+            min-height: 100vh;
         }
 
         .player {
-            background: white;
+            background: rgba(255, 255, 255, 0.95);
             border-radius: 15px;
             padding: 25px;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+            backdrop-filter: blur(10px);
             max-width: 700px;
             margin: 30px auto;
+            border: 1px solid rgba(255,255,255,0.3);
         }
 
         .now-playing {
-            background: linear-gradient(135deg, #f0f0f0, #e6f2ff);
+            background: linear-gradient(135deg, #f0f8ff, #e6f3ff);
             border-radius: 10px;
             padding: 20px;
             margin: 20px 0;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            border-left: 4px solid #4a90e2;
         }
 
         .track-title {
@@ -106,14 +113,15 @@
             cursor: pointer;
             font-size: 16px;
             font-weight: bold;
-            transition: all 0.2s ease;
-            min-height: 44px; /* iOS tap target size */
+            transition: all 0.3s ease;
+            min-height: 44px;
+            box-shadow: 0 2px 8px rgba(74, 144, 226, 0.3);
         }
 
         button:hover {
             background: #3a80d2;
             transform: translateY(-2px);
-            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            box-shadow: 0 4px 12px rgba(74, 144, 226, 0.4);
         }
 
         button:active {
@@ -124,26 +132,29 @@
             background-color: #95a5a6;
             cursor: not-allowed;
             transform: none;
+            box-shadow: none;
         }
 
         #start-btn {
-            background-color: #2ecc71;
+            background: linear-gradient(135deg, #2ecc71, #27ae60);
+            font-size: 18px;
+            padding: 15px 25px;
         }
 
         #start-btn:hover {
-            background-color: #27ae60;
+            background: linear-gradient(135deg, #27ae60, #219a52);
         }
 
         #start-btn:disabled {
-            background-color: #95a5a6;
+            background: #95a5a6;
         }
 
         #mute-btn {
-            background-color: #3498db;
+            background: linear-gradient(135deg, #3498db, #2980b9);
         }
 
         #mute-btn:hover {
-            background-color: #2980b9;
+            background: linear-gradient(135deg, #2980b9, #21618c);
         }
 
         .listeners {
@@ -151,6 +162,13 @@
             font-size: 14px;
             color: #7f8c8d;
             font-style: italic;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .listeners::before {
+            content: "👥";
         }
 
         .volume-control {
@@ -172,20 +190,22 @@
 
         input[type="range"]::-webkit-slider-thumb {
             -webkit-appearance: none;
-            width: 15px;
-            height: 15px;
-            background: #3498db;
+            width: 18px;
+            height: 18px;
+            background: linear-gradient(135deg, #3498db, #2980b9);
             border-radius: 50%;
             cursor: pointer;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
         }
 
         input[type="range"]::-moz-range-thumb {
-            width: 15px;
-            height: 15px;
-            background: #3498db;
+            width: 18px;
+            height: 18px;
+            background: linear-gradient(135deg, #3498db, #2980b9);
             border-radius: 50%;
             cursor: pointer;
             border: none;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
         }
         
         .footer {
@@ -196,26 +216,53 @@
         }
 
         .streaming-info {
-            background: #e8f5e8;
+            background: linear-gradient(135deg, #e8f5e8, #d4edda);
             border-left: 4px solid #2ecc71;
-            padding: 10px;
+            padding: 15px;
             margin: 15px 0;
-            border-radius: 4px;
+            border-radius: 8px;
+            font-size: 14px;
+            color: #155724;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            box-shadow: 0 2px 8px rgba(46, 204, 113, 0.2);
+        }
+
+        .radio-info {
+            background: linear-gradient(135deg, #fff3cd, #ffeaa7);
+            border-left: 4px solid #f39c12;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 8px;
             font-size: 13px;
-            color: #27ae60;
+            color: #856404;
+            box-shadow: 0 2px 8px rgba(243, 156, 18, 0.2);
+        }
+
+        .radio-info h4 {
+            margin: 0 0 8px 0;
+            color: #b7950b;
+            font-size: 14px;
         }
         
         /* Mobile optimizations */
         @media (max-width: 768px) {
+            body {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                padding: 10px;
+            }
+
             .player {
                 margin: 15px;
-                padding: 15px;
-                border-radius: 10px;
+                padding: 20px;
+                border-radius: 12px;
+                backdrop-filter: blur(8px);
             }
             
             .controls {
                 flex-direction: column;
-                gap: 10px;
+                gap: 15px;
                 align-items: stretch;
             }
             
@@ -226,8 +273,8 @@
             
             button {
                 width: 100%;
-                padding: 12px;
-                font-size: 18px; /* Larger text for mobile */
+                padding: 15px;
+                font-size: 18px;
             }
 
             .logo h1 {
@@ -261,16 +308,37 @@
                 -webkit-touch-callout: none;
             }
         }
+
+        /* Animation for radio elements */
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.7; }
+            100% { opacity: 1; }
+        }
+
+        .radio-live {
+            animation: pulse 2s infinite;
+            color: #e74c3c;
+            font-weight: bold;
+        }
     </style>
 </head>
 <body>
     <div class="player">
         <div class="logo">
-            <h1>🎵 ChillOut Radio</h1>
+            <h1>📻 ChillOut Radio</h1>
         </div>
         
         <div class="streaming-info">
-            ✨ Direct chunked streaming - optimized for all devices including iOS!
+            📡 <strong>Live Radio Stream</strong> - Tune in to what's playing now! All listeners hear the same thing at the same time.
+        </div>
+
+        <div class="radio-info">
+            <h4>🎵 How Radio Mode Works:</h4>
+            <p>• Everyone hears the exact same music at the same time<br>
+            • No seeking or rewinding - just like real radio<br>
+            • Tune in anytime to join the synchronized experience<br>
+            • Perfect for listening together with friends worldwide</p>
         </div>
         
         <div class="now-playing">
@@ -287,14 +355,16 @@
                 <div id="current-duration">-</div>
             </div>
             
-            <div class="listeners" id="listener-count">Listeners: 0</div>
+            <div class="listeners" id="listener-count">
+                <span class="radio-live">LIVE</span> • Listeners: 0
+            </div>
         </div>
         
         <div class="controls">
-            <button id="start-btn">Connect</button>
-            <button id="mute-btn">Mute</button>
+            <button id="start-btn">📻 Tune In</button>
+            <button id="mute-btn">🔊 Mute</button>
             <div class="volume-control">
-                <span>Volume:</span>
+                <span>🔉 Volume:</span>
                 <input type="range" id="volume" min="0" max="1" step="0.01" value="0.7">
             </div>
         </div>
@@ -302,15 +372,15 @@
         <div class="status-message" id="status-message" style="display: none;"></div>
 
         <div class="footer">
-            <p>🎶 Streaming your favorite chill music 24/7</p>
+            <p>🎶 Broadcasting chill music 24/7 • Radio Mode</p>
             <p><small>
-                <a href="/diag" style="color: #888; text-decoration: none;">Diagnostics</a> | 
-                Direct Streaming Only
+                <a href="/diag" style="color: #888; text-decoration: none;">🔧 Diagnostics</a> | 
+                Live Synchronized Streaming
             </small></p>
         </div>
     </div>
 
-    <!-- Clean direct streaming player -->
-    <script type="module" src="/static/js/modular-player.js"></script>
+    <!-- Radio streaming player -->
+    <script src="/static/js/radio-player.js"></script>
 </body>
 </html>

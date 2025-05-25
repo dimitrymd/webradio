@@ -23,19 +23,18 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     env_logger::init();
     
     println!("============================================================");
-    println!("Starting Rust MP3 Web Radio (Android Position Sync Fixed Edition)");
+    println!("Starting Rust MP3 Web Radio (Radio Mode - Live Streaming Edition)");
     println!("Music folder: {}", config::MUSIC_FOLDER.display());
     println!("Chunk size: {} KB", config::CHUNK_SIZE / 1024);
     println!("Features enabled:");
+    println!("  ✓ Live radio-style streaming (synchronized playback)");
+    println!("  ✓ All listeners hear the same thing at the same time");
+    println!("  ✓ No seeking - tune in to current radio time");
     println!("  ✓ Enhanced position synchronization (millisecond precision)");
-    println!("  ✓ Position persistence across reconnections");
-    println!("  ✓ Client-side position estimation with drift correction");
-    println!("  ✓ Improved MP3 frame-aligned streaming");
-    println!("  ✓ Accurate ID3 tag detection");
-    println!("  ✓ iOS Safari optimization with continuity");
-    println!("  ✓ Android position sync fixes - server authoritative");
-    println!("  ✓ HTTP Range request support");
-    println!("  ✓ Platform-specific optimizations");
+    println!("  ✓ Mobile-optimized radio experience");
+    println!("  ✓ Accurate listener count tracking");
+    println!("  ✓ Connection heartbeat system");
+    println!("  ✓ Cross-platform radio compatibility");
     println!("============================================================");
 
     // Initialize the enhanced stream manager
@@ -91,8 +90,8 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     
     // Start the internal track management thread only if we have tracks
     if has_tracks {
-        println!("Starting enhanced track management with millisecond precision...");
-        println!("Android optimization: Server-authoritative position tracking enabled");
+        println!("Starting radio broadcast thread with live synchronization...");
+        println!("Radio mode: All listeners synchronized to current server time");
         stream_manager.start_broadcast_thread();
         
         // Give the thread a moment to initialize
@@ -136,9 +135,10 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
             handlers::get_position,          // Detailed position info
             handlers::android_position,     // Android-specific position endpoint
             handlers::sync_check,            // Client sync verification
+            handlers::heartbeat,             // Connection heartbeat
             
             // Direct streaming endpoints (Android-enhanced)
-            direct_stream::direct_stream,
+            direct_stream::direct_stream,    // Fixed import
             direct_stream::direct_stream_options,
             direct_stream::stream_status,
             

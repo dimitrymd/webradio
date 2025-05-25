@@ -27,7 +27,10 @@ impl DirectStream {
         stream_manager: Arc<StreamManager>, 
         requested_position: Option<u64>,
         platform: Option<String>,
-        range_header: Option<String>
+        range_header: Option<String>,
+        ios_optimized: Option<bool>,
+        chunk_size: Option<usize>,
+        initial_buffer: Option<usize>
     ) -> Result<Self, Status> {
         // Get connection ID for tracking
         let connection_id = stream_manager.increment_listener_count();
@@ -51,31 +54,31 @@ impl DirectStream {
         // Get server position with mobile-friendly synchronization
         let (server_position_secs, server_position_ms) = stream_manager.get_precise_position();
         
-        // Mobile-friendly position synchronization (less strict than desktop)
-        let sync_position = if let Some(req_pos) = requested_position {
+        // Radio-style streaming: Always use current server position
+        // This ensures all clients hear the same thing at the same time, like a real radio station
+        let sync_position = server_position_secs;
+        
+        if let Some(req_pos) = requested_position {
             let diff = (req_pos as i64 - server_position_secs as i64).abs();
-            
-            // More lenient tolerance for mobile devices (network delays, etc.)
-            let tolerance = match platform_info.device_type.as_str() {
-                "android" => 5,  // 5 second tolerance for Android
-                "ios" => 4,      // 4 second tolerance for iOS  
-                "mobile" => 6,   // 6 second tolerance for other mobile
-                _ => 3           // 3 second tolerance for desktop
-            };
-            
-            if diff <= tolerance {
-                info!("Mobile sync: Using requested position {}s (server: {}s, diff: {}s)", 
-                      req_pos, server_position_secs, diff);
-                req_pos
-            } else {
-                warn!("Mobile sync: Position drift too large ({}s), using server position {}s", 
-                      diff, server_position_secs);
-                server_position_secs
-            }
+            info!("Radio mode: Client requested {}s, but serving current radio position {}s (diff: {}s)", 
+                  req_pos, server_position_secs, diff);
         } else {
-            info!("Mobile sync: No requested position, using server position: {}s", server_position_secs);
-            server_position_secs
+            info!("Radio mode: Serving current radio position: {}s", server_position_secs);
+        }
+        
+        // Ensure we never serve from position 0 unless the track just started
+        let actual_sync_position = if sync_position == 0 && server_position_ms < 1000 {
+            // Track just started, it's okay to serve from beginning
+            0
+        } else if sync_position == 0 {
+            // This shouldn't happen - track manager might not be running properly
+            warn!("Radio mode: Server position is 0 but track should be playing. Using 1s offset.");
+            1
+        } else {
+            sync_position
         };
+        
+        info!("Radio mode: Final sync position: {}s", actual_sync_position);
         
         // Create the full path to the MP3 file
         let file_path = config::MUSIC_FOLDER.join(&track.path);
@@ -100,14 +103,15 @@ impl DirectStream {
         let bitrate_kbps = Self::calculate_accurate_bitrate(&file_path, &track, file_size);
         
         info!("Mobile streaming: pos={}s, bitrate={}kbps, size={}B, device={}", 
-              sync_position, bitrate_kbps, file_size, platform_info.device_type);
+              sync_position,
+            actual_sync_position, bitrate_kbps, file_size, platform_info.device_type);
         
         // Determine start and end bytes based on range header or position
         let (start_byte, end_byte, is_partial) = if let Some(range) = &range_header {
             Self::parse_range_header(range, file_size)
         } else {
             let byte_position = Self::time_to_bytes_mobile_optimized(
-                sync_position, 
+                actual_sync_position, 
                 bitrate_kbps, 
                 file_size,
                 &file_path,
@@ -121,19 +125,19 @@ impl DirectStream {
                 byte_position 
             };
             
-            debug!("Mobile position sync: {}s -> byte {} of {}", sync_position, start, file_size);
+            debug!("Mobile position sync: {}s -> byte {} of {}", actual_sync_position, start, file_size);
             (start, file_size - 1, false)
         };
         
         // Determine chunk size based on platform and iOS optimizations
-        let content_length = end_byte - start_byte + 1;
-        let ios_chunk_params = if ios_optimized.unwrap_or(false) {
+        let _content_length = end_byte - start_byte + 1;
+        let ios_params = if ios_optimized.unwrap_or(false) {
             Some((chunk_size.unwrap_or(32768), initial_buffer.unwrap_or(65536)))
         } else {
             None
         };
         
-        let data = match Self::read_file_chunk(&file_path, start_byte, end_byte, &platform_info, ios_chunk_params) {
+        let data = match Self::read_file_chunk(&file_path, start_byte, end_byte, &platform_info, ios_params) {
             Ok(data) => data,
             Err(e) => {
                 error!("Error reading file: {}", e);
@@ -336,7 +340,11 @@ impl DirectStream {
         
         // Calculate chunk size based on platform and iOS params
         let content_length = end_byte - start_byte + 1;
-        let chunk_size = Self::calculate_mobile_chunk_size(platform_info, content_length, ios_params);
+        let chunk_size = if let Some((ios_chunk_size, _)) = ios_params {
+            ios_chunk_size
+        } else {
+            Self::calculate_mobile_chunk_size(platform_info, content_length)
+        };
         
         let mut buffer = vec![0u8; chunk_size];
         let bytes_read = file.read(&mut buffer)?;
@@ -369,6 +377,7 @@ impl DirectStream {
         is_partial: bool,
         bitrate_kbps: u64,
         sync_position: u64,
+        actual_sync_position: u64,
         server_position_secs: u64,
         server_position_ms: u64,
         connection_id: &str
@@ -390,22 +399,27 @@ impl DirectStream {
                 headers.push(Header::new("X-Android-Optimized", "true"));
             },
             "ios" => {
-                // iOS/Safari prefers some caching for smoother playback
-                headers.push(Header::new("Cache-Control", "public, max-age=3600"));
+                // iOS/Safari needs different settings for radio streaming
+                headers.push(Header::new("Cache-Control", "no-cache, no-store, must-revalidate"));
+                headers.push(Header::new("Pragma", "no-cache"));
                 headers.push(Header::new("Connection", "keep-alive"));
-                headers.push(Header::new("Keep-Alive", "timeout=60, max=1000"));
-                headers.push(Header::new("X-iOS-Optimized", "true"));
+                headers.push(Header::new("Keep-Alive", "timeout=120, max=100"));
+                headers.push(Header::new("X-iOS-Radio-Optimized", "true"));
+                // Disable iOS buffering that causes issues with live streams
+                headers.push(Header::new("X-Content-Duration", "LIVE"));
+                headers.push(Header::new("X-Playback-Session-Id", connection_id[..8].to_string()));
             },
             "mobile" => {
                 // General mobile optimization
-                headers.push(Header::new("Cache-Control", "public, max-age=1800"));
+                headers.push(Header::new("Cache-Control", "no-cache, no-store, must-revalidate"));
+                headers.push(Header::new("Pragma", "no-cache"));
                 headers.push(Header::new("Connection", "keep-alive"));
                 headers.push(Header::new("Keep-Alive", "timeout=45, max=1000"));
                 headers.push(Header::new("X-Mobile-Optimized", "true"));
             },
             _ => {
                 // Desktop browsers
-                headers.push(Header::new("Cache-Control", "public, max-age=300"));
+                headers.push(Header::new("Cache-Control", "no-cache, no-store, must-revalidate"));
                 headers.push(Header::new("Connection", "keep-alive"));
                 headers.push(Header::new("Keep-Alive", "timeout=120, max=1000"));
             }
@@ -426,7 +440,8 @@ impl DirectStream {
         headers.push(Header::new("X-Streaming-Method", "mobile_optimized_chunked"));
         headers.push(Header::new("X-Server-Position", server_position_secs.to_string()));
         headers.push(Header::new("X-Server-Position-Ms", server_position_ms.to_string()));
-        headers.push(Header::new("X-Position-Used", sync_position.to_string()));
+        headers.push(Header::new("X-Position-Used", actual_sync_position.to_string()));
+        headers.push(Header::new("X-Position-Requested", sync_position.to_string()));
         headers.push(Header::new("X-Connection-ID", connection_id[..8].to_string()));
         headers.push(Header::new("X-Platform", platform_info.device_type.clone()));
         
@@ -554,6 +569,20 @@ pub fn direct_stream(
         debug!("Range request received: {}", range);
     }
     
+    // Log iOS-specific parameters if provided
+    if ios_optimized.unwrap_or(false) {
+        debug!("iOS optimizations requested - chunk_size: {:?}, initial_buffer: {:?}, min_buffer_time: {:?}", 
+               chunk_size, initial_buffer, min_buffer_time);
+    }
+    
+    if preload.is_some() {
+        debug!("Preload setting: {:?}", preload);
+    }
+    
+    if buffer_recovery.is_some() {
+        debug!("Buffer recovery mode: {:?}", buffer_recovery);
+    }
+    
     // Cleanup stale connections periodically
     stream_manager.cleanup_stale_connections();
     
@@ -562,7 +591,10 @@ pub fn direct_stream(
         stream_manager.inner().clone(), 
         position,
         platform,
-        range_header.0
+        range_header.0,
+        ios_optimized,
+        chunk_size,
+        initial_buffer
     )
 }
 

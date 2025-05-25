@@ -54,62 +54,6 @@ export class NetworkManager {
             CONFIG.RECONNECT_MIN_DELAY = timeouts.RECONNECT_MIN;
             
             logger.log(`Adapted to ${playerState.networkType} network:`, 'NETWORK');
-// static/js/player/network-manager.js - Network and API management
-
-import { CONFIG, API_ENDPOINTS, NETWORK_CONFIG } from './config.js';
-import { playerState } from './state.js';
-import { logger } from './logger.js';
-
-export class NetworkManager {
-    constructor() {
-        this.setupNetworkMonitoring();
-        this.setupOnlineOfflineHandlers();
-    }
-    
-    setupNetworkMonitoring() {
-        if (navigator.connection) {
-            const updateNetworkInfo = () => {
-                const connection = navigator.connection;
-                const oldType = playerState.networkType;
-                playerState.networkType = connection.effectiveType || 'unknown';
-                
-                if (oldType !== playerState.networkType) {
-                    logger.log(`Network changed: ${oldType} -> ${playerState.networkType}`, 'NETWORK');
-                    this.adaptToNetworkQuality();
-                    this.emit('networkChanged', { 
-                        from: oldType, 
-                        to: playerState.networkType 
-                    });
-                }
-            };
-            
-            navigator.connection.addEventListener('change', updateNetworkInfo);
-            updateNetworkInfo(); // Initial check
-        }
-    }
-    
-    setupOnlineOfflineHandlers() {
-        window.addEventListener('online', () => {
-            logger.log('Network connection restored', 'NETWORK');
-            this.emit('networkRestored');
-        });
-        
-        window.addEventListener('offline', () => {
-            logger.error('Network connection lost', 'NETWORK');
-            this.emit('networkLost');
-        });
-    }
-    
-    adaptToNetworkQuality() {
-        const timeouts = NETWORK_CONFIG.TIMEOUTS[playerState.networkType];
-        
-        if (timeouts) {
-            // Update configuration based on network type
-            CONFIG.NOW_PLAYING_INTERVAL = timeouts.NOW_PLAYING;
-            CONFIG.MOBILE_BUFFER_TIMEOUT = timeouts.BUFFER_TIMEOUT;
-            CONFIG.RECONNECT_MIN_DELAY = timeouts.RECONNECT_MIN;
-            
-            logger.log(`Adapted to ${playerState.networkType} network:`, 'NETWORK');
             logger.log(`- Now playing interval: ${timeouts.NOW_PLAYING}ms`, 'NETWORK');
             logger.log(`- Buffer timeout: ${timeouts.BUFFER_TIMEOUT}ms`, 'NETWORK');
             logger.log(`- Reconnect delay: ${timeouts.RECONNECT_MIN}ms`, 'NETWORK');
