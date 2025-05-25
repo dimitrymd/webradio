@@ -311,6 +311,6 @@
     </div>
 
     <!-- Clean direct streaming player -->
-    <script src="/static/js/direct-player.js"></script>
+    <script type="module" src="/static/js/modular-player.js"></script>
 </body>
 </html>

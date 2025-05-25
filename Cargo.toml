@@ -1,9 +1,9 @@
 [package]
 name = "webradio"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
-description = "Minimal chunked streaming web radio server built with Rust"
-authors = ["Your Name <your.email@example.com>"]
+description = "Mobile-optimized chunked streaming web radio server built with Rust"
+authors = ["Dimitry Iacoviuc <dimitrymd@gmail.com>"]
 license = "MIT"
 keywords = ["radio", "streaming", "mp3", "web", "audio"]
 categories = ["multimedia", "web-programming"]
@@ -28,6 +28,7 @@ mp3-duration = "0.1.10"
 lazy_static = "1.4.0"
 parking_lot = "0.12.1"  # High-performance mutex
 chrono = { version = "0.4.41", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4"] }  # For connection tracking
 
 # Logging
 log = "0.4"

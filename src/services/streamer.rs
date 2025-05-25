@@ -1,12 +1,13 @@
-// src/services/streamer.rs - Enhanced version with precise position tracking
+// src/services/streamer.rs - Fixed version with proper listener tracking and mobile stability
 
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use parking_lot::Mutex;
-use log::{info, warn};
+use log::{info, warn, debug};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::path::PathBuf;
+use std::collections::HashMap;
 
 #[derive(Clone)]
 pub struct StreamManager {
@@ -14,6 +15,8 @@ pub struct StreamManager {
     active_listeners: Arc<AtomicUsize>,
     is_streaming: Arc<AtomicBool>,
     track_ended: Arc<AtomicBool>,
+    // Track listener connections to prevent inflated counts
+    listener_connections: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 struct StreamManagerInner {
@@ -23,10 +26,10 @@ struct StreamManagerInner {
     current_track_info: Option<String>,
     
     // Enhanced playback position tracking
-    playback_position: u64,           // Seconds
-    playback_position_ms: u64,        // Milliseconds component
-    track_start_time: Instant,        // When current track started
-    position_last_updated: Instant,   // Last time position was calculated
+    playback_position: u64,           
+    playback_position_ms: u64,        
+    track_start_time: Instant,        
+    position_last_updated: Instant,   
     
     // Single broadcast thread
     broadcast_thread: Option<thread::JoinHandle<()>>,
@@ -41,7 +44,7 @@ struct StreamManagerInner {
 
 impl StreamManager {
     pub fn new(music_folder: &std::path::Path, _chunk_size: usize, _buffer_size: usize, _cache_time: u64) -> Self {
-        info!("Initializing StreamManager with enhanced position tracking");
+        info!("Initializing StreamManager with mobile stability fixes");
         
         let should_stop = Arc::new(AtomicBool::new(false));
         let now = Instant::now();
@@ -55,7 +58,7 @@ impl StreamManager {
             position_last_updated: now,
             broadcast_thread: None,
             should_stop: should_stop.clone(),
-            current_bitrate: 128000, // Default starting bitrate
+            current_bitrate: 128000,
             current_track_duration: 0,
         };
         
@@ -64,6 +67,7 @@ impl StreamManager {
             active_listeners: Arc::new(AtomicUsize::new(0)),
             is_streaming: Arc::new(AtomicBool::new(false)),
             track_ended: Arc::new(AtomicBool::new(false)),
+            listener_connections: Arc::new(Mutex::new(HashMap::new())),
         }
     }
     
@@ -81,7 +85,7 @@ impl StreamManager {
         let track_ended = self.track_ended.clone();
         let should_stop = inner.should_stop.clone();
         
-        info!("Starting enhanced track management thread");
+        info!("Starting mobile-optimized track management thread");
         
         let thread_handle = thread::spawn(move || {
             Self::track_management_loop(
@@ -104,7 +108,7 @@ impl StreamManager {
         should_stop: Arc<AtomicBool>,
         music_folder: &std::path::Path,
     ) {
-        info!("Enhanced track management thread started");
+        info!("Mobile-optimized track management thread started");
         is_streaming.store(true, Ordering::SeqCst);
         
         let mut current_track_index: Option<usize> = None;
@@ -154,7 +158,7 @@ impl StreamManager {
                     let file_size = metadata.len();
                     if track.duration > 0 && file_size > 0 {
                         inner_lock.current_bitrate = (file_size * 8) / track.duration;
-                        info!("Calculated bitrate: {} kbps", inner_lock.current_bitrate / 1000);
+                        debug!("Calculated bitrate: {} kbps", inner_lock.current_bitrate / 1000);
                     }
                 }
             }
@@ -162,19 +166,19 @@ impl StreamManager {
             // Reset track ended flag
             track_ended.store(false, Ordering::SeqCst);
             
-            // Enhanced track playback with precise position updates
+            // Mobile-optimized track playback with smoother updates
             let track_duration = track.duration;
             if track_duration > 0 {
-                info!("Track \"{}\" will play for {} seconds with 100ms position updates", 
+                info!("Track \"{}\" will play for {} seconds with mobile-optimized updates", 
                       track.title, track_duration);
                 
                 let start_time = Instant::now();
                 
-                // Update position every 100ms for much better precision
+                // Update position every 500ms for better mobile battery life
                 while start_time.elapsed().as_secs() < track_duration && !should_stop.load(Ordering::SeqCst) {
-                    thread::sleep(Duration::from_millis(100));
+                    thread::sleep(Duration::from_millis(500)); // Longer interval for mobile
                     
-                    // Update playback position with millisecond precision
+                    // Update playback position
                     {
                         let mut inner_lock = inner.lock();
                         let elapsed = start_time.elapsed();
@@ -191,11 +195,11 @@ impl StreamManager {
                     inner_lock.playback_position_ms = 0;
                 }
             } else {
-                // Fallback duration if track duration is unknown
+                // Fallback duration for unknown length tracks
                 warn!("Track has no duration, using 180s fallback");
                 let start_time = Instant::now();
                 while start_time.elapsed().as_secs() < 180 && !should_stop.load(Ordering::SeqCst) {
-                    thread::sleep(Duration::from_millis(100));
+                    thread::sleep(Duration::from_millis(500));
                     
                     {
                         let mut inner_lock = inner.lock();
@@ -229,34 +233,94 @@ impl StreamManager {
                     }
                 }
                 
-                // Brief pause between tracks for smoother transitions
-                thread::sleep(Duration::from_millis(500));
+                // Shorter pause between tracks for better mobile experience
+                thread::sleep(Duration::from_millis(250));
             }
         }
         
-        info!("Enhanced track management thread ending");
+        info!("Mobile-optimized track management thread ending");
     }
     
-    // Enhanced API methods for direct streaming with precise position tracking
+    // Fixed listener management with proper connection tracking
+    pub fn increment_listener_count(&self) -> String {
+        let connection_id = uuid::Uuid::new_v4().to_string();
+        let now = Instant::now();
+        
+        // Clean up old connections first (older than 30 seconds)
+        {
+            let mut connections = self.listener_connections.lock();
+            connections.retain(|_, &mut last_seen| {
+                now.duration_since(last_seen).as_secs() < 30
+            });
+        }
+        
+        // Add new connection
+        {
+            let mut connections = self.listener_connections.lock();
+            connections.insert(connection_id.clone(), now);
+        }
+        
+        let new_count = {
+            let connections = self.listener_connections.lock();
+            connections.len()
+        };
+        
+        self.active_listeners.store(new_count, Ordering::SeqCst);
+        info!("Listener connected ({}). Active: {}", &connection_id[..8], new_count);
+        
+        connection_id
+    }
+    
+    pub fn decrement_listener_count(&self, connection_id: &str) {
+        {
+            let mut connections = self.listener_connections.lock();
+            connections.remove(connection_id);
+        }
+        
+        let new_count = {
+            let connections = self.listener_connections.lock();
+            connections.len()
+        };
+        
+        self.active_listeners.store(new_count, Ordering::SeqCst);
+        info!("Listener disconnected ({}). Active: {}", &connection_id[..8], new_count);
+    }
+    
+    pub fn update_listener_heartbeat(&self, connection_id: &str) {
+        let mut connections = self.listener_connections.lock();
+        if let Some(last_seen) = connections.get_mut(connection_id) {
+            *last_seen = Instant::now();
+        }
+    }
+    
+    // Cleanup stale connections periodically
+    pub fn cleanup_stale_connections(&self) {
+        let now = Instant::now();
+        let mut connections = self.listener_connections.lock();
+        
+        let old_count = connections.len();
+        connections.retain(|_, &mut last_seen| {
+            now.duration_since(last_seen).as_secs() < 60 // 60 second timeout
+        });
+        
+        let new_count = connections.len();
+        if old_count != new_count {
+            self.active_listeners.store(new_count, Ordering::SeqCst);
+            info!("Cleaned up {} stale connections. Active: {}", old_count - new_count, new_count);
+        }
+    }
+    
+    // Enhanced API methods
     pub fn get_track_info(&self) -> Option<String> {
         self.inner.lock().current_track_info.clone()
     }
     
     pub fn get_active_listeners(&self) -> usize {
-        self.active_listeners.load(Ordering::SeqCst)
-    }
-    
-    pub fn increment_listener_count(&self) {
-        let new_count = self.active_listeners.fetch_add(1, Ordering::SeqCst) + 1;
-        info!("Listener connected. Active: {}", new_count);
-    }
-    
-    pub fn decrement_listener_count(&self) {
-        let prev = self.active_listeners.load(Ordering::SeqCst);
-        if prev > 0 {
-            let new_count = self.active_listeners.fetch_sub(1, Ordering::SeqCst) - 1;
-            info!("Listener disconnected. Active: {}", new_count);
-        }
+        // Always return the accurate count from the connection map
+        let connections = self.listener_connections.lock();
+        let count = connections.len();
+        self.active_listeners.store(count, Ordering::SeqCst);
+        count
     }
     
     pub fn is_streaming(&self) -> bool {
@@ -267,14 +331,10 @@ impl StreamManager {
         self.track_ended.load(Ordering::SeqCst)
     }
     
-    // Enhanced position tracking with millisecond precision
     pub fn get_playback_position(&self) -> u64 {
         let inner = self.inner.lock();
-        
-        // Calculate real-time position based on elapsed time since track started
         let elapsed = inner.track_start_time.elapsed().as_secs();
         
-        // Ensure we don't exceed track duration
         if inner.current_track_duration > 0 {
             elapsed.min(inner.current_track_duration)
         } else {
@@ -282,16 +342,12 @@ impl StreamManager {
         }
     }
     
-    // New method for precise position with milliseconds
     pub fn get_precise_position(&self) -> (u64, u64) {
         let inner = self.inner.lock();
-        
-        // Calculate real-time position with millisecond precision
         let elapsed = inner.track_start_time.elapsed();
         let total_seconds = elapsed.as_secs();
         let milliseconds = elapsed.subsec_millis() as u64;
         
-        // Ensure we don't exceed track duration
         if inner.current_track_duration > 0 && total_seconds >= inner.current_track_duration {
             (inner.current_track_duration, 0)
         } else {
@@ -299,16 +355,12 @@ impl StreamManager {
         }
     }
     
-    // Get position at a specific point in time (for better synchronization)
     pub fn get_position_at_time(&self, reference_time: Instant) -> (u64, u64) {
         let inner = self.inner.lock();
-        
-        // Calculate position based on reference time
         let elapsed_since_start = reference_time.duration_since(inner.track_start_time);
         let total_seconds = elapsed_since_start.as_secs();
         let milliseconds = elapsed_since_start.subsec_millis() as u64;
         
-        // Bound by track duration
         if inner.current_track_duration > 0 && total_seconds >= inner.current_track_duration {
             (inner.current_track_duration, 0)
         } else {
@@ -320,12 +372,10 @@ impl StreamManager {
         self.inner.lock().current_bitrate
     }
     
-    // New method to get track duration
     pub fn get_current_track_duration(&self) -> u64 {
         self.inner.lock().current_track_duration
     }
     
-    // Method to check if position is near track end
     pub fn is_near_track_end(&self, threshold_seconds: u64) -> bool {
         let inner = self.inner.lock();
         if inner.current_track_duration == 0 {
@@ -336,7 +386,6 @@ impl StreamManager {
         elapsed + threshold_seconds >= inner.current_track_duration
     }
     
-    // Method to estimate remaining track time
     pub fn get_remaining_time(&self) -> u64 {
         let inner = self.inner.lock();
         if inner.current_track_duration == 0 {
@@ -347,7 +396,6 @@ impl StreamManager {
         inner.current_track_duration.saturating_sub(elapsed)
     }
     
-    // Enhanced method to get comprehensive track state
     pub fn get_track_state(&self) -> TrackState {
         let inner = self.inner.lock();
         let elapsed = inner.track_start_time.elapsed();
@@ -371,7 +419,7 @@ impl StreamManager {
     }
     
     pub fn stop_broadcasting(&self) {
-        info!("Stopping enhanced track management");
+        info!("Stopping track management");
         
         self.inner.lock().should_stop.store(true, Ordering::SeqCst);
         self.is_streaming.store(false, Ordering::SeqCst);
@@ -387,7 +435,6 @@ impl StreamManager {
     }
 }
 
-// New struct for comprehensive track state
 #[derive(Debug, Clone)]
 pub struct TrackState {
     pub position_seconds: u64,
