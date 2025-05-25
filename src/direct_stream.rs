@@ -1,4 +1,4 @@
-// src/direct_stream.rs - Fixed version with proper mobile connection management
+// src/direct_stream.rs - Fixed for true radio mode and iOS streaming
 
 use rocket::http::{ContentType, Header, Status};
 use rocket::response::{self, Responder, Response};
@@ -13,19 +13,19 @@ use crate::services::streamer::StreamManager;
 use crate::services::playlist;
 use crate::config;
 
-// Mobile-optimized streaming responder
+// Radio streaming responder
 pub struct DirectStream {
     data: Vec<u8>,
     content_type: ContentType,
     headers: Vec<Header<'static>>,
     status: Status,
-    connection_id: String, // Track connection for proper cleanup
+    connection_id: String,
 }
 
 impl DirectStream {
     pub fn new(
         stream_manager: Arc<StreamManager>, 
-        requested_position: Option<u64>,
+        _requested_position: Option<u64>, // Ignored in radio mode
         platform: Option<String>,
         range_header: Option<String>,
         ios_optimized: Option<bool>,
@@ -48,37 +48,14 @@ impl DirectStream {
         // Enhanced platform detection
         let platform_info = Self::detect_platform(&platform);
         
-        info!("Mobile streaming request: {} by {} (platform: {:?}, connection: {})", 
-              track.title, track.artist, platform_info, &connection_id[..8]);
+        info!("RADIO MODE: New listener connecting - {} (connection: {})", 
+              platform_info.device_type, &connection_id[..8]);
         
-        // Get server position with mobile-friendly synchronization
+        // RADIO MODE: Always get current server position (ignore any client request)
         let (server_position_secs, server_position_ms) = stream_manager.get_precise_position();
         
-        // Radio-style streaming: Always use current server position
-        // This ensures all clients hear the same thing at the same time, like a real radio station
-        let sync_position = server_position_secs;
-        
-        if let Some(req_pos) = requested_position {
-            let diff = (req_pos as i64 - server_position_secs as i64).abs();
-            info!("Radio mode: Client requested {}s, but serving current radio position {}s (diff: {}s)", 
-                  req_pos, server_position_secs, diff);
-        } else {
-            info!("Radio mode: Serving current radio position: {}s", server_position_secs);
-        }
-        
-        // Ensure we never serve from position 0 unless the track just started
-        let actual_sync_position = if sync_position == 0 && server_position_ms < 1000 {
-            // Track just started, it's okay to serve from beginning
-            0
-        } else if sync_position == 0 {
-            // This shouldn't happen - track manager might not be running properly
-            warn!("Radio mode: Server position is 0 but track should be playing. Using 1s offset.");
-            1
-        } else {
-            sync_position
-        };
-        
-        info!("Radio mode: Final sync position: {}s", actual_sync_position);
+        info!("RADIO MODE: Current server radio time: {}s + {}ms", 
+              server_position_secs, server_position_ms);
         
         // Create the full path to the MP3 file
         let file_path = config::MUSIC_FOLDER.join(&track.path);
@@ -102,52 +79,39 @@ impl DirectStream {
         let file_size = file_metadata.len();
         let bitrate_kbps = Self::calculate_accurate_bitrate(&file_path, &track, file_size);
         
-        info!("Mobile streaming: pos={}s, bitrate={}kbps, size={}B, device={}", 
-              sync_position,
-            actual_sync_position, bitrate_kbps, file_size, platform_info.device_type);
+        info!("RADIO MODE: Serving from position {}s, bitrate={}kbps, file={}B, platform={}", 
+              server_position_secs, bitrate_kbps, file_size, platform_info.device_type);
         
-        // Determine start and end bytes based on range header or position
+        // Handle range requests or calculate position-based streaming
         let (start_byte, end_byte, is_partial) = if let Some(range) = &range_header {
             Self::parse_range_header(range, file_size)
         } else {
-            let byte_position = Self::time_to_bytes_mobile_optimized(
-                actual_sync_position, 
+            // RADIO MODE: Calculate byte position from current server time
+            let byte_position = Self::calculate_radio_byte_position(
+                server_position_secs, 
                 bitrate_kbps, 
                 file_size,
                 &file_path,
                 &platform_info
             );
             
-            let start = if byte_position >= file_size { 
-                warn!("Calculated position exceeds file size, starting from beginning");
-                0 
-            } else { 
-                byte_position 
-            };
+            info!("RADIO MODE: Calculated byte position {} for time {}s", 
+                  byte_position, server_position_secs);
             
-            debug!("Mobile position sync: {}s -> byte {} of {}", actual_sync_position, start, file_size);
-            (start, file_size - 1, false)
+            // For iOS, we need to stream from current position to end
+            // For other platforms, we can also stream from current position
+            (byte_position, file_size - 1, false)
         };
         
-        // Determine chunk size based on platform and iOS optimizations
-        let _content_length = end_byte - start_byte + 1;
-        let ios_params = if ios_optimized.unwrap_or(false) {
-            Some((chunk_size.unwrap_or(32768), initial_buffer.unwrap_or(65536)))
+        // Special handling for iOS to prevent fragmentation
+        let data = if platform_info.device_type == "ios" {
+            Self::read_ios_radio_chunk(&file_path, start_byte, file_size, &connection_id)?
         } else {
-            None
+            Self::read_standard_radio_chunk(&file_path, start_byte, end_byte, &platform_info)?
         };
         
-        let data = match Self::read_file_chunk(&file_path, start_byte, end_byte, &platform_info, ios_params) {
-            Ok(data) => data,
-            Err(e) => {
-                error!("Error reading file: {}", e);
-                stream_manager.decrement_listener_count(&connection_id);
-                return Err(Status::InternalServerError);
-            }
-        };
-        
-        // Build mobile-optimized headers
-        let headers = Self::build_mobile_headers(
+        // Build radio-optimized headers
+        let headers = Self::build_radio_headers(
             &platform_info, 
             &track, 
             data.len(),
@@ -155,7 +119,6 @@ impl DirectStream {
             file_size,
             is_partial,
             bitrate_kbps,
-            sync_position,
             server_position_secs,
             server_position_ms,
             &connection_id
@@ -176,10 +139,10 @@ impl DirectStream {
         let platform_str = platform.as_deref().unwrap_or("");
         
         PlatformInfo {
-            device_type: if platform_str.contains("android") || platform_str.contains("Android") {
-                "android".to_string()
-            } else if platform_str == "ios" || platform_str == "safari" {
+            device_type: if platform_str == "ios" || platform_str.contains("safari") {
                 "ios".to_string()
+            } else if platform_str.contains("android") || platform_str.contains("Android") {
+                "android".to_string()
             } else if platform_str == "mobile" {
                 "mobile".to_string()
             } else {
@@ -193,7 +156,8 @@ impl DirectStream {
         }
     }
     
-    fn time_to_bytes_mobile_optimized(
+    // Calculate byte position for radio streaming
+    fn calculate_radio_byte_position(
         position_seconds: u64, 
         bitrate_kbps: u64, 
         file_size: u64,
@@ -204,38 +168,30 @@ impl DirectStream {
             return 0;
         }
         
-        // Detect ID3 tag size
+        // Detect ID3 tag size to skip metadata
         let id3_offset = Self::detect_id3_size(file_path).unwrap_or(0);
         
         // Convert time to bytes
         let bytes_per_second = (bitrate_kbps * 1000) / 8;
-        let byte_position = id3_offset + (position_seconds * bytes_per_second);
+        let raw_byte_position = id3_offset + (position_seconds * bytes_per_second);
         
-        // Mobile-optimized frame alignment (less strict for better compatibility)
-        let frame_size = if platform_info.is_mobile {
-            // Use larger alignment for mobile to reduce overhead
-            1024 // 1KB alignment for mobile devices
+        // Ensure we don't exceed file size
+        let max_position = file_size.saturating_sub(1024); // Leave 1KB buffer at end
+        let clamped_position = raw_byte_position.min(max_position);
+        
+        // For iOS, align to larger boundaries to prevent fragmentation
+        let alignment = if platform_info.device_type == "ios" {
+            2048 // 2KB alignment for iOS
         } else {
-            // Desktop can handle more precise alignment
-            Self::calculate_mp3_frame_size(bitrate_kbps)
+            1024 // 1KB alignment for others
         };
         
-        let aligned_position = (byte_position / frame_size) * frame_size;
-        let max_position = file_size.saturating_sub(config::CHUNK_SIZE as u64);
+        let aligned_position = (clamped_position / alignment) * alignment;
         
-        let final_position = aligned_position.min(max_position);
+        debug!("RADIO POSITION: {}s -> raw={}B, clamped={}B, aligned={}B (ID3={}B)", 
+               position_seconds, raw_byte_position, clamped_position, aligned_position, id3_offset);
         
-        debug!("Mobile position calc: {}s -> {}B (ID3: {}B, align: {}B)", 
-               position_seconds, final_position, id3_offset, frame_size);
-        
-        final_position
-    }
-    
-    fn calculate_mp3_frame_size(bitrate_kbps: u64) -> u64 {
-        // Standard MP3 frame calculation for 44.1kHz
-        let sample_rate = 44100;
-        let frame_size = (144 * bitrate_kbps * 1000) / sample_rate;
-        frame_size.max(144).min(1728)
+        aligned_position
     }
     
     fn detect_id3_size(file_path: &std::path::Path) -> Option<u64> {
@@ -324,51 +280,72 @@ impl DirectStream {
         }
     }
     
-    fn read_file_chunk(
+    // Special iOS radio chunk reading to prevent fragmentation
+    fn read_ios_radio_chunk(
         file_path: &std::path::Path,
         start_byte: u64,
-        end_byte: u64,
-        platform_info: &PlatformInfo,
-        ios_params: Option<(usize, usize)>
-    ) -> Result<Vec<u8>, std::io::Error> {
-        let mut file = File::open(file_path)?;
+        file_size: u64,
+        connection_id: &str
+    ) -> Result<Vec<u8>, Status> {
+        let mut file = File::open(file_path).map_err(|_| Status::InternalServerError)?;
         
         // Seek to start position
         if start_byte > 0 {
-            file.seek(SeekFrom::Start(start_byte))?;
+            file.seek(SeekFrom::Start(start_byte)).map_err(|_| Status::InternalServerError)?;
         }
         
-        // Calculate chunk size based on platform and iOS params
-        let content_length = end_byte - start_byte + 1;
-        let chunk_size = if let Some((ios_chunk_size, _)) = ios_params {
-            ios_chunk_size
-        } else {
-            Self::calculate_mobile_chunk_size(platform_info, content_length)
-        };
+        // For iOS radio, we read a larger continuous chunk to prevent buffering issues
+        // This gives iOS a substantial buffer to work with
+        let remaining_bytes = file_size - start_byte;
+        let chunk_size = std::cmp::min(remaining_bytes, 256 * 1024) as usize; // 256KB for iOS radio
         
         let mut buffer = vec![0u8; chunk_size];
-        let bytes_read = file.read(&mut buffer)?;
+        let bytes_read = file.read(&mut buffer).map_err(|_| Status::InternalServerError)?;
         
         // Truncate buffer to actual bytes read
         buffer.truncate(bytes_read);
         
-        debug!("Read {} bytes for {} device", bytes_read, platform_info.device_type);
+        info!("iOS RADIO: Read {}KB continuous chunk for connection {}", 
+              bytes_read / 1024, &connection_id[..8]);
+        
         Ok(buffer)
     }
     
-    fn calculate_mobile_chunk_size(platform_info: &PlatformInfo, max_content: u64) -> usize {
-        let base_size = match platform_info.device_type.as_str() {
-            "android" => config::CHUNK_SIZE * 8,  // 128KB for Android (good balance)
-            "ios" => config::CHUNK_SIZE * 6,      // 96KB for iOS (Safari optimization) 
-            "mobile" => config::CHUNK_SIZE * 10,  // 160KB for other mobile
-            _ => config::CHUNK_SIZE * 12,         // 192KB for desktop
-        };
+    // Standard radio chunk reading for other platforms
+    fn read_standard_radio_chunk(
+        file_path: &std::path::Path,
+        start_byte: u64,
+        end_byte: u64,
+        platform_info: &PlatformInfo
+    ) -> Result<Vec<u8>, Status> {
+        let mut file = File::open(file_path).map_err(|_| Status::InternalServerError)?;
         
-        // Ensure we don't exceed available content
-        base_size.min(max_content as usize).max(config::CHUNK_SIZE)
+        // Seek to start position
+        if start_byte > 0 {
+            file.seek(SeekFrom::Start(start_byte)).map_err(|_| Status::InternalServerError)?;
+        }
+        
+        // Calculate appropriate chunk size for radio streaming
+        let content_length = end_byte - start_byte + 1;
+        let chunk_size = match platform_info.device_type.as_str() {
+            "android" => std::cmp::min(content_length, 128 * 1024), // 128KB for Android
+            "mobile" => std::cmp::min(content_length, 96 * 1024),   // 96KB for mobile
+            _ => std::cmp::min(content_length, 192 * 1024),         // 192KB for desktop
+        } as usize;
+        
+        let mut buffer = vec![0u8; chunk_size];
+        let bytes_read = file.read(&mut buffer).map_err(|_| Status::InternalServerError)?;
+        
+        // Truncate buffer to actual bytes read
+        buffer.truncate(bytes_read);
+        
+        debug!("RADIO: Read {}KB chunk for {} platform", 
+               bytes_read / 1024, platform_info.device_type);
+        
+        Ok(buffer)
     }
     
-    fn build_mobile_headers(
+    fn build_radio_headers(
         platform_info: &PlatformInfo,
         track: &crate::models::playlist::Track,
         content_length: usize,
@@ -376,80 +353,83 @@ impl DirectStream {
         file_size: u64,
         is_partial: bool,
         bitrate_kbps: u64,
-        sync_position: u64,
-        actual_sync_position: u64,
         server_position_secs: u64,
         server_position_ms: u64,
         connection_id: &str
     ) -> Vec<Header<'static>> {
         let mut headers = Vec::new();
         
-        // Essential headers for audio streaming
+        // Essential headers for radio streaming
         headers.push(Header::new("Accept-Ranges", "bytes"));
         headers.push(Header::new("Content-Length", content_length.to_string()));
         
-        // Mobile-optimized caching and connection headers
+        // Radio-specific caching and connection headers
         match platform_info.device_type.as_str() {
-            "android" => {
-                // Android-specific optimizations
-                headers.push(Header::new("Cache-Control", "no-cache, no-store, must-revalidate"));
-                headers.push(Header::new("Pragma", "no-cache"));
-                headers.push(Header::new("Connection", "keep-alive"));
-                headers.push(Header::new("Keep-Alive", "timeout=30, max=1000"));
-                headers.push(Header::new("X-Android-Optimized", "true"));
-            },
             "ios" => {
-                // iOS/Safari needs different settings for radio streaming
+                // iOS radio streaming - prevent aggressive buffering
+                headers.push(Header::new("Cache-Control", "no-cache, no-store, must-revalidate"));
+                headers.push(Header::new("Pragma", "no-cache"));
+                headers.push(Header::new("Connection", "close")); // Close connection for iOS to prevent issues
+                headers.push(Header::new("X-iOS-Radio-Stream", "continuous"));
+                headers.push(Header::new("X-Content-Duration", "LIVE"));
+                headers.push(Header::new("X-iOS-Buffer-Strategy", "large-chunk"));
+            },
+            "android" => {
+                // Android radio streaming
                 headers.push(Header::new("Cache-Control", "no-cache, no-store, must-revalidate"));
                 headers.push(Header::new("Pragma", "no-cache"));
                 headers.push(Header::new("Connection", "keep-alive"));
-                headers.push(Header::new("Keep-Alive", "timeout=120, max=100"));
-                headers.push(Header::new("X-iOS-Radio-Optimized", "true"));
-                // Disable iOS buffering that causes issues with live streams
-                headers.push(Header::new("X-Content-Duration", "LIVE"));
-                headers.push(Header::new("X-Playback-Session-Id", connection_id[..8].to_string()));
+                headers.push(Header::new("Keep-Alive", "timeout=30, max=100"));
+                headers.push(Header::new("X-Android-Radio-Stream", "optimized"));
             },
             "mobile" => {
-                // General mobile optimization
+                // General mobile radio
                 headers.push(Header::new("Cache-Control", "no-cache, no-store, must-revalidate"));
                 headers.push(Header::new("Pragma", "no-cache"));
                 headers.push(Header::new("Connection", "keep-alive"));
-                headers.push(Header::new("Keep-Alive", "timeout=45, max=1000"));
-                headers.push(Header::new("X-Mobile-Optimized", "true"));
+                headers.push(Header::new("Keep-Alive", "timeout=45, max=100"));
+                headers.push(Header::new("X-Mobile-Radio-Stream", "standard"));
             },
             _ => {
-                // Desktop browsers
+                // Desktop radio streaming
                 headers.push(Header::new("Cache-Control", "no-cache, no-store, must-revalidate"));
                 headers.push(Header::new("Connection", "keep-alive"));
-                headers.push(Header::new("Keep-Alive", "timeout=120, max=1000"));
+                headers.push(Header::new("Keep-Alive", "timeout=120, max=200"));
+                headers.push(Header::new("X-Desktop-Radio-Stream", "optimized"));
             }
         }
         
-        // CORS headers for web player compatibility
+        // CORS headers
         headers.push(Header::new("Access-Control-Allow-Origin", "*"));
         headers.push(Header::new("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS"));
         headers.push(Header::new("Access-Control-Allow-Headers", "Range"));
         headers.push(Header::new("X-Content-Type-Options", "nosniff"));
         
-        // Enhanced debug headers for mobile troubleshooting
+        // Radio synchronization headers - critical for position sync
+        headers.push(Header::new("X-Radio-Mode", "synchronized"));
+        headers.push(Header::new("X-Radio-Position-Seconds", server_position_secs.to_string()));
+        headers.push(Header::new("X-Radio-Position-Milliseconds", server_position_ms.to_string()));
+        headers.push(Header::new("X-Radio-Byte-Start", start_byte.to_string()));
+        headers.push(Header::new("X-Radio-Sync-Timestamp", 
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .to_string()));
+        
+        // Track and streaming info
         headers.push(Header::new("X-Track-Title", track.title.clone()));
         headers.push(Header::new("X-Track-Duration", track.duration.to_string()));
         headers.push(Header::new("X-Bitrate-Kbps", bitrate_kbps.to_string()));
-        headers.push(Header::new("X-Start-Byte", start_byte.to_string()));
         headers.push(Header::new("X-Content-Length", content_length.to_string()));
-        headers.push(Header::new("X-Streaming-Method", "mobile_optimized_chunked"));
-        headers.push(Header::new("X-Server-Position", server_position_secs.to_string()));
-        headers.push(Header::new("X-Server-Position-Ms", server_position_ms.to_string()));
-        headers.push(Header::new("X-Position-Used", actual_sync_position.to_string()));
-        headers.push(Header::new("X-Position-Requested", sync_position.to_string()));
+        headers.push(Header::new("X-Streaming-Method", "radio_synchronized"));
         headers.push(Header::new("X-Connection-ID", connection_id[..8].to_string()));
         headers.push(Header::new("X-Platform", platform_info.device_type.clone()));
         
-        // Mobile-specific debugging headers
-        if platform_info.is_mobile {
-            headers.push(Header::new("X-Mobile-Debug", "connection_managed"));
-            headers.push(Header::new("X-Mobile-Chunk-Size", 
-                Self::calculate_mobile_chunk_size(platform_info, file_size).to_string()));
+        // Platform-specific debugging
+        if platform_info.device_type == "ios" {
+            headers.push(Header::new("X-iOS-Chunk-Size", format!("{}KB", content_length / 1024)));
+            headers.push(Header::new("X-iOS-Strategy", "large-continuous-chunk"));
         }
         
         // Partial content header if needed
@@ -511,20 +491,6 @@ impl<'r> Responder<'r, 'static> for DirectStream {
     }
 }
 
-// Connection tracking for proper listener management
-#[derive(Debug)]
-pub struct ConnectionTracker {
-    pub id: String,
-}
-
-impl Drop for ConnectionTracker {
-    fn drop(&mut self) {
-        // This would ideally notify the StreamManager, but we need a reference
-        // In practice, the cleanup happens via periodic cleanup in StreamManager
-        debug!("Connection {} dropped", &self.id[..8]);
-    }
-}
-
 #[derive(Debug)]
 pub struct RangeHeader(pub Option<String>);
 
@@ -538,67 +504,44 @@ impl<'r> rocket::request::FromRequest<'r> for RangeHeader {
     }
 }
 
-// Main direct streaming endpoint with iOS optimizations
+// Main radio streaming endpoint
 #[rocket::get("/direct-stream?<position>&<platform>&<ios_optimized>&<chunk_size>&<initial_buffer>&<min_buffer_time>&<preload>&<buffer_recovery>")]
 pub fn direct_stream(
-    position: Option<u64>,
+    position: Option<u64>,        // Ignored in radio mode
     platform: Option<String>,
-    ios_optimized: Option<bool>,
-    chunk_size: Option<usize>,
-    initial_buffer: Option<usize>,
-    min_buffer_time: Option<u64>,
-    preload: Option<String>,
-    buffer_recovery: Option<u64>,
+    ios_optimized: Option<bool>,  // Ignored - iOS gets special handling automatically
+    chunk_size: Option<usize>,    // Ignored - calculated per platform
+    initial_buffer: Option<usize>, // Ignored - calculated per platform
+    min_buffer_time: Option<u64>, // Ignored in radio mode
+    preload: Option<String>,      // Ignored in radio mode
+    buffer_recovery: Option<u64>, // Ignored in radio mode
     range_header: RangeHeader,
     stream_manager: &State<Arc<StreamManager>>
 ) -> Result<DirectStream, Status> {
-    // Enhanced logging for mobile debugging
     let platform_str = platform.as_deref().unwrap_or("unknown");
-    let is_mobile = platform_str.contains("android") || 
-                   platform_str.contains("Android") ||
-                   platform_str == "ios" ||
-                   platform_str == "mobile";
     
-    if is_mobile {
-        info!("Mobile direct stream request - platform: {}, position: {:?}", platform_str, position);
-    } else {
-        debug!("Desktop direct stream request - platform: {}, position: {:?}", platform_str, position);
-    }
+    info!("RADIO STREAM REQUEST: platform={}, ignoring position parameter (radio mode)", platform_str);
     
     if let Some(ref range) = range_header.0 {
         debug!("Range request received: {}", range);
     }
     
-    // Log iOS-specific parameters if provided
-    if ios_optimized.unwrap_or(false) {
-        debug!("iOS optimizations requested - chunk_size: {:?}, initial_buffer: {:?}, min_buffer_time: {:?}", 
-               chunk_size, initial_buffer, min_buffer_time);
-    }
-    
-    if preload.is_some() {
-        debug!("Preload setting: {:?}", preload);
-    }
-    
-    if buffer_recovery.is_some() {
-        debug!("Buffer recovery mode: {:?}", buffer_recovery);
-    }
-    
-    // Cleanup stale connections periodically
+    // Cleanup stale connections
     stream_manager.cleanup_stale_connections();
     
-    // Return the streaming handler (connection tracking happens inside DirectStream::new)
+    // Return radio streaming (position is ignored, server determines current time)
     DirectStream::new(
         stream_manager.inner().clone(), 
-        position,
+        None, // Always None in radio mode
         platform,
         range_header.0,
-        ios_optimized,
-        chunk_size,
-        initial_buffer
+        None, // iOS optimization handled automatically
+        None, // Chunk size calculated per platform
+        None  // Buffer size calculated per platform
     )
 }
 
-// Stream status endpoint with accurate listener count
+// Stream status endpoint
 #[rocket::get("/stream-status")]
 pub fn stream_status(stream_manager: &State<Arc<StreamManager>>) -> rocket::serde::json::Json<serde_json::Value> {
     let sm = stream_manager.inner();
@@ -607,7 +550,7 @@ pub fn stream_status(stream_manager: &State<Arc<StreamManager>>) -> rocket::serd
     sm.cleanup_stale_connections();
     
     let is_streaming = sm.is_streaming();
-    let active_listeners = sm.get_active_listeners(); // This now returns accurate count
+    let active_listeners = sm.get_active_listeners();
     let current_bitrate = sm.get_current_bitrate() / 1000;
     let (position_secs, position_ms) = sm.get_precise_position();
     
@@ -617,8 +560,8 @@ pub fn stream_status(stream_manager: &State<Arc<StreamManager>>) -> rocket::serd
             "artist": track.artist,
             "album": track.album,
             "duration": track.duration,
-            "position_seconds": position_secs,
-            "position_milliseconds": position_ms,
+            "radio_position": position_secs,
+            "radio_position_ms": position_ms,
             "path": track.path
         })
     } else {
@@ -629,23 +572,22 @@ pub fn stream_status(stream_manager: &State<Arc<StreamManager>>) -> rocket::serd
         "status": if is_streaming { "streaming" } else { "stopped" },
         "active_listeners": active_listeners,
         "stream_available": true,
-        "playback_position": position_secs,
-        "playback_position_ms": position_ms,
+        "radio_position": position_secs,
+        "radio_position_ms": position_ms,
         "bitrate_kbps": current_bitrate,
         "current_track": track_info,
         "server_time": chrono::Local::now().to_rfc3339(),
         "supports_range_requests": true,
-        "chunked_streaming": true,
-        "mobile_optimized": true,
-        "streaming_method": "mobile_optimized_chunked",
-        "position_accuracy": "millisecond",
-        "connection_management": "tracked",
-        "mobile_features": {
+        "streaming_method": "radio_synchronized",
+        "streaming_mode": "radio",
+        "seeking_enabled": false,
+        "synchronized_playback": true,
+        "radio_features": {
+            "position_ignored": true,
+            "server_time_authoritative": true,
+            "ios_large_chunks": true,
             "android_optimized": true,
-            "ios_optimized": true,
-            "connection_tracking": true,
-            "stale_cleanup": true,
-            "accurate_listener_count": true
+            "desktop_optimized": true
         }
     });
     

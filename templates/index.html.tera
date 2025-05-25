@@ -245,6 +245,23 @@
             color: #b7950b;
             font-size: 14px;
         }
+
+        .optimization-info {
+            background: linear-gradient(135deg, #e3f2fd, #bbdefb);
+            border-left: 4px solid #2196f3;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 8px;
+            font-size: 13px;
+            color: #0d47a1;
+            box-shadow: 0 2px 8px rgba(33, 150, 243, 0.2);
+        }
+
+        .optimization-info h4 {
+            margin: 0 0 8px 0;
+            color: #1565c0;
+            font-size: 14px;
+        }
         
         /* Mobile optimizations */
         @media (max-width: 768px) {
@@ -288,6 +305,12 @@
             .track-artist {
                 font-size: 16px;
             }
+
+            .optimization-info,
+            .radio-info {
+                font-size: 12px;
+                padding: 12px;
+            }
         }
 
         /* iOS-specific optimizations */
@@ -321,16 +344,38 @@
             color: #e74c3c;
             font-weight: bold;
         }
+
+        /* Platform-specific indicators */
+        .platform-indicator {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            font-size: 12px;
+            background: rgba(0,0,0,0.1);
+            padding: 4px 8px;
+            border-radius: 12px;
+            color: #666;
+        }
     </style>
 </head>
 <body>
     <div class="player">
+        <div class="platform-indicator" id="platform-indicator"></div>
+        
         <div class="logo">
             <h1>📻 ChillOut Radio</h1>
         </div>
         
         <div class="streaming-info">
             📡 <strong>Live Radio Stream</strong> - Tune in to what's playing now! All listeners hear the same thing at the same time.
+        </div>
+
+        <div class="optimization-info">
+            <h4>🚀 Optimized Experience:</h4>
+            <p>• <strong>iOS:</strong> Fixed buffering issues with smart buffer management<br>
+            • <strong>Desktop:</strong> Always starts from current radio position<br>
+            • <strong>Android:</strong> Enhanced position synchronization<br>
+            • <strong>All Platforms:</strong> Faster reconnection and better error handling</p>
         </div>
 
         <div class="radio-info">
@@ -372,7 +417,7 @@
         <div class="status-message" id="status-message" style="display: none;"></div>
 
         <div class="footer">
-            <p>🎶 Broadcasting chill music 24/7 • Radio Mode</p>
+            <p>🎶 Broadcasting chill music 24/7 • Optimized Radio Mode v2.3.0</p>
             <p><small>
                 <a href="/diag" style="color: #888; text-decoration: none;">🔧 Diagnostics</a> | 
                 Live Synchronized Streaming
@@ -380,7 +425,36 @@
         </div>
     </div>
 
-    <!-- Radio streaming player -->
-    <script src="/static/js/radio-player.js"></script>
+    <!-- Optimized radio streaming player -->
+    <script src="/static/js/optimized-radio-player.js"></script>
+    
+    <script>
+        // Platform detection for indicator
+        document.addEventListener('DOMContentLoaded', function() {
+            const indicator = document.getElementById('platform-indicator');
+            const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+            const isAndroid = /Android/i.test(navigator.userAgent);
+            const isMobile = /Mobi|Android/i.test(navigator.userAgent);
+            
+            let platform = 'Desktop';
+            if (isIOS) platform = 'iOS Optimized';
+            else if (isAndroid) platform = 'Android Optimized';
+            else if (isMobile) platform = 'Mobile Optimized';
+            
+            indicator.textContent = platform;
+            
+            // Add platform-specific styling
+            if (isIOS) {
+                indicator.style.background = 'rgba(255, 107, 107, 0.2)';
+                indicator.style.color = '#ff6b6b';
+            } else if (isAndroid) {
+                indicator.style.background = 'rgba(255, 152, 0, 0.2)';
+                indicator.style.color = '#FF9800';
+            } else if (isMobile) {
+                indicator.style.background = 'rgba(76, 175, 80, 0.2)';
+                indicator.style.color = '#4CAF50';
+            }
+        });
+    </script>
 </body>
 </html>
