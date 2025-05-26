@@ -255,21 +255,23 @@ pub fn rescan_and_update_durations(playlist_file: &Path, music_folder: &Path) {
     println!("Playlist updated and saved");
 }
 
-// Fixed track_switcher function with proper access to StreamManager
 pub fn track_switcher(stream_manager: Arc<StreamManager>) {
-    // The broadcast thread now handles all track switching internally
-    // This function is now just a monitoring function
-    
     println!("Track monitor thread started - broadcast thread handles all transitions");
     
     let mut last_log_time = Instant::now();
+    let mut last_cleanup_time = Instant::now();
     
     loop {
         thread::sleep(Duration::from_secs(1));
         
+        // Clean up stale connections every 10 seconds
+        if last_cleanup_time.elapsed().as_secs() >= 10 {
+            stream_manager.cleanup_stale_connections();
+            last_cleanup_time = Instant::now();
+        }
+        
         // Just monitor and log status
         if last_log_time.elapsed().as_secs() >= 10 {
-            // Get a reference to the StreamManager
             let active_listeners = stream_manager.get_active_listeners();
             let is_streaming = stream_manager.is_streaming();
             let playback_position = stream_manager.get_playback_position();

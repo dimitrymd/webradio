@@ -1,20 +1,24 @@
 [package]
 name = "webradio"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
-description = "Mobile-optimized chunked streaming web radio server built with Rust"
-authors = ["Dimitry Iacoviuc <dimitrymd@gmail.com>"]
+description = "True Radio - Single broadcast for all listeners"
+authors = ["Your Name"]
 license = "MIT"
-keywords = ["radio", "streaming", "mp3", "web", "audio"]
-categories = ["multimedia", "web-programming"]
 
 [dependencies]
 # Core web framework
 rocket = { version = "0.5.0", features = ["json"] }
 rocket_dyn_templates = { version = "0.1.0-rc.3", features = ["tera"] }
 
-# Async runtime (minimal features needed)
-tokio = { version = "1.28.0", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+# Async runtime
+tokio = { version = "1.28.0", features = ["full"] }
+tokio-stream = "0.1"
+
+# Broadcast streaming
+futures = "0.3"
+async-stream = "0.3"
+bytes = "1.4"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -26,9 +30,9 @@ mp3-duration = "0.1.10"
 
 # Utilities
 lazy_static = "1.4.0"
-parking_lot = "0.12.1"  # High-performance mutex
+parking_lot = "0.12.1"
 chrono = { version = "0.4.41", features = ["serde"] }
-uuid = { version = "1.0", features = ["v4"] }  # For connection tracking
+uuid = { version = "1.0", features = ["v4"] }
 
 # Logging
 log = "0.4"
@@ -38,7 +42,6 @@ env_logger = "0.10.0"
 thiserror = "1.0"
 
 [profile.release]
-# Optimize for performance and size
 opt-level = 3
 lto = true
 codegen-units = 1
@@ -46,6 +49,5 @@ panic = "abort"
 strip = true
 
 [profile.dev]
-# Faster compilation in development
 opt-level = 0
 debug = true
