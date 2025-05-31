@@ -8,8 +8,6 @@ use log::{info, warn, debug, error};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::path::PathBuf;
 use std::collections::{HashMap, VecDeque};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use tokio::sync::broadcast;
 use bytes::Bytes;
 

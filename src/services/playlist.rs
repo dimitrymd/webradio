@@ -9,12 +9,10 @@ use crate::models::playlist::{Track, Playlist};
 use crate::services::streamer::StreamManager;
 use crate::utils::mp3_scanner;
 
-// Constants to fine-tune track switching behavior
-const MIN_TRACK_PLAYBACK_TIME: u64 = 5; // Minimum seconds a track must play before switching
-const TRACK_SWITCH_DELAY_MS: u64 = 200; // Delay between track switch operations
-const MAX_WAIT_BEFORE_SWITCH: u64 = 5; // Maximum seconds to wait before switching tracks
-const HEALTH_CHECK_INTERVAL_SECS: u64 = 3; // Interval for checking stream health
-const TRACK_SWITCH_TIMEOUT_SECS: u64 = 30; // Maximum time allowed for track switching
+// Track switching constants
+const TRACK_CHECK_INTERVAL_SECS: u64 = 1;
+const TRACK_SWITCH_THRESHOLD_SECS: u64 = 5; // Switch when 5 seconds left
+const MIN_TRACK_DURATION: u64 = 10; // Minimum seconds before allowing switch
 
 pub fn get_playlist(playlist_file: &Path) -> Playlist {
     if playlist_file.exists() {
@@ -83,8 +81,8 @@ pub fn get_current_track(playlist_file: &Path, music_folder: &Path) -> Option<Tr
     // Verify file exists
     let track_path = music_folder.join(&current_track.path);
     if !track_path.exists() {
-        // Try to advance if current file doesn't exist
-        return advance_track(playlist_file, music_folder);
+        log::warn!("Current track file not found: {}", track_path.display());
+        return None;
     }
     
     Some(current_track.clone())
@@ -99,7 +97,11 @@ pub fn advance_track(playlist_file: &Path, music_folder: &Path) -> Option<Track>
     }
     
     // Move to next track
+    let old_index = playlist.current_track;
     playlist.current_track = (playlist.current_track + 1) % playlist.tracks.len();
+    
+    log::info!("Advanced playlist from track {} to track {}", old_index, playlist.current_track);
+    
     save_playlist(&playlist, playlist_file);
     
     // Get the new current track
@@ -120,21 +122,35 @@ pub fn scan_music_folder(music_folder: &Path, playlist_file: &Path) -> Playlist 
     // Add new tracks
     for mp3 in mp3_files {
         if !existing_paths.contains(&mp3.path) {
+            log::info!("Adding new track: {} by {}", mp3.title, mp3.artist);
             playlist.tracks.push(mp3);
         }
     }
     
     // Remove tracks that no longer exist
+    let before_count = playlist.tracks.len();
     playlist.tracks.retain(|track| {
-        music_folder.join(&track.path).exists()
+        let exists = music_folder.join(&track.path).exists();
+        if !exists {
+            log::warn!("Removing missing track: {}", track.path);
+        }
+        exists
     });
+    let after_count = playlist.tracks.len();
+    
+    if before_count != after_count {
+        log::info!("Removed {} missing tracks", before_count - after_count);
+    }
     
     // Make sure current_track is valid
     if !playlist.tracks.is_empty() && playlist.current_track >= playlist.tracks.len() {
         playlist.current_track = 0;
+        log::info!("Reset current track index to 0");
     }
     
     save_playlist(&playlist, playlist_file);
+    log::info!("Playlist updated: {} tracks total", playlist.tracks.len());
+    
     playlist
 }
 
@@ -160,7 +176,9 @@ pub fn verify_track_durations(playlist_file: &Path, music_folder: &Path) {
             0
         };
         
-        println!("Track {}: \"{}\" by \"{}\"", i, track.title, track.artist);
+        let current_marker = if i == playlist.current_track { " ← CURRENT" } else { "" };
+        
+        println!("Track {}: \"{}\" by \"{}\"{}", i, track.title, track.artist, current_marker);
         println!("  → Stored duration: {} seconds", track.duration);
         println!("  → Actual duration: {} seconds", actual_duration);
         println!("  → File exists: {}", file_exists);
@@ -255,43 +273,130 @@ pub fn rescan_and_update_durations(playlist_file: &Path, music_folder: &Path) {
     println!("Playlist updated and saved");
 }
 
+// Fixed track switcher that monitors but doesn't interfere
 pub fn track_switcher(stream_manager: Arc<StreamManager>) {
-    println!("Track monitor thread started - broadcast thread handles all transitions");
+    println!("Track monitor thread started - monitoring for automatic track switching");
     
     let mut last_log_time = Instant::now();
     let mut last_cleanup_time = Instant::now();
+    let mut last_position_check = Instant::now();
+    let mut current_track_info: Option<String> = None;
     
     loop {
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(Duration::from_secs(TRACK_CHECK_INTERVAL_SECS));
         
-        // Clean up stale connections every 10 seconds
-        if last_cleanup_time.elapsed().as_secs() >= 10 {
+        // Clean up stale connections every 30 seconds
+        if last_cleanup_time.elapsed().as_secs() >= 30 {
             stream_manager.cleanup_stale_connections();
             last_cleanup_time = Instant::now();
         }
         
-        // Just monitor and log status
-        if last_log_time.elapsed().as_secs() >= 10 {
+        // Check track position every 5 seconds for auto-switching
+        if last_position_check.elapsed().as_secs() >= 5 {
+            let track_state = stream_manager.get_track_state();
+            
+            // Check if we should automatically switch tracks
+            if track_state.duration > 0 && track_state.remaining_time <= TRACK_SWITCH_THRESHOLD_SECS 
+               && track_state.position_seconds >= MIN_TRACK_DURATION {
+                
+                // Get current track info to see if it changed
+                let new_track_info = track_state.track_info.clone();
+                
+                if let Some(ref current_info) = current_track_info {
+                    if let Some(ref new_info) = new_track_info {
+                        if current_info == new_info {
+                            // Same track, check if it's time to switch
+                            log::info!("Track \"{}\" has {}s remaining - requesting switch", 
+                                     extract_title_from_track_info(new_info).unwrap_or("Unknown".to_string()),
+                                     track_state.remaining_time);
+                            
+                            stream_manager.request_track_switch();
+                            
+                            // Update current track info to prevent repeated switches
+                            current_track_info = None;
+                        }
+                    }
+                } else {
+                    current_track_info = new_track_info;
+                }
+            } else if track_state.remaining_time > TRACK_SWITCH_THRESHOLD_SECS {
+                // Track is not near end, update current track info
+                current_track_info = track_state.track_info.clone();
+            }
+            
+            last_position_check = Instant::now();
+        }
+        
+        // Log status every 30 seconds
+        if last_log_time.elapsed().as_secs() >= 30 {
             let active_listeners = stream_manager.get_active_listeners();
             let is_streaming = stream_manager.is_streaming();
-            let playback_position = stream_manager.get_playback_position();
+            let track_state = stream_manager.get_track_state();
             
-            if let Some(track) = get_current_track(&crate::config::PLAYLIST_FILE, &crate::config::MUSIC_FOLDER) {
-                println!("MONITOR: Playing \"{}\" at {}s of {}s, listeners={}, streaming={}", 
-                       track.title, playback_position, track.duration, active_listeners, is_streaming);
+            if let Some(track_info) = &track_state.track_info {
+                if let Some(title) = extract_title_from_track_info(track_info) {
+                    log::info!("MONITOR: \"{}\" at {}s/{}s, listeners={}, streaming={}", 
+                              title, track_state.position_seconds, track_state.duration, 
+                              active_listeners, is_streaming);
+                } else {
+                    log::info!("MONITOR: Position {}s/{}s, listeners={}, streaming={}", 
+                              track_state.position_seconds, track_state.duration,
+                              active_listeners, is_streaming);
+                }
+            } else {
+                log::info!("MONITOR: No track info, listeners={}, streaming={}", 
+                          active_listeners, is_streaming);
             }
             
             last_log_time = Instant::now();
         }
         
-        // Check if we should scan for new files periodically
-        if last_log_time.elapsed().as_secs() >= 300 { // Every 5 minutes
+        // Check if we should scan for new files periodically (every 5 minutes)
+        if last_log_time.elapsed().as_secs() >= 300 {
             let playlist = get_playlist(&crate::config::PLAYLIST_FILE);
             
             if playlist.tracks.is_empty() {
-                println!("MONITOR: No tracks in playlist, scanning for new files...");
+                log::info!("MONITOR: No tracks in playlist, scanning for new files...");
                 scan_music_folder(&crate::config::MUSIC_FOLDER, &crate::config::PLAYLIST_FILE);
             }
         }
     }
+}
+
+// Helper function to extract title from track info JSON
+fn extract_title_from_track_info(track_info: &str) -> Option<String> {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(track_info) {
+        if let Some(title) = parsed.get("title") {
+            if let Some(title_str) = title.as_str() {
+                return Some(title_str.to_string());
+            }
+        }
+    }
+    None
+}
+
+// Add a manual track advance function for testing
+pub fn manually_advance_track(stream_manager: &Arc<StreamManager>) {
+    log::info!("Manual track advance requested");
+    stream_manager.request_track_switch();
+}
+
+// Get next track in playlist without advancing
+pub fn get_next_track(playlist_file: &Path, music_folder: &Path) -> Option<Track> {
+    let playlist = get_playlist(playlist_file);
+    
+    if playlist.tracks.is_empty() {
+        return None;
+    }
+    
+    let next_index = (playlist.current_track + 1) % playlist.tracks.len();
+    let next_track = playlist.tracks.get(next_index)?;
+    
+    // Verify file exists
+    let track_path = music_folder.join(&next_track.path);
+    if !track_path.exists() {
+        return None;
+    }
+    
+    Some(next_track.clone())
 }

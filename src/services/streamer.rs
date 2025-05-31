@@ -1,4 +1,4 @@
-// src/services/streamer.rs - Complete True Radio Implementation
+// src/services/streamer.rs - Fixed track switching and logging
 
 use std::sync::Arc;
 use std::thread;
@@ -13,8 +13,17 @@ use std::io::{Read, Seek, SeekFrom};
 use tokio::sync::broadcast;
 use bytes::Bytes;
 
-const BROADCAST_CHUNK_SIZE: usize = 4096; // 4KB chunks
-const BROADCAST_BUFFER_SIZE: usize = 50;  // Keep 50 chunks in memory
+const BROADCAST_CHUNK_SIZE: usize = 8192;
+const BROADCAST_BUFFER_SIZE: usize = 100;
+const HEARTBEAT_TIMEOUT: u64 = 60;
+
+// Track end reasons - moved outside impl block
+#[derive(Debug)]
+enum TrackEndReason {
+    Finished,
+    Interrupted,
+    Error,
+}
 
 #[derive(Clone)]
 pub struct AudioChunk {
@@ -43,126 +52,130 @@ pub struct TrackState {
     pub track_info: Option<String>,
 }
 
+// Current track information
+#[derive(Clone, Debug)]
+pub struct CurrentTrackInfo {
+    pub track: crate::models::playlist::Track,
+    pub start_time: Instant,
+    pub file_size: u64,
+    pub bitrate: u64,
+}
+
 #[derive(Clone)]
 pub struct StreamManager {
-    inner: Arc<Mutex<StreamManagerInner>>,
-    broadcast_tx: Arc<broadcast::Sender<AudioChunk>>,
-    connections: Arc<RwLock<HashMap<String, ConnectionInfo>>>,
-    active_listeners: Arc<AtomicUsize>,
+    // Control flags
     is_streaming: Arc<AtomicBool>,
     track_ended: Arc<AtomicBool>,
     should_stop: Arc<AtomicBool>,
-}
-
-struct StreamManagerInner {
+    should_switch_track: Arc<AtomicBool>,
+    active_listeners: Arc<AtomicUsize>,
+    current_chunk_id: Arc<AtomicUsize>,
+    
+    // Broadcast channel
+    broadcast_tx: Arc<broadcast::Sender<AudioChunk>>,
+    
+    // Connection tracking
+    connections: Arc<RwLock<HashMap<String, ConnectionInfo>>>,
+    
+    // Current track state (synchronized)
+    current_track: Arc<RwLock<Option<CurrentTrackInfo>>>,
+    
+    // Music folder
     music_folder: PathBuf,
-    current_track_info: Option<String>,
-    current_track_path: Option<PathBuf>,
-    playback_position: u64,
-    track_start_time: Instant,
-    current_chunk_id: u64,
-    current_bitrate: u64,
-    current_track_duration: u64,
-    recent_chunks: VecDeque<AudioChunk>,
-    broadcast_thread: Option<thread::JoinHandle<()>>,
+    
+    // Recent chunks for late joiners
+    recent_chunks: Arc<Mutex<VecDeque<AudioChunk>>>,
 }
 
 impl StreamManager {
     pub fn new(music_folder: &std::path::Path, _chunk_size: usize, _buffer_size: usize, _cache_time: u64) -> Self {
-        info!("Initializing TRUE RADIO StreamManager");
+        info!("Initializing StreamManager with proper track switching");
         
-        let should_stop = Arc::new(AtomicBool::new(false));
-        let now = Instant::now();
-        
-        // Create broadcast channel
-        let (broadcast_tx, _) = broadcast::channel(BROADCAST_BUFFER_SIZE);
-        
-        let inner = StreamManagerInner {
-            music_folder: music_folder.to_path_buf(),
-            current_track_info: None,
-            current_track_path: None,
-            playback_position: 0,
-            track_start_time: now,
-            current_chunk_id: 0,
-            current_bitrate: 128000,
-            current_track_duration: 180,
-            recent_chunks: VecDeque::with_capacity(BROADCAST_BUFFER_SIZE),
-            broadcast_thread: None,
-        };
+        // Create broadcast channel with larger capacity
+        let (broadcast_tx, _) = broadcast::channel(BROADCAST_BUFFER_SIZE * 2);
         
         Self {
-            inner: Arc::new(Mutex::new(inner)),
-            broadcast_tx: Arc::new(broadcast_tx),
-            connections: Arc::new(RwLock::new(HashMap::new())),
-            active_listeners: Arc::new(AtomicUsize::new(0)),
             is_streaming: Arc::new(AtomicBool::new(false)),
             track_ended: Arc::new(AtomicBool::new(false)),
-            should_stop,
+            should_stop: Arc::new(AtomicBool::new(false)),
+            should_switch_track: Arc::new(AtomicBool::new(false)),
+            active_listeners: Arc::new(AtomicUsize::new(0)),
+            current_chunk_id: Arc::new(AtomicUsize::new(0)),
+            
+            broadcast_tx: Arc::new(broadcast_tx),
+            connections: Arc::new(RwLock::new(HashMap::new())),
+            current_track: Arc::new(RwLock::new(None)),
+            
+            music_folder: music_folder.to_path_buf(),
+            recent_chunks: Arc::new(Mutex::new(VecDeque::with_capacity(BROADCAST_BUFFER_SIZE))),
         }
     }
     
     pub fn start_broadcast_thread(&self) {
-        let mut inner = self.inner.lock();
-        
-        if inner.broadcast_thread.is_some() {
-            warn!("Broadcast thread already exists");
+        if self.is_streaming.load(Ordering::SeqCst) {
+            warn!("Broadcast already running");
             return;
         }
         
-        let music_folder = inner.music_folder.clone();
-        let inner_clone = self.inner.clone();
+        let music_folder = self.music_folder.clone();
         let broadcast_tx = self.broadcast_tx.clone();
         let is_streaming = self.is_streaming.clone();
         let track_ended = self.track_ended.clone();
         let should_stop = self.should_stop.clone();
+        let should_switch_track = self.should_switch_track.clone();
+        let current_track = self.current_track.clone();
+        let current_chunk_id = self.current_chunk_id.clone();
+        let recent_chunks = self.recent_chunks.clone();
         
-        info!("Starting TRUE RADIO broadcast thread");
+        info!("Starting broadcast thread with proper track management");
         
-        let thread_handle = thread::spawn(move || {
+        thread::spawn(move || {
             Self::radio_broadcast_loop(
-                inner_clone,
+                music_folder,
                 broadcast_tx,
                 is_streaming,
                 track_ended,
                 should_stop,
-                &music_folder,
+                should_switch_track,
+                current_track,
+                current_chunk_id,
+                recent_chunks,
             );
         });
-        
-        inner.broadcast_thread = Some(thread_handle);
-        self.is_streaming.store(true, Ordering::SeqCst);
     }
     
     fn radio_broadcast_loop(
-        inner: Arc<Mutex<StreamManagerInner>>,
+        music_folder: PathBuf,
         broadcast_tx: Arc<broadcast::Sender<AudioChunk>>,
         is_streaming: Arc<AtomicBool>,
         track_ended: Arc<AtomicBool>,
         should_stop: Arc<AtomicBool>,
-        music_folder: &std::path::Path,
+        should_switch_track: Arc<AtomicBool>,
+        current_track: Arc<RwLock<Option<CurrentTrackInfo>>>,
+        current_chunk_id: Arc<AtomicUsize>,
+        recent_chunks: Arc<Mutex<VecDeque<AudioChunk>>>,
     ) {
-        info!("TRUE RADIO broadcast thread started");
+        info!("Radio broadcast loop started");
         is_streaming.store(true, Ordering::SeqCst);
         
         let mut current_track_index = 0usize;
-        
-        // Set up dummy track info immediately
-        {
-            let mut inner_lock = inner.lock();
-            inner_lock.current_track_info = Some(r#"{"title":"ChillOut Radio","artist":"Live Stream","album":"Now Playing","duration":180,"path":"live.mp3"}"#.to_string());
-            inner_lock.current_track_duration = 180;
-            inner_lock.track_start_time = Instant::now();
-        }
         
         while !should_stop.load(Ordering::SeqCst) {
             // Get playlist
             let playlist = crate::services::playlist::get_playlist(&crate::config::PLAYLIST_FILE);
             
             if playlist.tracks.is_empty() {
-                info!("No tracks available, using silence");
-                Self::broadcast_silence(&inner, &broadcast_tx, &should_stop);
-                thread::sleep(Duration::from_secs(5));
+                info!("No tracks available, broadcasting silence");
+                Self::broadcast_silence(&broadcast_tx, &should_stop, &current_chunk_id, &recent_chunks);
+                thread::sleep(Duration::from_secs(2));
                 continue;
+            }
+            
+            // Check if we should switch tracks
+            if should_switch_track.load(Ordering::SeqCst) {
+                should_switch_track.store(false, Ordering::SeqCst);
+                current_track_index = (current_track_index + 1) % playlist.tracks.len();
+                info!("Manual track switch requested, moving to track {}", current_track_index);
             }
             
             // Get current track
@@ -174,133 +187,189 @@ impl StreamManager {
             let track_path = music_folder.join(&track.path);
             
             if !track_path.exists() {
-                error!("Track not found: {}", track_path.display());
+                error!("Track not found: {} - skipping", track_path.display());
                 current_track_index = (current_track_index + 1) % playlist.tracks.len();
                 continue;
             }
             
-            info!("BROADCASTING: \"{}\" by {} to ALL listeners", track.title, track.artist);
+            // Get file metadata
+            let file_size = match std::fs::metadata(&track_path) {
+                Ok(metadata) => metadata.len(),
+                Err(e) => {
+                    error!("Cannot read file metadata for {}: {}", track_path.display(), e);
+                    current_track_index = (current_track_index + 1) % playlist.tracks.len();
+                    continue;
+                }
+            };
+            
+            // Calculate bitrate
+            let bitrate = if track.duration > 0 {
+                (file_size * 8) / track.duration
+            } else {
+                128000 // Default
+            };
+            
+            // Update current track info FIRST
+            let track_info = CurrentTrackInfo {
+                track: track.clone(),
+                start_time: Instant::now(),
+                file_size,
+                bitrate,
+            };
+            
+            {
+                let mut current_track_lock = current_track.write();
+                *current_track_lock = Some(track_info.clone());
+            }
+            
+            info!("NOW BROADCASTING: \"{}\" by \"{}\" ({}s, {}kb, ~{}kbps)", 
+                  track.title, track.artist, track.duration, file_size / 1024, bitrate / 1000);
             
             // Open and broadcast the track
             match File::open(&track_path) {
                 Ok(mut file) => {
+                    track_ended.store(false, Ordering::SeqCst);
+                    
                     // Skip ID3 tags
                     let id3_size = Self::detect_id3_size(&mut file).unwrap_or(0);
                     if id3_size > 0 {
                         let _ = file.seek(SeekFrom::Start(id3_size));
+                        info!("Skipped {} bytes of ID3 tags", id3_size);
                     }
-                    
-                    // Update inner state
-                    {
-                        let mut inner_lock = inner.lock();
-                        inner_lock.current_track_path = Some(track_path.clone());
-                        inner_lock.track_start_time = Instant::now();
-                        inner_lock.playback_position = 0;
-                        inner_lock.current_track_duration = track.duration;
-                        
-                        if let Ok(track_json) = serde_json::to_string(&track) {
-                            inner_lock.current_track_info = Some(track_json);
-                        }
-                        
-                        // Calculate bitrate
-                        if let Ok(metadata) = std::fs::metadata(&track_path) {
-                            let file_size = metadata.len();
-                            if track.duration > 0 {
-                                inner_lock.current_bitrate = (file_size * 8) / track.duration;
-                            }
-                        }
-                    }
-                    
-                    track_ended.store(false, Ordering::SeqCst);
                     
                     // Broadcast the track
-                    Self::broadcast_track(&inner, &broadcast_tx, &should_stop, &track_ended, file);
+                    let broadcast_result = Self::broadcast_track(
+                        &broadcast_tx,
+                        &should_stop,
+                        &should_switch_track,
+                        &current_chunk_id,
+                        &recent_chunks,
+                        file,
+                        &track_info,
+                    );
+                    
+                    match broadcast_result {
+                        TrackEndReason::Finished => {
+                            info!("Track \"{}\" finished naturally", track.title);
+                            current_track_index = (current_track_index + 1) % playlist.tracks.len();
+                        },
+                        TrackEndReason::Interrupted => {
+                            info!("Track \"{}\" interrupted for switch", track.title);
+                            // Index already updated by switch logic
+                        },
+                        TrackEndReason::Error => {
+                            error!("Track \"{}\" ended with error", track.title);
+                            current_track_index = (current_track_index + 1) % playlist.tracks.len();
+                        }
+                    }
                 },
                 Err(e) => {
-                    error!("Failed to open track: {}", e);
+                    error!("Failed to open track {}: {}", track_path.display(), e);
+                    current_track_index = (current_track_index + 1) % playlist.tracks.len();
                 }
             }
             
-            // Move to next track
-            current_track_index = (current_track_index + 1) % playlist.tracks.len();
+            // Mark track as ended
             track_ended.store(true, Ordering::SeqCst);
+            
+            // Update playlist file with new current track
+            let mut updated_playlist = playlist.clone();
+            updated_playlist.current_track = current_track_index;
+            crate::services::playlist::save_playlist(&updated_playlist, &crate::config::PLAYLIST_FILE);
             
             // Brief pause between tracks
             thread::sleep(Duration::from_millis(500));
         }
         
-        info!("TRUE RADIO broadcast thread ending");
+        info!("Radio broadcast loop ending");
+        is_streaming.store(false, Ordering::SeqCst);
     }
     
     fn broadcast_track(
-        inner: &Arc<Mutex<StreamManagerInner>>,
         broadcast_tx: &Arc<broadcast::Sender<AudioChunk>>,
         should_stop: &Arc<AtomicBool>,
-        track_ended: &Arc<AtomicBool>,
+        should_switch_track: &Arc<AtomicBool>,
+        current_chunk_id: &Arc<AtomicUsize>,
+        recent_chunks: &Arc<Mutex<VecDeque<AudioChunk>>>,
         mut file: File,
-    ) {
+        track_info: &CurrentTrackInfo,
+    ) -> TrackEndReason {
         let mut chunk_buffer = vec![0u8; BROADCAST_CHUNK_SIZE];
         let mut total_bytes_read = 0u64;
         let start_time = Instant::now();
         
-        // Calculate timing for real-time playback (128kbps)
-        let bytes_per_second = 16000u64; // 128kbps = 16KB/s
-        let chunk_duration_ms = (BROADCAST_CHUNK_SIZE as u64 * 1000) / bytes_per_second;
+        // Calculate timing for real-time playback
+        let bytes_per_second = if track_info.bitrate > 0 {
+            track_info.bitrate / 8
+        } else {
+            16000 // Default 128kbps = 16KB/s
+        };
+        
+        let expected_duration = Duration::from_secs(track_info.track.duration);
+        
+        info!("Broadcasting track: {}kbps, expected duration: {}s", 
+              track_info.bitrate / 1000, track_info.track.duration);
         
         loop {
+            // Check stop conditions
             if should_stop.load(Ordering::SeqCst) {
-                break;
+                return TrackEndReason::Interrupted;
             }
             
-            // Read chunk
+            if should_switch_track.load(Ordering::SeqCst) {
+                info!("Track switch requested during playback");
+                return TrackEndReason::Interrupted;
+            }
+            
+            // Check if we should end based on duration
+            let elapsed = start_time.elapsed();
+            if elapsed >= expected_duration {
+                info!("Track duration reached ({:?}), ending naturally", elapsed);
+                return TrackEndReason::Finished;
+            }
+            
+            // Read chunk from file
             let bytes_read = match file.read(&mut chunk_buffer) {
                 Ok(0) => {
-                    info!("Track finished broadcasting");
-                    break;
+                    info!("End of file reached after {:?}", elapsed);
+                    return TrackEndReason::Finished;
                 },
                 Ok(n) => n,
                 Err(e) => {
                     error!("Read error: {}", e);
-                    break;
+                    return TrackEndReason::Error;
                 }
             };
             
             total_bytes_read += bytes_read as u64;
             
             // Create audio chunk
+            let chunk_id = current_chunk_id.fetch_add(1, Ordering::SeqCst) as u64;
             let chunk = AudioChunk {
                 data: Bytes::copy_from_slice(&chunk_buffer[..bytes_read]),
                 position: total_bytes_read,
                 timestamp: Instant::now(),
-                chunk_id: {
-                    let mut inner_lock = inner.lock();
-                    let id = inner_lock.current_chunk_id;
-                    inner_lock.current_chunk_id += 1;
-                    id
-                },
+                chunk_id,
             };
             
             // Update recent chunks buffer
             {
-                let mut inner_lock = inner.lock();
-                if inner_lock.recent_chunks.len() >= BROADCAST_BUFFER_SIZE {
-                    inner_lock.recent_chunks.pop_front();
+                let mut chunks = recent_chunks.lock();
+                if chunks.len() >= BROADCAST_BUFFER_SIZE {
+                    chunks.pop_front();
                 }
-                inner_lock.recent_chunks.push_back(chunk.clone());
-                
-                // Update position
-                inner_lock.playback_position = start_time.elapsed().as_secs();
+                chunks.push_back(chunk.clone());
             }
             
             // Broadcast to all listeners
             match broadcast_tx.send(chunk) {
                 Ok(receiver_count) => {
-                    if receiver_count > 0 {
-                        debug!("Broadcast chunk to {} listeners", receiver_count);
+                    if receiver_count > 0 && chunk_id % 100 == 0 {
+                        debug!("Broadcast chunk {} to {} listeners", chunk_id, receiver_count);
                     }
                 },
                 Err(_) => {
-                    // No receivers
+                    // Channel full or no receivers - this is OK
                 }
             }
             
@@ -310,7 +379,7 @@ impl StreamManager {
             
             if expected_time > actual_time {
                 let sleep_time = expected_time - actual_time;
-                if sleep_time > Duration::from_millis(1) {
+                if sleep_time > Duration::from_millis(1) && sleep_time < Duration::from_millis(1000) {
                     thread::sleep(sleep_time);
                 }
             }
@@ -318,40 +387,36 @@ impl StreamManager {
     }
     
     fn broadcast_silence(
-        inner: &Arc<Mutex<StreamManagerInner>>,
         broadcast_tx: &Arc<broadcast::Sender<AudioChunk>>,
         should_stop: &Arc<AtomicBool>,
+        current_chunk_id: &Arc<AtomicUsize>,
+        recent_chunks: &Arc<Mutex<VecDeque<AudioChunk>>>,
     ) {
         let silence_data = vec![0u8; BROADCAST_CHUNK_SIZE];
         
-        for i in 0..10 { // 10 chunks of silence
+        for i in 0..20 {
             if should_stop.load(Ordering::SeqCst) {
                 break;
             }
             
+            let chunk_id = current_chunk_id.fetch_add(1, Ordering::SeqCst) as u64;
             let chunk = AudioChunk {
                 data: Bytes::from(silence_data.clone()),
                 position: i * BROADCAST_CHUNK_SIZE as u64,
                 timestamp: Instant::now(),
-                chunk_id: {
-                    let mut inner_lock = inner.lock();
-                    let id = inner_lock.current_chunk_id;
-                    inner_lock.current_chunk_id += 1;
-                    id
-                },
+                chunk_id,
             };
             
-            // Update recent chunks
             {
-                let mut inner_lock = inner.lock();
-                if inner_lock.recent_chunks.len() >= BROADCAST_BUFFER_SIZE {
-                    inner_lock.recent_chunks.pop_front();
+                let mut chunks = recent_chunks.lock();
+                if chunks.len() >= BROADCAST_BUFFER_SIZE {
+                    chunks.pop_front();
                 }
-                inner_lock.recent_chunks.push_back(chunk.clone());
+                chunks.push_back(chunk.clone());
             }
             
             let _ = broadcast_tx.send(chunk);
-            thread::sleep(Duration::from_millis(250)); // 4 chunks per second
+            thread::sleep(Duration::from_millis(250));
         }
     }
     
@@ -369,11 +434,16 @@ impl StreamManager {
                       (header[9] as u32 & 0x7F);
             
             let total_size = (size + 10) as u64;
-            debug!("ID3v2 tag size: {} bytes", total_size);
             Some(total_size)
         } else {
             Some(0)
         }
+    }
+    
+    // Public method to request track switch
+    pub fn request_track_switch(&self) {
+        info!("Track switch requested");
+        self.should_switch_track.store(true, Ordering::SeqCst);
     }
     
     // Connection management
@@ -398,8 +468,8 @@ impl StreamManager {
     }
     
     pub fn get_recent_chunks(&self, from_chunk_id: u64) -> Vec<AudioChunk> {
-        let inner = self.inner.lock();
-        inner.recent_chunks
+        let chunks = self.recent_chunks.lock();
+        chunks
             .iter()
             .filter(|chunk| chunk.chunk_id > from_chunk_id)
             .cloned()
@@ -435,16 +505,20 @@ impl StreamManager {
         let now = Instant::now();
         let mut connections = self.connections.write();
         
+        let before_count = connections.len();
         connections.retain(|_id, conn_info| {
-            let age = now.duration_since(conn_info.last_heartbeat).as_secs();
-            age < 60
+            now.duration_since(conn_info.last_heartbeat).as_secs() < HEARTBEAT_TIMEOUT
         });
+        let after_count = connections.len();
         
-        self.update_listener_count();
+        if before_count != after_count {
+            info!("Cleaned up {} stale connections", before_count - after_count);
+            self.active_listeners.store(after_count, Ordering::SeqCst);
+        }
     }
     
     pub fn get_active_listeners(&self) -> usize {
-        self.connections.read().len()
+        self.active_listeners.load(Ordering::SeqCst)
     }
     
     pub fn is_streaming(&self) -> bool {
@@ -456,26 +530,44 @@ impl StreamManager {
     }
     
     pub fn get_playback_position(&self) -> u64 {
-        let inner = self.inner.lock();
-        inner.track_start_time.elapsed().as_secs()
+        if let Some(track_info) = self.current_track.read().as_ref() {
+            track_info.start_time.elapsed().as_secs()
+        } else {
+            0
+        }
     }
     
     pub fn get_precise_position(&self) -> (u64, u64) {
-        let inner = self.inner.lock();
-        let elapsed = inner.track_start_time.elapsed();
-        (elapsed.as_secs(), elapsed.subsec_millis() as u64)
+        if let Some(track_info) = self.current_track.read().as_ref() {
+            let elapsed = track_info.start_time.elapsed();
+            (elapsed.as_secs(), elapsed.subsec_millis() as u64)
+        } else {
+            (0, 0)
+        }
     }
     
     pub fn get_track_info(&self) -> Option<String> {
-        self.inner.lock().current_track_info.clone()
+        if let Some(track_info) = self.current_track.read().as_ref() {
+            serde_json::to_string(&track_info.track).ok()
+        } else {
+            None
+        }
     }
     
     pub fn get_current_bitrate(&self) -> u64 {
-        self.inner.lock().current_bitrate
+        if let Some(track_info) = self.current_track.read().as_ref() {
+            track_info.bitrate
+        } else {
+            128000
+        }
     }
     
     pub fn get_current_track_duration(&self) -> u64 {
-        self.inner.lock().current_track_duration
+        if let Some(track_info) = self.current_track.read().as_ref() {
+            track_info.track.duration
+        } else {
+            0
+        }
     }
     
     pub fn track_ended(&self) -> bool {
@@ -483,9 +575,8 @@ impl StreamManager {
     }
     
     pub fn get_track_state(&self) -> TrackState {
-        let inner = self.inner.lock();
         let (position_secs, position_ms) = self.get_precise_position();
-        let duration = inner.current_track_duration;
+        let duration = self.get_current_track_duration();
         let remaining = if duration > position_secs { duration - position_secs } else { 0 };
         let is_near_end = remaining <= 10;
         
@@ -495,8 +586,8 @@ impl StreamManager {
             duration,
             remaining_time: remaining,
             is_near_end,
-            bitrate: inner.current_bitrate,
-            track_info: inner.current_track_info.clone(),
+            bitrate: self.get_current_bitrate(),
+            track_info: self.get_track_info(),
         }
     }
     
@@ -508,18 +599,8 @@ impl StreamManager {
     }
     
     pub fn stop_broadcasting(&self) {
-        info!("Stopping TRUE RADIO broadcast");
-        
+        info!("Stopping radio broadcast");
         self.should_stop.store(true, Ordering::SeqCst);
-        self.is_streaming.store(false, Ordering::SeqCst);
-        
-        let thread = {
-            let mut inner = self.inner.lock();
-            inner.broadcast_thread.take()
-        };
-        
-        if let Some(thread) = thread {
-            let _ = thread.join();
-        }
+        thread::sleep(Duration::from_millis(100));
     }
 }
