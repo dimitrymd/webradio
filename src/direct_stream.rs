@@ -1,18 +1,94 @@
 // src/direct_stream.rs - True Radio implementation
 
-use rocket::http::{ContentType, Header, Status};
-use rocket::response::{self, Responder};
-use rocket::{Request, Response, State};
+use rocket::http::{ContentType, Status};
+use rocket::response::{self, Responder, Response};
+use rocket::{Request, State};
 use std::sync::Arc;
-use log::{info, error, debug};
+use log::{info, debug};
 use tokio::sync::broadcast;
 use futures::stream::{Stream, StreamExt};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::io;
+use tokio::io::{AsyncRead, ReadBuf};
+use bytes::Bytes;
 
 use crate::services::streamer::{StreamManager, AudioChunk};
 use crate::services::playlist;
 use crate::config;
+
+// Wrapper to convert Stream to AsyncRead
+pub struct StreamToAsyncRead {
+    stream: Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>,
+    buffer: Option<Bytes>,
+    buffer_pos: usize,
+}
+
+impl StreamToAsyncRead {
+    pub fn new(stream: Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>) -> Self {
+        Self {
+            stream,
+            buffer: None,
+            buffer_pos: 0,
+        }
+    }
+}
+
+impl AsyncRead for StreamToAsyncRead {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            // If we have data in buffer, use it first
+            if let Some(ref buffer) = self.buffer {
+                if self.buffer_pos < buffer.len() {
+                    let buffer_len = buffer.len();
+                    let to_copy = std::cmp::min(buf.remaining(), buffer_len - self.buffer_pos);
+                    buf.put_slice(&buffer[self.buffer_pos..self.buffer_pos + to_copy]);
+                    self.buffer_pos += to_copy;
+                    
+                    if self.buffer_pos >= buffer_len {
+                        self.buffer = None;
+                        self.buffer_pos = 0;
+                    }
+                    
+                    return Poll::Ready(Ok(()));
+                }
+            }
+            
+            // Get next chunk from stream
+            match self.stream.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(bytes))) => {
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    
+                    let to_copy = std::cmp::min(buf.remaining(), bytes.len());
+                    buf.put_slice(&bytes[..to_copy]);
+                    
+                    if to_copy < bytes.len() {
+                        // Store remaining bytes for next read
+                        self.buffer = Some(bytes.slice(to_copy..));
+                        self.buffer_pos = 0;
+                    }
+                    
+                    return Poll::Ready(Ok(()));
+                },
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Err(e));
+                },
+                Poll::Ready(None) => {
+                    return Poll::Ready(Ok(()));
+                },
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+}
 
 // True radio streaming responder
 pub struct RadioBroadcastStream {
@@ -21,6 +97,7 @@ pub struct RadioBroadcastStream {
     platform: String,
     initial_chunks: Vec<AudioChunk>,
     current_index: usize,
+    finished: bool,
 }
 
 impl RadioBroadcastStream {
@@ -31,8 +108,8 @@ impl RadioBroadcastStream {
         // Subscribe to the broadcast
         let (connection_id, receiver) = stream_manager.subscribe();
         
-        let platform_str = platform.as_deref().unwrap_or("unknown");
-        stream_manager.update_connection_info(&connection_id, platform_str.to_string(), String::new());
+        let platform_str = platform.as_deref().unwrap_or("unknown").to_string();
+        stream_manager.update_connection_info(&connection_id, platform_str.clone(), String::new());
         
         info!("TRUE RADIO: New listener {} connected to broadcast on {}", 
               &connection_id[..8], platform_str);
@@ -45,29 +122,34 @@ impl RadioBroadcastStream {
         Ok(RadioBroadcastStream {
             receiver,
             connection_id,
-            platform: platform_str.to_string(),
+            platform: platform_str,
             initial_chunks,
             current_index: 0,
+            finished: false,
         })
     }
 }
 
 impl Stream for RadioBroadcastStream {
-    type Item = Result<Vec<u8>, std::io::Error>;
+    type Item = Result<Bytes, io::Error>;
     
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.finished {
+            return Poll::Ready(None);
+        }
+        
         // First, send any initial chunks
         if self.current_index < self.initial_chunks.len() {
-            let chunk = &self.initial_chunks[self.current_index];
+            let chunk_data = self.initial_chunks[self.current_index].data.clone();
             self.current_index += 1;
-            return Poll::Ready(Some(Ok(chunk.data.to_vec())));
+            return Poll::Ready(Some(Ok(chunk_data)));
         }
         
         // Then, receive from broadcast
         match self.receiver.try_recv() {
             Ok(chunk) => {
                 debug!("Sending chunk {} to listener {}", chunk.chunk_id, &self.connection_id[..8]);
-                Poll::Ready(Some(Ok(chunk.data.to_vec())))
+                Poll::Ready(Some(Ok(chunk.data)))
             },
             Err(broadcast::error::TryRecvError::Empty) => {
                 // No data available yet, register waker
@@ -82,6 +164,7 @@ impl Stream for RadioBroadcastStream {
             },
             Err(broadcast::error::TryRecvError::Closed) => {
                 info!("Broadcast closed for listener {}", &self.connection_id[..8]);
+                self.finished = true;
                 Poll::Ready(None)
             },
         }
@@ -94,12 +177,34 @@ impl Drop for RadioBroadcastStream {
     }
 }
 
-// Simple streaming response
-pub struct DirectStream {
-    stream: Pin<Box<dyn Stream<Item = Result<Vec<u8>, std::io::Error>> + Send>>,
-    headers: Vec<Header<'static>>,
+// Wrapper struct that handles cleanup
+struct StreamWrapper {
+    stream: StreamToAsyncRead,
     connection_id: String,
     stream_manager: Arc<StreamManager>,
+}
+
+impl AsyncRead for StreamWrapper {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl Drop for StreamWrapper {
+    fn drop(&mut self) {
+        self.stream_manager.decrement_listener_count(&self.connection_id);
+        info!("Stream wrapper cleaned up for connection {}", &self.connection_id[..8]);
+    }
+}
+
+// Simple streaming response
+pub struct DirectStream {
+    stream: StreamWrapper,
+    headers: Vec<(String, String)>,
 }
 
 impl DirectStream {
@@ -124,11 +229,21 @@ impl DirectStream {
         // Build headers
         let headers = Self::build_radio_headers(&platform_str, &track, &connection_id);
         
-        Ok(DirectStream {
-            stream: Box::pin(broadcast_stream),
-            headers,
+        // Convert stream to AsyncRead
+        let byte_stream: Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>> = 
+            Box::pin(broadcast_stream);
+        let async_read = StreamToAsyncRead::new(byte_stream);
+        
+        // Wrap with cleanup handler
+        let stream_wrapper = StreamWrapper {
+            stream: async_read,
             connection_id: connection_id.clone(),
-            stream_manager,
+            stream_manager: stream_manager.clone(),
+        };
+        
+        Ok(DirectStream {
+            stream: stream_wrapper,
+            headers,
         })
     }
     
@@ -136,34 +251,34 @@ impl DirectStream {
         platform: &str,
         track: &crate::models::playlist::Track,
         connection_id: &str,
-    ) -> Vec<Header<'static>> {
+    ) -> Vec<(String, String)> {
         let mut headers = Vec::new();
         
         // Essential headers
-        headers.push(Header::new("Content-Type", "audio/mpeg"));
-        headers.push(Header::new("Cache-Control", "no-cache, no-store"));
-        headers.push(Header::new("Transfer-Encoding", "chunked")); // Chunked for streaming
+        headers.push(("Content-Type".to_string(), "audio/mpeg".to_string()));
+        headers.push(("Cache-Control".to_string(), "no-cache, no-store".to_string()));
+        headers.push(("Transfer-Encoding".to_string(), "chunked".to_string()));
         
         // Platform-specific
         match platform {
             "ios" => {
-                headers.push(Header::new("Connection", "keep-alive"));
-                headers.push(Header::new("X-Accel-Buffering", "no"));
+                headers.push(("Connection".to_string(), "keep-alive".to_string()));
+                headers.push(("X-Accel-Buffering".to_string(), "no".to_string()));
             },
             _ => {
-                headers.push(Header::new("Connection", "keep-alive"));
+                headers.push(("Connection".to_string(), "keep-alive".to_string()));
             }
         }
         
         // CORS
-        headers.push(Header::new("Access-Control-Allow-Origin", "*"));
+        headers.push(("Access-Control-Allow-Origin".to_string(), "*".to_string()));
         
         // Radio metadata
-        headers.push(Header::new("X-Radio-Mode", "true-broadcast"));
-        headers.push(Header::new("X-Track-Title", track.title.clone()));
-        headers.push(Header::new("X-Track-Artist", track.artist.clone()));
-        headers.push(Header::new("X-Connection-ID", connection_id));
-        headers.push(Header::new("X-Platform", platform.to_string()));
+        headers.push(("X-Radio-Mode".to_string(), "true-broadcast".to_string()));
+        headers.push(("X-Track-Title".to_string(), track.title.clone()));
+        headers.push(("X-Track-Artist".to_string(), track.artist.clone()));
+        headers.push(("X-Connection-ID".to_string(), connection_id.to_string()));
+        headers.push(("X-Platform".to_string(), platform.to_string()));
         
         headers
     }
@@ -171,19 +286,16 @@ impl DirectStream {
 
 impl<'r> Responder<'r, 'static> for DirectStream {
     fn respond_to(self, _: &'r Request<'_>) -> response::Result<'static> {
-        // Use Rocket's streaming response
-        Response::build()
-            .header(ContentType::new("audio", "mpeg"))
-            .raw_header("Transfer-Encoding", "chunked")
-            .raw_header("Cache-Control", "no-cache")
-            .streamed_body(self.stream)
-            .ok()
-    }
-}
-
-impl Drop for DirectStream {
-    fn drop(&mut self) {
-        self.stream_manager.decrement_listener_count(&self.connection_id);
+        let mut response = Response::build();
+        response.header(ContentType::new("audio", "mpeg"));
+        
+        // Add custom headers
+        for (name, value) in self.headers {
+            response.raw_header(name, value);
+        }
+        
+        // Move the stream into the response
+        response.streamed_body(self.stream).ok()
     }
 }
 
@@ -221,30 +333,21 @@ pub fn direct_stream(
 
 // For async streaming support
 pub struct RadioStreamResponse {
-    stream: Pin<Box<dyn Stream<Item = Result<Vec<u8>, std::io::Error>> + Send>>,
+    stream: Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>,
 }
 
 impl RadioStreamResponse {
     pub fn new(stream_manager: Arc<StreamManager>) -> Self {
-        let broadcast_stream = stream_manager.get_broadcast_receiver();
+        let broadcast_stream = RadioBroadcastStream::new(stream_manager, None)
+            .expect("Failed to create broadcast stream");
         
-        // Convert broadcast receiver to async stream
+        // Convert to bytes stream
         let stream = async_stream::stream! {
-            let mut receiver = broadcast_stream;
-            loop {
-                match receiver.recv().await {
-                    Ok(chunk) => {
-                        yield Ok(chunk.data.to_vec());
-                    },
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        // Continue despite lag
-                        debug!("Stream lagged by {} chunks", skipped);
-                        continue;
-                    },
-                    Err(_) => {
-                        // Stream closed
-                        break;
-                    }
+            let mut stream = broadcast_stream;
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(bytes) => yield Ok(bytes),
+                    Err(e) => yield Err(e),
                 }
             }
         };
@@ -255,20 +358,31 @@ impl RadioStreamResponse {
     }
 }
 
-// Alternative async endpoint (if using Rocket with async)
+// Alternative simple endpoint (returns JSON status instead of Response)
 #[rocket::get("/radio-stream")]
 pub async fn radio_stream(
     stream_manager: &State<Arc<StreamManager>>
-) -> Result<Response<'static>, Status> {
-    let response = RadioStreamResponse::new(stream_manager.inner().clone());
+) -> rocket::serde::json::Json<serde_json::Value> {
+    let sm = stream_manager.inner();
     
-    Response::build()
-        .header(ContentType::new("audio", "mpeg"))
-        .raw_header("Transfer-Encoding", "chunked")
-        .raw_header("Cache-Control", "no-cache")
-        .raw_header("X-Radio-Mode", "true-broadcast")
-        .streamed_body(response.stream)
-        .ok()
+    sm.cleanup_stale_connections();
+    
+    let active_listeners = sm.get_active_listeners();
+    let (position_secs, position_ms) = sm.get_precise_position();
+    
+    rocket::serde::json::Json(serde_json::json!({
+        "status": "streaming",
+        "mode": "true_radio_broadcast",
+        "active_listeners": active_listeners,
+        "radio_position": position_secs,
+        "radio_position_ms": position_ms,
+        "message": "Use /direct-stream for actual audio streaming",
+        "endpoints": {
+            "audio_stream": "/direct-stream",
+            "now_playing": "/api/now-playing",
+            "stats": "/api/stats"
+        }
+    }))
 }
 
 // Status endpoint
