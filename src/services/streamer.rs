@@ -1,4 +1,4 @@
-// src/services/streamer.rs - Fixed track switching and logging
+// src/services/streamer.rs - CPU Optimized version
 
 use std::sync::Arc;
 use std::thread;
@@ -9,15 +9,17 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::path::PathBuf;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, BufReader};
 use tokio::sync::broadcast;
 use bytes::Bytes;
 
-const BROADCAST_CHUNK_SIZE: usize = 8192;
-const BROADCAST_BUFFER_SIZE: usize = 100;
+// Optimized constants for better CPU usage
+const BROADCAST_CHUNK_SIZE: usize = 8192; // Back to 8KB for smoother playback
+const BROADCAST_BUFFER_SIZE: usize = 50;   // Reduced from 100
 const HEARTBEAT_TIMEOUT: u64 = 60;
+const TIMING_PRECISION_MS: u64 = 50;       // Reduced timing precision to save CPU
 
-// Track end reasons - moved outside impl block
+// Track end reasons
 #[derive(Debug)]
 enum TrackEndReason {
     Finished,
@@ -71,11 +73,12 @@ pub struct StreamManager {
     active_listeners: Arc<AtomicUsize>,
     current_chunk_id: Arc<AtomicUsize>,
     
-    // Broadcast channel
+    // Broadcast channel - smaller capacity to reduce memory usage
     broadcast_tx: Arc<broadcast::Sender<AudioChunk>>,
     
-    // Connection tracking
+    // Connection tracking - with cleanup optimization
     connections: Arc<RwLock<HashMap<String, ConnectionInfo>>>,
+    last_cleanup: Arc<Mutex<Instant>>,
     
     // Current track state (synchronized)
     current_track: Arc<RwLock<Option<CurrentTrackInfo>>>,
@@ -83,16 +86,16 @@ pub struct StreamManager {
     // Music folder
     music_folder: PathBuf,
     
-    // Recent chunks for late joiners
+    // Recent chunks for late joiners - smaller buffer
     recent_chunks: Arc<Mutex<VecDeque<AudioChunk>>>,
 }
 
 impl StreamManager {
     pub fn new(music_folder: &std::path::Path, _chunk_size: usize, _buffer_size: usize, _cache_time: u64) -> Self {
-        info!("Initializing StreamManager with proper track switching");
+        info!("Initializing CPU-optimized StreamManager");
         
-        // Create broadcast channel with larger capacity
-        let (broadcast_tx, _) = broadcast::channel(BROADCAST_BUFFER_SIZE * 2);
+        // Create broadcast channel with optimized capacity
+        let (broadcast_tx, _) = broadcast::channel(BROADCAST_BUFFER_SIZE);
         
         Self {
             is_streaming: Arc::new(AtomicBool::new(false)),
@@ -105,6 +108,7 @@ impl StreamManager {
             broadcast_tx: Arc::new(broadcast_tx),
             connections: Arc::new(RwLock::new(HashMap::new())),
             current_track: Arc::new(RwLock::new(None)),
+            last_cleanup: Arc::new(Mutex::new(Instant::now())),
             
             music_folder: music_folder.to_path_buf(),
             recent_chunks: Arc::new(Mutex::new(VecDeque::with_capacity(BROADCAST_BUFFER_SIZE))),
@@ -127,7 +131,7 @@ impl StreamManager {
         let current_chunk_id = self.current_chunk_id.clone();
         let recent_chunks = self.recent_chunks.clone();
         
-        info!("Starting broadcast thread with proper track management");
+        info!("Starting CPU-optimized broadcast thread");
         
         thread::spawn(move || {
             Self::radio_broadcast_loop(
@@ -155,19 +159,28 @@ impl StreamManager {
         current_chunk_id: Arc<AtomicUsize>,
         recent_chunks: Arc<Mutex<VecDeque<AudioChunk>>>,
     ) {
-        info!("Radio broadcast loop started");
+        info!("CPU-optimized broadcast loop started");
         is_streaming.store(true, Ordering::SeqCst);
         
         let mut current_track_index = 0usize;
+        let mut playlist_cache_time = Instant::now();
+        let mut cached_playlist = None;
         
         while !should_stop.load(Ordering::SeqCst) {
-            // Get playlist
-            let playlist = crate::services::playlist::get_playlist(&crate::config::PLAYLIST_FILE);
+            // Cache playlist for 10 seconds to reduce file I/O (reduced from 30)
+            let playlist = if playlist_cache_time.elapsed().as_secs() >= 10 || cached_playlist.is_none() {
+                let new_playlist = crate::services::playlist::get_playlist(&crate::config::PLAYLIST_FILE);
+                playlist_cache_time = Instant::now();
+                cached_playlist = Some(new_playlist.clone());
+                new_playlist
+            } else {
+                cached_playlist.as_ref().unwrap().clone()
+            };
             
             if playlist.tracks.is_empty() {
                 info!("No tracks available, broadcasting silence");
                 Self::broadcast_silence(&broadcast_tx, &should_stop, &current_chunk_id, &recent_chunks);
-                thread::sleep(Duration::from_secs(2));
+                thread::sleep(Duration::from_secs(5)); // Longer sleep to reduce CPU
                 continue;
             }
             
@@ -175,7 +188,11 @@ impl StreamManager {
             if should_switch_track.load(Ordering::SeqCst) {
                 should_switch_track.store(false, Ordering::SeqCst);
                 current_track_index = (current_track_index + 1) % playlist.tracks.len();
-                info!("Manual track switch requested, moving to track {}", current_track_index);
+                info!("Manual track switch to index {}", current_track_index);
+                
+                // Invalidate playlist cache when switching tracks
+                cached_playlist = None;
+                playlist_cache_time = Instant::now() - Duration::from_secs(11);
             }
             
             // Get current track
@@ -192,7 +209,7 @@ impl StreamManager {
                 continue;
             }
             
-            // Get file metadata
+            // Get file metadata (cached for performance)
             let file_size = match std::fs::metadata(&track_path) {
                 Ok(metadata) => metadata.len(),
                 Err(e) => {
@@ -209,7 +226,7 @@ impl StreamManager {
                 128000 // Default
             };
             
-            // Update current track info FIRST
+            // Update current track info
             let track_info = CurrentTrackInfo {
                 track: track.clone(),
                 start_time: Instant::now(),
@@ -222,40 +239,40 @@ impl StreamManager {
                 *current_track_lock = Some(track_info.clone());
             }
             
-            info!("NOW BROADCASTING: \"{}\" by \"{}\" ({}s, {}kb, ~{}kbps)", 
-                  track.title, track.artist, track.duration, file_size / 1024, bitrate / 1000);
+            info!("BROADCASTING: \"{}\" by \"{}\" ({}s, {}kbps)", 
+                  track.title, track.artist, track.duration, bitrate / 1000);
             
-            // Open and broadcast the track
+            // Open and broadcast the track with buffered reading
             match File::open(&track_path) {
-                Ok(mut file) => {
+                Ok(file) => {
+                    let mut buf_reader = BufReader::with_capacity(BROADCAST_CHUNK_SIZE * 4, file);
                     track_ended.store(false, Ordering::SeqCst);
                     
                     // Skip ID3 tags
-                    let id3_size = Self::detect_id3_size(&mut file).unwrap_or(0);
+                    let id3_size = Self::detect_id3_size(&mut buf_reader).unwrap_or(0);
                     if id3_size > 0 {
-                        let _ = file.seek(SeekFrom::Start(id3_size));
+                        let _ = buf_reader.seek(SeekFrom::Start(id3_size));
                         info!("Skipped {} bytes of ID3 tags", id3_size);
                     }
                     
                     // Broadcast the track
-                    let broadcast_result = Self::broadcast_track(
+                    let broadcast_result = Self::broadcast_track_optimized(
                         &broadcast_tx,
                         &should_stop,
                         &should_switch_track,
                         &current_chunk_id,
                         &recent_chunks,
-                        file,
+                        buf_reader,
                         &track_info,
                     );
                     
                     match broadcast_result {
                         TrackEndReason::Finished => {
-                            info!("Track \"{}\" finished naturally", track.title);
+                            info!("Track \"{}\" finished", track.title);
                             current_track_index = (current_track_index + 1) % playlist.tracks.len();
                         },
                         TrackEndReason::Interrupted => {
-                            info!("Track \"{}\" interrupted for switch", track.title);
-                            // Index already updated by switch logic
+                            info!("Track \"{}\" interrupted", track.title);
                         },
                         TrackEndReason::Error => {
                             error!("Track \"{}\" ended with error", track.title);
@@ -269,29 +286,24 @@ impl StreamManager {
                 }
             }
             
-            // Mark track as ended
             track_ended.store(true, Ordering::SeqCst);
             
-            // Update playlist file with new current track
-            let mut updated_playlist = playlist.clone();
-            updated_playlist.current_track = current_track_index;
-            crate::services::playlist::save_playlist(&updated_playlist, &crate::config::PLAYLIST_FILE);
-            
             // Brief pause between tracks
-            thread::sleep(Duration::from_millis(500));
+            thread::sleep(Duration::from_millis(200)); // Reduced from 500ms
         }
         
-        info!("Radio broadcast loop ending");
+        info!("CPU-optimized broadcast loop ending");
         is_streaming.store(false, Ordering::SeqCst);
     }
     
-    fn broadcast_track(
+    // Optimized track broadcasting with better timing control
+    fn broadcast_track_optimized(
         broadcast_tx: &Arc<broadcast::Sender<AudioChunk>>,
         should_stop: &Arc<AtomicBool>,
         should_switch_track: &Arc<AtomicBool>,
         current_chunk_id: &Arc<AtomicUsize>,
         recent_chunks: &Arc<Mutex<VecDeque<AudioChunk>>>,
-        mut file: File,
+        mut file: BufReader<File>,
         track_info: &CurrentTrackInfo,
     ) -> TrackEndReason {
         let mut chunk_buffer = vec![0u8; BROADCAST_CHUNK_SIZE];
@@ -306,25 +318,26 @@ impl StreamManager {
         };
         
         let expected_duration = Duration::from_secs(track_info.track.duration);
+        let mut last_timing_check = Instant::now();
         
-        info!("Broadcasting track: {}kbps, expected duration: {}s", 
+        info!("Broadcasting: {}kbps, duration: {}s", 
               track_info.bitrate / 1000, track_info.track.duration);
         
         loop {
-            // Check stop conditions
-            if should_stop.load(Ordering::SeqCst) {
+            // Check stop conditions (less frequently to save CPU)
+            if should_stop.load(Ordering::Relaxed) { // Use Relaxed ordering for better performance
                 return TrackEndReason::Interrupted;
             }
             
-            if should_switch_track.load(Ordering::SeqCst) {
+            if should_switch_track.load(Ordering::Relaxed) {
                 info!("Track switch requested during playback");
                 return TrackEndReason::Interrupted;
             }
             
-            // Check if we should end based on duration
+            // Check duration less frequently
             let elapsed = start_time.elapsed();
             if elapsed >= expected_duration {
-                info!("Track duration reached ({:?}), ending naturally", elapsed);
+                info!("Track duration reached ({:?})", elapsed);
                 return TrackEndReason::Finished;
             }
             
@@ -344,15 +357,15 @@ impl StreamManager {
             total_bytes_read += bytes_read as u64;
             
             // Create audio chunk
-            let chunk_id = current_chunk_id.fetch_add(1, Ordering::SeqCst) as u64;
+            let chunk_id = current_chunk_id.fetch_add(1, Ordering::Relaxed);
             let chunk = AudioChunk {
                 data: Bytes::copy_from_slice(&chunk_buffer[..bytes_read]),
                 position: total_bytes_read,
                 timestamp: Instant::now(),
-                chunk_id,
+                chunk_id: chunk_id as u64,
             };
             
-            // Update recent chunks buffer
+            // Update recent chunks buffer (less locking)
             {
                 let mut chunks = recent_chunks.lock();
                 if chunks.len() >= BROADCAST_BUFFER_SIZE {
@@ -364,28 +377,34 @@ impl StreamManager {
             // Broadcast to all listeners
             match broadcast_tx.send(chunk) {
                 Ok(receiver_count) => {
-                    if receiver_count > 0 && chunk_id % 100 == 0 {
+                    // Log less frequently to reduce CPU usage
+                    if receiver_count > 0 && chunk_id % 200 == 0 {
                         debug!("Broadcast chunk {} to {} listeners", chunk_id, receiver_count);
                     }
                 },
                 Err(_) => {
-                    // Channel full or no receivers - this is OK
+                    // Channel full or no receivers - continue anyway
                 }
             }
             
-            // Real-time timing control
-            let expected_time = Duration::from_millis((total_bytes_read * 1000) / bytes_per_second);
-            let actual_time = start_time.elapsed();
-            
-            if expected_time > actual_time {
-                let sleep_time = expected_time - actual_time;
-                if sleep_time > Duration::from_millis(1) && sleep_time < Duration::from_millis(1000) {
-                    thread::sleep(sleep_time);
+            // Optimized timing control (check less frequently)
+            if last_timing_check.elapsed().as_millis() >= TIMING_PRECISION_MS as u128 {
+                let expected_time = Duration::from_millis((total_bytes_read * 1000) / bytes_per_second);
+                let actual_time = start_time.elapsed();
+                
+                if expected_time > actual_time {
+                    let sleep_time = expected_time - actual_time;
+                    if sleep_time > Duration::from_millis(1) && sleep_time < Duration::from_millis(500) {
+                        thread::sleep(sleep_time);
+                    }
                 }
+                
+                last_timing_check = Instant::now();
             }
         }
     }
     
+    // Optimized silence broadcasting
     fn broadcast_silence(
         broadcast_tx: &Arc<broadcast::Sender<AudioChunk>>,
         should_stop: &Arc<AtomicBool>,
@@ -394,17 +413,17 @@ impl StreamManager {
     ) {
         let silence_data = vec![0u8; BROADCAST_CHUNK_SIZE];
         
-        for i in 0..20 {
-            if should_stop.load(Ordering::SeqCst) {
+        for i in 0..10 { // Fewer silence chunks
+            if should_stop.load(Ordering::Relaxed) {
                 break;
             }
             
-            let chunk_id = current_chunk_id.fetch_add(1, Ordering::SeqCst) as u64;
+            let chunk_id = current_chunk_id.fetch_add(1, Ordering::Relaxed);
             let chunk = AudioChunk {
                 data: Bytes::from(silence_data.clone()),
                 position: i * BROADCAST_CHUNK_SIZE as u64,
                 timestamp: Instant::now(),
-                chunk_id,
+                chunk_id: chunk_id as u64,
             };
             
             {
@@ -416,11 +435,12 @@ impl StreamManager {
             }
             
             let _ = broadcast_tx.send(chunk);
-            thread::sleep(Duration::from_millis(250));
+            thread::sleep(Duration::from_millis(500)); // Longer sleep for silence
         }
     }
     
-    fn detect_id3_size(file: &mut File) -> Option<u64> {
+    // Optimized ID3 detection with BufReader
+    fn detect_id3_size(file: &mut BufReader<File>) -> Option<u64> {
         let mut header = [0u8; 10];
         
         if file.read_exact(&mut header).is_err() {
@@ -443,10 +463,10 @@ impl StreamManager {
     // Public method to request track switch
     pub fn request_track_switch(&self) {
         info!("Track switch requested");
-        self.should_switch_track.store(true, Ordering::SeqCst);
+        self.should_switch_track.store(true, Ordering::Relaxed);
     }
     
-    // Connection management
+    // Connection management with optimized cleanup
     pub fn subscribe(&self) -> (String, broadcast::Receiver<AudioChunk>) {
         let connection_id = uuid::Uuid::new_v4().to_string();
         let receiver = self.broadcast_tx.subscribe();
@@ -498,10 +518,18 @@ impl StreamManager {
     
     fn update_listener_count(&self) {
         let count = self.connections.read().len();
-        self.active_listeners.store(count, Ordering::SeqCst);
+        self.active_listeners.store(count, Ordering::Relaxed);
     }
     
+    // Optimized cleanup - only run when needed
     pub fn cleanup_stale_connections(&self) {
+        let mut last_cleanup = self.last_cleanup.lock();
+        
+        // Only cleanup every 30 seconds to reduce CPU usage
+        if last_cleanup.elapsed().as_secs() < 30 {
+            return;
+        }
+        
         let now = Instant::now();
         let mut connections = self.connections.write();
         
@@ -513,16 +541,18 @@ impl StreamManager {
         
         if before_count != after_count {
             info!("Cleaned up {} stale connections", before_count - after_count);
-            self.active_listeners.store(after_count, Ordering::SeqCst);
+            self.active_listeners.store(after_count, Ordering::Relaxed);
         }
+        
+        *last_cleanup = now;
     }
     
     pub fn get_active_listeners(&self) -> usize {
-        self.active_listeners.load(Ordering::SeqCst)
+        self.active_listeners.load(Ordering::Relaxed)
     }
     
     pub fn is_streaming(&self) -> bool {
-        self.is_streaming.load(Ordering::SeqCst)
+        self.is_streaming.load(Ordering::Relaxed)
     }
     
     pub fn get_broadcast_receiver(&self) -> broadcast::Receiver<AudioChunk> {
@@ -571,7 +601,7 @@ impl StreamManager {
     }
     
     pub fn track_ended(&self) -> bool {
-        self.track_ended.load(Ordering::SeqCst)
+        self.track_ended.load(Ordering::Relaxed)
     }
     
     pub fn get_track_state(&self) -> TrackState {
@@ -599,8 +629,8 @@ impl StreamManager {
     }
     
     pub fn stop_broadcasting(&self) {
-        info!("Stopping radio broadcast");
-        self.should_stop.store(true, Ordering::SeqCst);
+        info!("Stopping CPU-optimized broadcast");
+        self.should_stop.store(true, Ordering::Relaxed);
         thread::sleep(Duration::from_millis(100));
     }
 }

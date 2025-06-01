@@ -9,7 +9,7 @@ use rocket::http::Header;
 use rocket::response::Responder;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use log::info;
+use log::{info, warn};
 
 use crate::services::streamer::StreamManager;
 use crate::services::playlist;
@@ -59,7 +59,7 @@ pub async fn now_playing(
     let active_listeners = sm.get_active_listeners();
     let is_mobile = mobile_client.unwrap_or(false) || android_client.unwrap_or(false);
     
-    // Get track info from stream manager
+    // PRIORITY: Get track info from stream manager first (this is what's actually playing)
     if let Some(track_json) = &track_state.track_info {
         if let Ok(mut track_value) = serde_json::from_str::<serde_json::Value>(track_json) {
             if let serde_json::Value::Object(ref mut map) = track_value {
@@ -109,6 +109,9 @@ pub async fn now_playing(
                 map.insert("streaming".to_string(), serde_json::Value::Bool(sm.is_streaming()));
                 map.insert("track_ended".to_string(), serde_json::Value::Bool(sm.track_ended()));
                 
+                // Add source indicator for debugging
+                map.insert("track_source".to_string(), serde_json::Value::String("stream_manager".to_string()));
+                
                 if is_mobile {
                     map.insert("mobile_optimized".to_string(), serde_json::Value::Bool(true));
                 }
@@ -117,30 +120,61 @@ pub async fn now_playing(
         }
     }
     
-    // Fallback response
-    CorsResponse::new(Json(serde_json::json!({
-        "title": "ChillOut Radio",
-        "artist": "Live Stream",
-        "album": "Now Playing",
-        "duration": track_state.duration,
-        "path": "live.mp3",
-        "radio_position": track_state.position_seconds,
-        "radio_position_ms": track_state.position_milliseconds,
-        "playback_position": track_state.position_seconds,
-        "playback_position_ms": track_state.position_milliseconds,
-        "active_listeners": active_listeners,
-        "bitrate": track_state.bitrate / 1000,
-        "server_timestamp": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-        "streaming_mode": "radio",
-        "seeking_enabled": false,
-        "synchronized_playback": true,
-        "streaming": sm.is_streaming(),
-        "mobile_optimized": is_mobile,
-        "track_ended": sm.track_ended()
-    })))
+    // FALLBACK: If stream manager has no track info, try playlist as fallback
+    warn!("Stream manager has no track info, falling back to playlist");
+    if let Some(current_track) = playlist::get_current_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER) {
+        CorsResponse::new(Json(serde_json::json!({
+            "title": current_track.title,
+            "artist": current_track.artist,
+            "album": current_track.album,
+            "duration": current_track.duration,
+            "path": current_track.path,
+            "radio_position": track_state.position_seconds,
+            "radio_position_ms": track_state.position_milliseconds,
+            "playback_position": track_state.position_seconds,
+            "playback_position_ms": track_state.position_milliseconds,
+            "active_listeners": active_listeners,
+            "bitrate": track_state.bitrate / 1000,
+            "server_timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            "streaming_mode": "radio",
+            "seeking_enabled": false,
+            "synchronized_playback": true,
+            "streaming": sm.is_streaming(),
+            "mobile_optimized": is_mobile,
+            "track_ended": sm.track_ended(),
+            "track_source": "playlist_fallback"
+        })))
+    } else {
+        // LAST RESORT: Default response
+        warn!("No track info available from any source");
+        CorsResponse::new(Json(serde_json::json!({
+            "title": "ChillOut Radio",
+            "artist": "Live Stream",
+            "album": "Now Playing",
+            "duration": track_state.duration,
+            "path": "live.mp3",
+            "radio_position": track_state.position_seconds,
+            "radio_position_ms": track_state.position_milliseconds,
+            "playback_position": track_state.position_seconds,
+            "playback_position_ms": track_state.position_milliseconds,
+            "active_listeners": active_listeners,
+            "bitrate": track_state.bitrate / 1000,
+            "server_timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            "streaming_mode": "radio",
+            "seeking_enabled": false,
+            "synchronized_playback": true,
+            "streaming": sm.is_streaming(),
+            "mobile_optimized": is_mobile,
+            "track_ended": sm.track_ended(),
+            "track_source": "default"
+        })))
+    }
 }
 
 #[get("/api/heartbeat?<connection_id>")]

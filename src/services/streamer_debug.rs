@@ -1,13 +1,14 @@
-// src/services/streamer_debug.rs - Minimal debug version
+// src/services/streamer_debug.rs - Cleaned up imports
 
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use parking_lot::{Mutex, RwLock};
-use log::{info, warn, debug, error};
+use log::{info, debug}; // Removed unused warn and error
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::path::PathBuf;
 use std::collections::{HashMap, VecDeque};
+// Removed unused File, Read, Seek, SeekFrom imports
 use tokio::sync::broadcast;
 use bytes::Bytes;
 
@@ -171,7 +172,7 @@ impl StreamManager {
         info!("DEBUG: Broadcast thread started successfully");
     }
     
-    // All the required methods
+    // All the required methods (same as before, just cleaned up imports)
     pub fn subscribe(&self) -> (String, broadcast::Receiver<AudioChunk>) {
         let connection_id = uuid::Uuid::new_v4().to_string();
         let receiver = self.broadcast_tx.subscribe();
@@ -297,6 +298,10 @@ impl StreamManager {
         if let Some(conn_info) = connections.get_mut(connection_id) {
             conn_info.last_heartbeat = Instant::now();
         }
+    }
+    
+    pub fn request_track_switch(&self) {
+        info!("DEBUG: Track switch requested");
     }
     
     pub fn stop_broadcasting(&self) {

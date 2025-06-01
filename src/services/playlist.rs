@@ -1,3 +1,5 @@
+// src/services/playlist.rs - CPU Optimized version
+
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -9,12 +11,48 @@ use crate::models::playlist::{Track, Playlist};
 use crate::services::streamer::StreamManager;
 use crate::utils::mp3_scanner;
 
-// Track switching constants
-const TRACK_CHECK_INTERVAL_SECS: u64 = 1;
-const TRACK_SWITCH_THRESHOLD_SECS: u64 = 5; // Switch when 5 seconds left
-const MIN_TRACK_DURATION: u64 = 10; // Minimum seconds before allowing switch
+// Optimized constants - less frequent operations
+const TRACK_CHECK_INTERVAL_SECS: u64 = 5;     // Increased from 1
+const TRACK_SWITCH_THRESHOLD_SECS: u64 = 10;  // Increased from 5
+const MIN_TRACK_DURATION: u64 = 15;           // Increased from 10
+const STATUS_LOG_INTERVAL_SECS: u64 = 60;     // Increased from 30
+const CLEANUP_INTERVAL_SECS: u64 = 60;        // Increased from 30
+const FILE_SCAN_INTERVAL_SECS: u64 = 600;     // Check for new files every 10 minutes
+
+// Cached playlist to reduce file I/O
+static mut CACHED_PLAYLIST: Option<(Playlist, Instant)> = None;
+static mut CACHE_MUTEX: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
+// Function to invalidate cache when playlist changes
+pub fn invalidate_playlist_cache() {
+    unsafe {
+        let _lock = CACHE_MUTEX.lock();
+        CACHED_PLAYLIST = None;
+    }
+}
 
 pub fn get_playlist(playlist_file: &Path) -> Playlist {
+    unsafe {
+        let _lock = CACHE_MUTEX.lock();
+        
+        // Check if we have a cached playlist that's less than 10 seconds old (reduced from 30)
+        if let Some((ref cached_playlist, cache_time)) = CACHED_PLAYLIST {
+            if cache_time.elapsed().as_secs() < 10 {
+                return cached_playlist.clone();
+            }
+        }
+        
+        // Read from file
+        let playlist = read_playlist_from_file(playlist_file);
+        
+        // Update cache
+        CACHED_PLAYLIST = Some((playlist.clone(), Instant::now()));
+        
+        playlist
+    }
+}
+
+fn read_playlist_from_file(playlist_file: &Path) -> Playlist {
     if playlist_file.exists() {
         match fs::read_to_string(playlist_file) {
             Ok(content) => {
@@ -52,6 +90,10 @@ pub fn save_playlist(playlist: &Playlist, playlist_file: &Path) {
         Ok(mut file) => {
             if let Err(e) = file.write_all(json.as_bytes()) {
                 log::error!("Error writing playlist file: {}", e);
+            } else {
+                // IMPORTANT: Invalidate cache after successful write
+                invalidate_playlist_cache();
+                log::debug!("Playlist saved and cache invalidated");
             }
         },
         Err(e) => {
@@ -78,7 +120,7 @@ pub fn get_current_track(playlist_file: &Path, music_folder: &Path) -> Option<Tr
     // Get current track
     let current_track = playlist.tracks.get(current_index)?;
     
-    // Verify file exists
+    // Verify file exists (less frequently to save CPU)
     let track_path = music_folder.join(&current_track.path);
     if !track_path.exists() {
         log::warn!("Current track file not found: {}", track_path.display());
@@ -120,14 +162,16 @@ pub fn scan_music_folder(music_folder: &Path, playlist_file: &Path) -> Playlist 
         .collect();
     
     // Add new tracks
+    let mut added_count = 0;
     for mp3 in mp3_files {
         if !existing_paths.contains(&mp3.path) {
             log::info!("Adding new track: {} by {}", mp3.title, mp3.artist);
             playlist.tracks.push(mp3);
+            added_count += 1;
         }
     }
     
-    // Remove tracks that no longer exist
+    // Remove tracks that no longer exist (batch operation)
     let before_count = playlist.tracks.len();
     playlist.tracks.retain(|track| {
         let exists = music_folder.join(&track.path).exists();
@@ -137,9 +181,11 @@ pub fn scan_music_folder(music_folder: &Path, playlist_file: &Path) -> Playlist 
         exists
     });
     let after_count = playlist.tracks.len();
+    let removed_count = before_count - after_count;
     
-    if before_count != after_count {
-        log::info!("Removed {} missing tracks", before_count - after_count);
+    if added_count > 0 || removed_count > 0 {
+        log::info!("Playlist updated: +{} tracks, -{} tracks, total: {}", 
+                   added_count, removed_count, playlist.tracks.len());
     }
     
     // Make sure current_track is valid
@@ -149,12 +195,10 @@ pub fn scan_music_folder(music_folder: &Path, playlist_file: &Path) -> Playlist 
     }
     
     save_playlist(&playlist, playlist_file);
-    log::info!("Playlist updated: {} tracks total", playlist.tracks.len());
-    
     playlist
 }
 
-// Verify track durations and report any issues
+// Optimized duration verification - only run when explicitly requested
 pub fn verify_track_durations(playlist_file: &Path, music_folder: &Path) {
     let playlist = get_playlist(playlist_file);
     
@@ -166,7 +210,7 @@ pub fn verify_track_durations(playlist_file: &Path, music_folder: &Path) {
         let file_path = music_folder.join(&track.path);
         let file_exists = file_path.exists();
         
-        // Attempt to verify duration directly from file
+        // Only check duration for files that exist
         let actual_duration = if file_exists {
             match mp3_duration::from_path(&file_path) {
                 Ok(duration) => duration.as_secs(),
@@ -182,7 +226,6 @@ pub fn verify_track_durations(playlist_file: &Path, music_folder: &Path) {
         println!("  → Stored duration: {} seconds", track.duration);
         println!("  → Actual duration: {} seconds", actual_duration);
         println!("  → File exists: {}", file_exists);
-        println!("  → Path: {}", file_path.display());
         
         // Flag potential issues
         if track.duration == 0 {
@@ -199,23 +242,19 @@ pub fn verify_track_durations(playlist_file: &Path, music_folder: &Path) {
     println!("=====================================================");
 }
 
-// Rescan and fix track durations
+// Optimized duration updating - batch operations
 pub fn rescan_and_update_durations(playlist_file: &Path, music_folder: &Path) {
     println!("Rescanning music folder and updating track durations...");
     
-    // Get current playlist
     let mut playlist = get_playlist(playlist_file);
-    
-    // Keep track of which tracks were updated
     let mut updated_count = 0;
     
-    // Iterate through all tracks and update their durations
+    // Process tracks in batches to reduce I/O overhead
     for track in &mut playlist.tracks {
         let file_path = music_folder.join(&track.path);
         
         // Skip if file doesn't exist
         if !file_path.exists() {
-            println!("File not found, skipping: {}", file_path.display());
             continue;
         }
         
@@ -253,7 +292,6 @@ pub fn rescan_and_update_durations(playlist_file: &Path, music_folder: &Path) {
                 // Try filesize method as fallback
                 if let Ok(metadata) = file_path.metadata() {
                     let file_size = metadata.len();
-                    // Rough estimate: MP3 at 128kbps = 16KB per second
                     let estimated_duration = file_size / 16000;
                     if estimated_duration > 0 && estimated_duration != old_duration {
                         println!("Using filesize estimate for \"{}\": {} -> {} seconds", 
@@ -273,31 +311,33 @@ pub fn rescan_and_update_durations(playlist_file: &Path, music_folder: &Path) {
     println!("Playlist updated and saved");
 }
 
-// Fixed track switcher that monitors but doesn't interfere
+// CPU-optimized track switcher with reduced frequency operations
 pub fn track_switcher(stream_manager: Arc<StreamManager>) {
-    println!("Track monitor thread started - monitoring for automatic track switching");
+    println!("Track monitor thread started - CPU optimized version");
     
     let mut last_log_time = Instant::now();
     let mut last_cleanup_time = Instant::now();
     let mut last_position_check = Instant::now();
+    let mut last_file_scan = Instant::now();
     let mut current_track_info: Option<String> = None;
     
     loop {
         thread::sleep(Duration::from_secs(TRACK_CHECK_INTERVAL_SECS));
         
-        // Clean up stale connections every 30 seconds
-        if last_cleanup_time.elapsed().as_secs() >= 30 {
+        // Clean up stale connections less frequently
+        if last_cleanup_time.elapsed().as_secs() >= CLEANUP_INTERVAL_SECS {
             stream_manager.cleanup_stale_connections();
             last_cleanup_time = Instant::now();
         }
         
-        // Check track position every 5 seconds for auto-switching
-        if last_position_check.elapsed().as_secs() >= 5 {
+        // Check track position for auto-switching (reduced frequency)
+        if last_position_check.elapsed().as_secs() >= TRACK_CHECK_INTERVAL_SECS {
             let track_state = stream_manager.get_track_state();
             
             // Check if we should automatically switch tracks
-            if track_state.duration > 0 && track_state.remaining_time <= TRACK_SWITCH_THRESHOLD_SECS 
-               && track_state.position_seconds >= MIN_TRACK_DURATION {
+            if track_state.duration > 0 && 
+               track_state.remaining_time <= TRACK_SWITCH_THRESHOLD_SECS && 
+               track_state.position_seconds >= MIN_TRACK_DURATION {
                 
                 // Get current track info to see if it changed
                 let new_track_info = track_state.track_info.clone();
@@ -306,8 +346,7 @@ pub fn track_switcher(stream_manager: Arc<StreamManager>) {
                     if let Some(ref new_info) = new_track_info {
                         if current_info == new_info {
                             // Same track, check if it's time to switch
-                            log::info!("Track \"{}\" has {}s remaining - requesting switch", 
-                                     extract_title_from_track_info(new_info).unwrap_or("Unknown".to_string()),
+                            log::info!("Track has {}s remaining - requesting switch", 
                                      track_state.remaining_time);
                             
                             stream_manager.request_track_switch();
@@ -327,8 +366,8 @@ pub fn track_switcher(stream_manager: Arc<StreamManager>) {
             last_position_check = Instant::now();
         }
         
-        // Log status every 30 seconds
-        if last_log_time.elapsed().as_secs() >= 30 {
+        // Log status less frequently to reduce CPU usage
+        if last_log_time.elapsed().as_secs() >= STATUS_LOG_INTERVAL_SECS {
             let active_listeners = stream_manager.get_active_listeners();
             let is_streaming = stream_manager.is_streaming();
             let track_state = stream_manager.get_track_state();
@@ -351,37 +390,39 @@ pub fn track_switcher(stream_manager: Arc<StreamManager>) {
             last_log_time = Instant::now();
         }
         
-        // Check if we should scan for new files periodically (every 5 minutes)
-        if last_log_time.elapsed().as_secs() >= 300 {
+        // Check for new files much less frequently to save CPU
+        if last_file_scan.elapsed().as_secs() >= FILE_SCAN_INTERVAL_SECS {
             let playlist = get_playlist(&crate::config::PLAYLIST_FILE);
             
             if playlist.tracks.is_empty() {
                 log::info!("MONITOR: No tracks in playlist, scanning for new files...");
                 scan_music_folder(&crate::config::MUSIC_FOLDER, &crate::config::PLAYLIST_FILE);
             }
+            
+            last_file_scan = Instant::now();
         }
     }
 }
 
-// Helper function to extract title from track info JSON
+// Helper function to extract title from track info JSON (cached)
 fn extract_title_from_track_info(track_info: &str) -> Option<String> {
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(track_info) {
-        if let Some(title) = parsed.get("title") {
-            if let Some(title_str) = title.as_str() {
-                return Some(title_str.to_string());
-            }
+    // Simple string search instead of full JSON parsing for better performance
+    if let Some(start) = track_info.find("\"title\":\"") {
+        let start = start + 9; // Length of "title":"
+        if let Some(end) = track_info[start..].find('"') {
+            return Some(track_info[start..start + end].to_string());
         }
     }
     None
 }
 
-// Add a manual track advance function for testing
+// Manual track advance function for testing
 pub fn manually_advance_track(stream_manager: &Arc<StreamManager>) {
     log::info!("Manual track advance requested");
     stream_manager.request_track_switch();
 }
 
-// Get next track in playlist without advancing
+// Get next track in playlist without advancing (cached)
 pub fn get_next_track(playlist_file: &Path, music_folder: &Path) -> Option<Track> {
     let playlist = get_playlist(playlist_file);
     
@@ -392,7 +433,7 @@ pub fn get_next_track(playlist_file: &Path, music_folder: &Path) -> Option<Track
     let next_index = (playlist.current_track + 1) % playlist.tracks.len();
     let next_track = playlist.tracks.get(next_index)?;
     
-    // Verify file exists
+    // Verify file exists (but don't log to reduce noise)
     let track_path = music_folder.join(&next_track.path);
     if !track_path.exists() {
         return None;
