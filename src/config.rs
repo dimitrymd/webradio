@@ -1,132 +1,137 @@
-// src/config.rs - CPU Optimized configuration
+// src/config.rs - Ultra CPU-optimized configuration
 
 use std::path::PathBuf;
 use std::env;
 use lazy_static::lazy_static;
 
 lazy_static! {
-    // Base directory
     pub static ref BASE_DIR: PathBuf = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    
-    // Music folder
     pub static ref MUSIC_FOLDER: PathBuf = BASE_DIR.join("music");
-    
-    // Playlist file
     pub static ref PLAYLIST_FILE: PathBuf = BASE_DIR.join("playlist.json");
 }
 
-// CPU-optimized chunk sizes - better balance for smooth playback
-pub const CHUNK_SIZE: usize = 1024 * 8;           // Back to 8KB for smoother timing
-pub const BUFFER_SIZE: usize = 1024 * 64;         // 64KB buffer
+// ===== ULTRA CPU OPTIMIZATION SETTINGS =====
 
-// Platform-specific chunk sizes - optimized for smooth playback
-pub const IOS_CHUNK_SIZE: usize = 1024 * 16;      // 16KB for iOS
-pub const IOS_MAX_BUFFER: usize = 1024 * 32;      // 32KB max buffer for iOS
-pub const ANDROID_CHUNK_SIZE: usize = 1024 * 8;   // 8KB for Android (smoother)
-pub const DESKTOP_CHUNK_SIZE: usize = 1024 * 16;  // 16KB for desktop
+// Huge chunks = minimal operations
+pub const CHUNK_SIZE: usize = 1024 * 128;         // 128KB chunks
+pub const BUFFER_SIZE: usize = 1024 * 256;        // 256KB buffer
 
-// Stream configuration - balanced for performance and smoothness
-pub const STREAM_CACHE_TIME: u64 = 30;            // Balanced cache time
+// Platform-specific chunk sizes - also huge
+pub const IOS_CHUNK_SIZE: usize = 1024 * 128;     // 128KB
+pub const IOS_MAX_BUFFER: usize = 1024 * 256;     // 256KB
+pub const ANDROID_CHUNK_SIZE: usize = 1024 * 64;  // 64KB
+pub const DESKTOP_CHUNK_SIZE: usize = 1024 * 128; // 128KB
 
-// Buffer management - smaller buffers = less memory = better CPU cache performance
-pub const MAX_RECENT_CHUNKS: usize = 50;          // Reduced from 100
-pub const INITIAL_CHUNKS_TO_SEND: usize = 10;     // Reduced from 20
-pub const BROADCAST_BUFFER_SIZE: usize = 32;      // Reduced from 64
-pub const MIN_BUFFER_CHUNKS: usize = 5;           // Reduced minimum buffer
-pub const UNDERRUN_RECOVERY_DELAY_MS: u64 = 10;   // Slightly increased for stability
+// Stream configuration
+pub const STREAM_CACHE_TIME: u64 = 120;           // 2 minutes cache
+
+// Buffer management - minimal
+pub const MAX_RECENT_CHUNKS: usize = 10;          // Tiny
+pub const INITIAL_CHUNKS_TO_SEND: usize = 1;      // Minimal
+pub const BROADCAST_BUFFER_SIZE: usize = 10;      // Tiny
+pub const MIN_BUFFER_CHUNKS: usize = 1;           // Minimal
+pub const UNDERRUN_RECOVERY_DELAY_MS: u64 = 100; // Longer
 
 // Server configuration
 pub const PORT: u16 = 8000;
 pub const HOST: &str = "0.0.0.0";
 pub const MAX_CONCURRENT_USERS: usize = 1000;
 
-// Connection management - longer intervals to reduce CPU load
-pub const CONNECTION_TIMEOUT_SECS: u64 = 120;     // Increased from 90
-pub const HEARTBEAT_INTERVAL_SECS: u64 = 30;      // Increased from 15
-pub const STALE_CONNECTION_CHECK_SECS: u64 = 180; // Increased from 120
+// Connection management - very long intervals
+pub const CONNECTION_TIMEOUT_SECS: u64 = 600;     // 10 minutes
+pub const HEARTBEAT_INTERVAL_SECS: u64 = 120;     // 2 minutes
+pub const STALE_CONNECTION_CHECK_SECS: u64 = 600; // 10 minutes
 
-// WebSocket configuration (if needed) - longer intervals
-pub const WS_PING_INTERVAL_MS: u64 = 10000;       // Increased from 5000
-pub const WS_TIMEOUT_SECS: u64 = 120;             // Increased from 90
+// WebSocket configuration
+pub const WS_PING_INTERVAL_MS: u64 = 60000;       // 1 minute
+pub const WS_TIMEOUT_SECS: u64 = 600;             // 10 minutes
 
-// Broadcast channel capacity - smaller for better performance
-pub const BROADCAST_CHANNEL_CAPACITY: usize = 1000; // Reduced from 2000
+// Broadcast channel capacity
+pub const BROADCAST_CHANNEL_CAPACITY: usize = 100; // Minimal
 
-// Position synchronization - less frequent updates
-pub const POSITION_UPDATE_INTERVAL_MS: u64 = 200;   // Increased from 100
-pub const POSITION_SYNC_TOLERANCE_SECONDS: u64 = 3; // Increased tolerance
-pub const POSITION_SAVE_INTERVAL_MS: u64 = 10000;   // Increased from 5000
-pub const MAX_RECONNECT_GAP_MS: u64 = 15000;        // Increased from 10000
+// Position synchronization - very rare
+pub const POSITION_UPDATE_INTERVAL_MS: u64 = 2000;  // 2 seconds
+pub const POSITION_SYNC_TOLERANCE_SECONDS: u64 = 10;
+pub const POSITION_SAVE_INTERVAL_MS: u64 = 60000;   // 1 minute
+pub const MAX_RECONNECT_GAP_MS: u64 = 60000;        // 1 minute
 
-// MP3 streaming optimization
-pub const MP3_FRAME_ALIGNMENT: bool = true;
-pub const FRAME_BOUNDARY_ALIGNMENT: bool = true;
-pub const ID3_DETECTION: bool = true;
-pub const VBR_DETECTION_ENABLED: bool = false;      // Disabled for CPU savings
+// All features disabled
+pub const MP3_FRAME_ALIGNMENT: bool = false;
+pub const FRAME_BOUNDARY_ALIGNMENT: bool = false;
+pub const ID3_DETECTION: bool = false;              // Even this
+pub const VBR_DETECTION_ENABLED: bool = false;
 
-// MP3 frame constants
-pub const DEFAULT_MP3_FRAME_SIZE: u64 = 144;
-pub const MIN_MP3_FRAME_SIZE: u64 = 96;
-pub const MAX_MP3_FRAME_SIZE: u64 = 1728;
-pub const DEFAULT_ID3_OFFSET: u64 = 1024;
-pub const MAX_ID3_TAG_SIZE: u64 = 128 * 1024;
-
-// MP3 sync pattern
-pub const MP3_FRAME_SYNC_BYTES: [u8; 2] = [0xFF, 0xE0];
-
-// Track transition - longer buffers for stability
-pub const TRACK_TRANSITION_BUFFER_MS: u64 = 200;    // Increased from 100
-pub const TRACK_PRELOAD_SECONDS: u64 = 3;           // Reduced from 5
+// Track transition
+pub const TRACK_TRANSITION_BUFFER_MS: u64 = 1000;  // 1 second
+pub const TRACK_PRELOAD_SECONDS: u64 = 0;          // No preloading
 
 // Error handling
-pub const MAX_POSITION_CORRECTION_ATTEMPTS: u8 = 2; // Reduced from 3
-pub const POSITION_VALIDATION_STRICT: bool = false; // Relaxed for performance
+pub const MAX_POSITION_CORRECTION_ATTEMPTS: u8 = 0; // None
+pub const POSITION_VALIDATION_STRICT: bool = false;
 
-// Debug and monitoring - reduced logging for CPU savings
+// All monitoring disabled
 pub const POSITION_DEBUG_LOGGING: bool = false;
 pub const DRIFT_DETECTION_LOGGING: bool = false;
-pub const PERFORMANCE_MONITORING: bool = false;     // Disabled for CPU savings
+pub const PERFORMANCE_MONITORING: bool = false;
+pub const ENABLE_DETAILED_LOGGING: bool = false;
+pub const ENABLE_METRICS_COLLECTION: bool = false;
 
-// Adaptive buffering thresholds - simplified
-pub const ADAPTIVE_BUFFERING: bool = false;         // Disabled for CPU savings
-pub const HIGH_BITRATE_THRESHOLD: u64 = 192000;
-pub const LOW_BITRATE_EXTRA_CHUNKS: usize = 5;      // Reduced from 10
-pub const HIGH_BITRATE_EXTRA_CHUNKS: usize = 15;    // Reduced from 30
+// Adaptive buffering - disabled
+pub const ADAPTIVE_BUFFERING: bool = false;
+pub const HIGH_BITRATE_THRESHOLD: u64 = 256000;
+pub const LOW_BITRATE_EXTRA_CHUNKS: usize = 1;
+pub const HIGH_BITRATE_EXTRA_CHUNKS: usize = 2;
 
-// Client position sync (disabled in radio mode)
+// Client position sync - disabled
 pub const CLIENT_POSITION_SYNC_ENABLED: bool = false;
 pub const POSITION_DRIFT_CORRECTION_FACTOR: f64 = 0.0;
 
-// Platform-specific buffer sizes - optimized for CPU
-pub const IOS_INITIAL_BUFFER_SIZE: usize = 10;      // Reduced from 20
-pub const SAFARI_INITIAL_BUFFER_SIZE: usize = 12;   // Reduced from 25
-pub const MOBILE_INITIAL_BUFFER_SIZE: usize = 8;    // Reduced from 15
-pub const DESKTOP_INITIAL_BUFFER_SIZE: usize = 15;  // Reduced from 30
+// Platform-specific buffer sizes - minimal
+pub const IOS_INITIAL_BUFFER_SIZE: usize = 1;
+pub const SAFARI_INITIAL_BUFFER_SIZE: usize = 1;
+pub const MOBILE_INITIAL_BUFFER_SIZE: usize = 1;
+pub const DESKTOP_INITIAL_BUFFER_SIZE: usize = 2;
 
-// Direct streaming buffer sizes
-pub const DIRECT_STREAM_BUFFER_SIZE: usize = 1024 * 32; // Reduced from 64KB
+// Direct streaming buffer
+pub const DIRECT_STREAM_BUFFER_SIZE: usize = 1024 * 128; // 128KB
 
-// Network quality detection - disabled for CPU savings
+// Network quality detection - disabled
 pub const ENABLE_NETWORK_QUALITY_DETECTION: bool = false;
-pub const POOR_NETWORK_EXTRA_BUFFER_MS: u64 = 1000; // Reduced from 2000
+pub const POOR_NETWORK_EXTRA_BUFFER_MS: u64 = 0;
 
-// Radio mode specific
+// Radio mode
 pub const RADIO_MODE: bool = true;
-pub const RADIO_SYNC_INTERVAL_MS: u64 = 10000;      // Increased from 5000
+pub const RADIO_SYNC_INTERVAL_MS: u64 = 60000;     // 1 minute
 pub const RADIO_POSITION_AUTHORITY: &str = "server";
 
 // CPU optimization flags
-pub const ENABLE_DETAILED_LOGGING: bool = false;    // Disable verbose logging
-pub const ENABLE_METRICS_COLLECTION: bool = false;  // Disable metrics for CPU savings
-pub const USE_RELAXED_MEMORY_ORDERING: bool = true; // Use relaxed atomic ordering
-pub const BATCH_OPERATIONS: bool = true;            // Enable batch operations
-pub const REDUCE_SYSCALLS: bool = true;             // Minimize system calls
+pub const USE_RELAXED_MEMORY_ORDERING: bool = true;
+pub const BATCH_OPERATIONS: bool = true;
+pub const REDUCE_SYSCALLS: bool = true;
 
 // File I/O optimization
-pub const PLAYLIST_CACHE_DURATION_SECS: u64 = 30;   // Cache playlist reads
-pub const FILE_BUFFER_SIZE: usize = 1024 * 64;      // 64KB file buffer
-pub const REDUCE_FILE_STAT_CALLS: bool = true;      // Cache file existence checks
+pub const PLAYLIST_CACHE_DURATION_SECS: u64 = 120;  // 2 minutes
+pub const FILE_BUFFER_SIZE: usize = 1024 * 256;     // 256KB
+pub const REDUCE_FILE_STAT_CALLS: bool = true;
 
 // Threading optimization
-pub const THREAD_SLEEP_PRECISION_MS: u64 = 10;      // Reduced sleep precision
-pub const BACKGROUND_TASK_INTERVAL_MS: u64 = 1000;  // Less frequent background tasks
+pub const THREAD_SLEEP_PRECISION_MS: u64 = 100;     // Very low precision
+pub const BACKGROUND_TASK_INTERVAL_MS: u64 = 10000; // 10 seconds
+
+// Logging
+pub const LOG_LEVEL: &str = "error";                // Only errors
+pub const SUPPRESS_PROGRESS_LOGS: bool = true;
+pub const SUPPRESS_CONNECTION_LOGS: bool = true;
+
+// Memory optimization
+pub const USE_JEMALLOC: bool = false;
+pub const PREALLOCATE_BUFFERS: bool = true;
+
+// Thread pool settings
+pub const WORKER_THREADS: usize = 1;                // Single thread
+pub const MAX_BLOCKING_THREADS: usize = 2;          // Minimal
+
+// HTTP optimization
+pub const KEEP_ALIVE_TIMEOUT: u32 = 600;           // 10 minutes
+pub const REQUEST_TIMEOUT: u64 = 60;               // 1 minute
+pub const RESPONSE_COMPRESSION: bool = false;      // No compression

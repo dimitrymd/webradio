@@ -2269,6 +2269,7 @@ dependencies = [
  "futures",
  "id3",
  "lazy_static",
+ "libc",
  "log",
  "mp3-duration",
  "parking_lot",

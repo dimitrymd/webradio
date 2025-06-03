@@ -1,9 +1,9 @@
-// src/main.rs - Simplified with proper shutdown
+// src/main.rs - CPU-optimized entry point
 
 extern crate rocket;
 
 use rocket_dyn_templates::Template;
-use rocket::{launch, routes, catchers, Shutdown};
+use rocket::{launch, routes, catchers, Config};
 use std::sync::Arc;
 
 mod config;
@@ -18,12 +18,13 @@ use crate::services::playlist;
 
 #[launch]
 fn rocket() -> rocket::Rocket<rocket::Build> {
-    // Initialize logging
+    // Set up minimal logging
+    std::env::set_var("RUST_LOG", "error");
     env_logger::init();
     
     println!("============================================================");
-    println!("ChillOut Radio - Simplified Implementation v4.0");
-    println!("Single broadcast thread with proper timing");
+    println!("ChillOut Radio - Ultra CPU-Optimized v6.0");
+    println!("Minimal CPU usage configuration active");
     println!("============================================================");
 
     // Initialize stream manager
@@ -41,7 +42,7 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         });
     }
     
-    // Scan for music files
+    // Initial scan
     println!("Scanning for MP3 files...");
     playlist::scan_music_folder(&config::MUSIC_FOLDER, &config::PLAYLIST_FILE);
     
@@ -51,38 +52,58 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         println!("   Add MP3 files to: {}", config::MUSIC_FOLDER.display());
     } else {
         println!("✅ Found {} tracks", playlist_data.tracks.len());
-        
-        if let Some(current_track) = playlist::get_current_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER) {
-            println!("   Starting with: \"{}\" by {}", current_track.title, current_track.artist);
-        }
     }
 
-    // Update track durations
-    println!("Updating track durations...");
+    // Update durations once at startup
     playlist::rescan_and_update_durations(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER);
 
     // Start broadcast thread
-    println!("Starting radio broadcast...");
+    println!("Starting CPU-optimized radio broadcast...");
     stream_manager.start_broadcast_thread();
+    
+    // Start minimal monitor thread
+    let monitor_manager = stream_manager.clone();
+    std::thread::Builder::new()
+        .name("monitor".to_string())
+        .spawn(move || {
+            // Set monitor thread to lower priority
+            #[cfg(unix)]
+            {
+                unsafe {
+                    libc::nice(15); // Even lower priority than broadcast
+                }
+            }
+            playlist::track_switcher(monitor_manager);
+        })
+        .expect("Failed to spawn monitor thread");
     
     // Set up shutdown handler
     let stream_manager_for_shutdown = stream_manager.clone();
     ctrlc::set_handler(move || {
-        println!("\n📻 Shutting down radio broadcast...");
+        println!("\n📻 Shutting down...");
         stream_manager_for_shutdown.stop_broadcasting();
         std::thread::sleep(std::time::Duration::from_millis(500));
         std::process::exit(0);
     }).expect("Error setting Ctrl-C handler");
     
-    println!("✅ Radio is broadcasting!");
+    println!("✅ CPU-optimized radio is broadcasting!");
     println!("🌐 Server at: http://localhost:8000");
     println!("📻 Stream at: http://localhost:8000/direct-stream");
-    println!("📊 Status at: http://localhost:8000/stream-status");
     println!("🛑 Press Ctrl+C to stop");
     println!("============================================================");
     
+    // Configure Rocket for lower CPU usage
+    let rocket_config = Config {
+        port: config::PORT,
+        address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+        keep_alive: config::KEEP_ALIVE_TIMEOUT,
+        workers: config::WORKER_THREADS,
+        max_blocking: config::MAX_BLOCKING_THREADS,
+        ..Config::default()
+    };
+    
     // Build Rocket server
-    rocket::build()
+    rocket::custom(rocket_config)
         .manage(stream_manager)
         .mount("/", routes![
             // Streaming endpoints
