@@ -10,27 +10,27 @@ lazy_static! {
     pub static ref PLAYLIST_FILE: PathBuf = BASE_DIR.join("playlist.json");
 }
 
-// ===== ULTRA CPU OPTIMIZATION SETTINGS =====
+// ===== BALANCED CPU OPTIMIZATION SETTINGS =====
 
-// Huge chunks = minimal operations
-pub const CHUNK_SIZE: usize = 1024 * 128;         // 128KB chunks
-pub const BUFFER_SIZE: usize = 1024 * 256;        // 256KB buffer
+// Balanced chunks for smooth playback with lower CPU
+pub const CHUNK_SIZE: usize = 1024 * 64;          // 64KB chunks
+pub const BUFFER_SIZE: usize = 1024 * 128;        // 128KB buffer
 
-// Platform-specific chunk sizes - also huge
-pub const IOS_CHUNK_SIZE: usize = 1024 * 128;     // 128KB
-pub const IOS_MAX_BUFFER: usize = 1024 * 256;     // 256KB
-pub const ANDROID_CHUNK_SIZE: usize = 1024 * 64;  // 64KB
-pub const DESKTOP_CHUNK_SIZE: usize = 1024 * 128; // 128KB
+// Platform-specific chunk sizes
+pub const IOS_CHUNK_SIZE: usize = 1024 * 32;      // 32KB for iOS
+pub const IOS_MAX_BUFFER: usize = 1024 * 64;      // 64KB max
+pub const ANDROID_CHUNK_SIZE: usize = 1024 * 32;  // 32KB for Android
+pub const DESKTOP_CHUNK_SIZE: usize = 1024 * 64;  // 64KB for desktop
 
 // Stream configuration
 pub const STREAM_CACHE_TIME: u64 = 120;           // 2 minutes cache
 
-// Buffer management - minimal
-pub const MAX_RECENT_CHUNKS: usize = 10;          // Tiny
-pub const INITIAL_CHUNKS_TO_SEND: usize = 1;      // Minimal
-pub const BROADCAST_BUFFER_SIZE: usize = 10;      // Tiny
-pub const MIN_BUFFER_CHUNKS: usize = 1;           // Minimal
-pub const UNDERRUN_RECOVERY_DELAY_MS: u64 = 100; // Longer
+// Buffer management - balanced for smooth playback
+pub const MAX_RECENT_CHUNKS: usize = 25;          // Reasonable buffer
+pub const INITIAL_CHUNKS_TO_SEND: usize = 3;      // Quick start
+pub const BROADCAST_BUFFER_SIZE: usize = 50;      // Good buffer size
+pub const MIN_BUFFER_CHUNKS: usize = 3;           // Minimum buffer
+pub const UNDERRUN_RECOVERY_DELAY_MS: u64 = 50;  // Quick recovery
 
 // Server configuration
 pub const PORT: u16 = 8000;
@@ -93,7 +93,7 @@ pub const MOBILE_INITIAL_BUFFER_SIZE: usize = 1;
 pub const DESKTOP_INITIAL_BUFFER_SIZE: usize = 2;
 
 // Direct streaming buffer
-pub const DIRECT_STREAM_BUFFER_SIZE: usize = 1024 * 128; // 128KB
+pub const DIRECT_STREAM_BUFFER_SIZE: usize = 1024 * 64; // 64KB
 
 // Network quality detection - disabled
 pub const ENABLE_NETWORK_QUALITY_DETECTION: bool = false;

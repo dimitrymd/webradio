@@ -92,13 +92,16 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     println!("🛑 Press Ctrl+C to stop");
     println!("============================================================");
     
-    // Configure Rocket for lower CPU usage
+    // Configure Rocket for minimal CPU usage
     let rocket_config = Config {
         port: config::PORT,
         address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
         keep_alive: config::KEEP_ALIVE_TIMEOUT,
-        workers: config::WORKER_THREADS,
-        max_blocking: config::MAX_BLOCKING_THREADS,
+        workers: 1,              // Single worker thread!
+        max_blocking: 1,         // Minimal blocking threads
+        ident: rocket::config::Ident::none(), // Disable ident header
+        ip_header: None,         // No IP header parsing
+        log_level: rocket::config::LogLevel::Off, // Disable Rocket logging
         ..Config::default()
     };
     

@@ -12,8 +12,8 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::services::streamer::{StreamManager, AudioChunk};
 
-// Larger buffer for fewer operations
-const STREAM_BUFFER_SIZE: usize = 65536; // 64KB internal buffer
+// Balanced buffer for smooth streaming
+const STREAM_BUFFER_SIZE: usize = 32768; // 32KB internal buffer
 
 pub struct AudioStream {
     receiver: broadcast::Receiver<AudioChunk>,
@@ -88,7 +88,7 @@ impl AsyncRead for AudioStream {
             
             // Try to get multiple chunks at once for efficiency
             let mut chunks_received = 0;
-            const MAX_CHUNKS_PER_POLL: usize = 5;
+            const MAX_CHUNKS_PER_POLL: usize = 3; // Balanced
             
             while chunks_received < MAX_CHUNKS_PER_POLL {
                 match self.receiver.try_recv() {

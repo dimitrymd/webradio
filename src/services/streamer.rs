@@ -1,4 +1,4 @@
-// src/services/streamer.rs - Ultra CPU-optimized implementation
+// src/services/streamer.rs - Ultra low CPU implementation
 
 use std::sync::Arc;
 use std::thread;
@@ -13,10 +13,10 @@ use std::io::{Read, Seek, SeekFrom, BufReader};
 use tokio::sync::broadcast;
 use bytes::Bytes;
 
-// Much larger chunks = far fewer operations
-const BROADCAST_CHUNK_SIZE: usize = 131072; // 128KB chunks (was 32KB)
-const BROADCAST_BUFFER_SIZE: usize = 25;    // Smaller buffer
-const FILE_BUFFER_SIZE: usize = 262144;      // 256KB file buffer
+// Larger chunks = fewer operations
+const BROADCAST_CHUNK_SIZE: usize = 65536;  // 64KB chunks
+const BROADCAST_BUFFER_SIZE: usize = 50;    
+const FILE_BUFFER_SIZE: usize = 131072;     // 128KB file buffer
 
 #[derive(Clone)]
 pub struct AudioChunk {
@@ -51,12 +51,10 @@ pub struct StreamManager {
     broadcast_tx: Arc<broadcast::Sender<AudioChunk>>,
     connections: Arc<RwLock<HashMap<String, ConnectionInfo>>>,
     
-    // Use atomics for frequently accessed values
     track_position_ms: Arc<AtomicU64>,
     track_duration_secs: Arc<AtomicU64>,
     track_bitrate: Arc<AtomicU64>,
     
-    // Less frequently accessed data
     current_track_json: Arc<RwLock<Option<String>>>,
     track_start_time: Arc<RwLock<Instant>>,
     
@@ -65,7 +63,7 @@ pub struct StreamManager {
 
 impl StreamManager {
     pub fn new(music_folder: &std::path::Path, _chunk_size: usize, _buffer_size: usize, _cache_time: u64) -> Self {
-        info!("Initializing Ultra CPU-optimized StreamManager");
+        info!("Initializing Ultra Low CPU StreamManager");
         
         let (broadcast_tx, _) = broadcast::channel(BROADCAST_BUFFER_SIZE);
         
@@ -78,7 +76,7 @@ impl StreamManager {
             
             track_position_ms: Arc::new(AtomicU64::new(0)),
             track_duration_secs: Arc::new(AtomicU64::new(0)),
-            track_bitrate: Arc::new(AtomicU64::new(128000)),
+            track_bitrate: Arc::new(AtomicU64::new(192000)),
             
             current_track_json: Arc::new(RwLock::new(None)),
             track_start_time: Arc::new(RwLock::new(Instant::now())),
@@ -106,15 +104,15 @@ impl StreamManager {
         thread::Builder::new()
             .name("radio-broadcast".to_string())
             .spawn(move || {
-                // Set thread to lower priority
+                // Set lowest priority
                 #[cfg(unix)]
                 {
                     unsafe {
-                        libc::nice(19); // Lowest priority
+                        libc::nice(19);
                     }
                 }
                 
-                Self::broadcast_loop(
+                Self::ultra_low_cpu_broadcast_loop(
                     music_folder,
                     broadcast_tx,
                     is_streaming,
@@ -129,7 +127,7 @@ impl StreamManager {
             .expect("Failed to spawn broadcast thread");
     }
     
-    fn broadcast_loop(
+    fn ultra_low_cpu_broadcast_loop(
         music_folder: PathBuf,
         broadcast_tx: Arc<broadcast::Sender<AudioChunk>>,
         is_streaming: Arc<AtomicBool>,
@@ -140,24 +138,31 @@ impl StreamManager {
         track_duration_secs: Arc<AtomicU64>,
         track_bitrate: Arc<AtomicU64>,
     ) {
-        info!("Ultra CPU-optimized broadcast loop started");
+        info!("Ultra low CPU broadcast loop started");
         is_streaming.store(true, Ordering::Relaxed);
         
-        let mut chunk_id = 0u64;
-        let mut last_position_update = Instant::now();
-        
-        // Reusable buffer - avoid allocations
-        let mut buffer = vec![0u8; BROADCAST_CHUNK_SIZE];
-        let mut last_playlist_check = Instant::now();
         let mut cached_playlist = None;
+        let mut last_playlist_check = Instant::now();
         
         'main: loop {
             if should_stop.load(Ordering::Relaxed) {
                 break 'main;
             }
             
-            // Check playlist less frequently
-            let playlist = if last_playlist_check.elapsed() > Duration::from_secs(60) || cached_playlist.is_none() {
+            // When no listeners, just sleep for a long time
+            if broadcast_tx.receiver_count() == 0 {
+                thread::sleep(Duration::from_secs(10));
+                
+                // Update virtual position
+                if let start_time = track_start_time.read().clone() {
+                    let elapsed = start_time.elapsed().as_millis() as u64;
+                    track_position_ms.store(elapsed, Ordering::Relaxed);
+                }
+                continue;
+            }
+            
+            // Get playlist (with caching)
+            let playlist = if last_playlist_check.elapsed() > Duration::from_secs(120) || cached_playlist.is_none() {
                 last_playlist_check = Instant::now();
                 let p = crate::services::playlist::get_playlist(&crate::config::PLAYLIST_FILE);
                 cached_playlist = Some(p.clone());
@@ -167,7 +172,7 @@ impl StreamManager {
             };
             
             if playlist.tracks.is_empty() {
-                thread::sleep(Duration::from_secs(30)); // Long sleep when no tracks
+                thread::sleep(Duration::from_secs(30));
                 continue;
             }
             
@@ -176,35 +181,15 @@ impl StreamManager {
             let track_path = music_folder.join(&track.path);
             
             if !track_path.exists() {
-                error!("Track not found: {}", track_path.display());
                 Self::advance_to_next_track(&playlist, track_index);
-                cached_playlist = None; // Force reload
-                thread::sleep(Duration::from_millis(500));
+                cached_playlist = None;
+                thread::sleep(Duration::from_secs(1));
                 continue;
             }
             
-            // Use cached duration if available
-            let actual_duration = if track.duration > 0 {
-                track.duration
-            } else {
-                180 // Default 3 minutes, avoid mp3_duration call
-            };
-            
-            // Simple bitrate calculation
-            let actual_bitrate = 192000; // Just use a fixed bitrate to avoid calculations
-            
-            // Open file with larger buffer
-            let file = match File::open(&track_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    error!("Cannot open file: {}", e);
-                    Self::advance_to_next_track(&playlist, track_index);
-                    cached_playlist = None;
-                    continue;
-                }
-            };
-            
-            let mut reader = BufReader::with_capacity(FILE_BUFFER_SIZE, file);
+            // Use pre-calculated values
+            let actual_duration = track.duration.max(180);
+            let actual_bitrate = 192000u64; // Fixed bitrate
             
             // Update track info
             {
@@ -212,63 +197,83 @@ impl StreamManager {
                 *track_start_time.write() = Instant::now();
             }
             
-            // Store values in atomics
             track_duration_secs.store(actual_duration, Ordering::Relaxed);
             track_bitrate.store(actual_bitrate, Ordering::Relaxed);
             track_position_ms.store(0, Ordering::Relaxed);
             
             info!("Playing: \"{}\" - {}s", track.title, actual_duration);
             
-            // Skip ID3 if present
-            let _ = Self::skip_id3_simple(&mut reader);
-            
-            // Pre-calculate timing constants
-            let bytes_per_second = actual_bitrate / 8;
-            let bytes_per_ms = bytes_per_second as f64 / 1000.0;
-            let chunk_duration_ms = (BROADCAST_CHUNK_SIZE as f64 / bytes_per_ms) as u64;
-            
-            let mut total_bytes = 0u64;
+            // Virtual playback when no listeners
             let track_start = Instant::now();
-            let mut next_chunk_time = Instant::now();
             
-            // Only update position every 2 seconds
-            const POSITION_UPDATE_INTERVAL: Duration = Duration::from_secs(2);
-            
-            // Check if we have listeners before allocating
-            let mut last_listener_check = Instant::now();
-            let mut has_listeners = false;
-            
-            loop {
+            'track: loop {
                 if should_stop.load(Ordering::Relaxed) {
                     break 'main;
                 }
                 
-                // Check if track should end
                 let elapsed = track_start.elapsed();
                 if elapsed >= Duration::from_secs(actual_duration) {
-                    break;
+                    break 'track;
                 }
                 
-                // Update position very infrequently
-                if last_position_update.elapsed() >= POSITION_UPDATE_INTERVAL {
+                // Check for listeners
+                if broadcast_tx.receiver_count() == 0 {
+                    // No listeners - just update position and sleep
                     track_position_ms.store(elapsed.as_millis() as u64, Ordering::Relaxed);
-                    last_position_update = Instant::now();
+                    thread::sleep(Duration::from_secs(5));
+                    continue 'track;
                 }
                 
-                // Check for listeners less frequently
-                if last_listener_check.elapsed() >= Duration::from_secs(5) {
-                    has_listeners = broadcast_tx.receiver_count() > 0;
-                    last_listener_check = Instant::now();
+                // We have listeners - need to actually stream
+                // Open file only when needed
+                let file = match File::open(&track_path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        error!("Cannot open file: {}", e);
+                        break 'track;
+                    }
+                };
+                
+                let mut reader = BufReader::with_capacity(FILE_BUFFER_SIZE, file);
+                let _ = Self::skip_id3_simple(&mut reader);
+                
+                // Calculate where we should be in the file
+                let elapsed_ms = elapsed.as_millis() as u64;
+                let bytes_per_ms = actual_bitrate / 8000;
+                let target_position = elapsed_ms * bytes_per_ms;
+                
+                // Seek to approximate position
+                if target_position > 0 {
+                    let _ = reader.seek(SeekFrom::Start(target_position));
                 }
                 
-                // Read chunk
-                match reader.read_exact(&mut buffer) {
-                    Ok(()) => {
-                        total_bytes += BROADCAST_CHUNK_SIZE as u64;
-                        chunk_id += 1;
-                        
-                        // Only send if there are listeners
-                        if has_listeners {
+                // Pre-calculate timing
+                let chunk_duration_ms = (BROADCAST_CHUNK_SIZE as u64 * 8000) / actual_bitrate;
+                let mut buffer = vec![0u8; BROADCAST_CHUNK_SIZE];
+                let mut chunk_id = target_position / BROADCAST_CHUNK_SIZE as u64;
+                let mut total_bytes = target_position;
+                let mut next_chunk_time = Instant::now();
+                
+                // Stream while we have listeners
+                while broadcast_tx.receiver_count() > 0 {
+                    if should_stop.load(Ordering::Relaxed) {
+                        break 'main;
+                    }
+                    
+                    // Check if track should end
+                    if track_start.elapsed() >= Duration::from_secs(actual_duration) {
+                        break 'track;
+                    }
+                    
+                    // Update position occasionally
+                    track_position_ms.store(track_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    
+                    // Read chunk
+                    match reader.read_exact(&mut buffer) {
+                        Ok(()) => {
+                            total_bytes += BROADCAST_CHUNK_SIZE as u64;
+                            chunk_id += 1;
+                            
                             let chunk = AudioChunk {
                                 data: Bytes::copy_from_slice(&buffer),
                                 position: total_bytes,
@@ -277,70 +282,64 @@ impl StreamManager {
                             };
                             
                             let _ = broadcast_tx.send(chunk);
-                        }
-                        
-                        // Calculate next chunk time
-                        next_chunk_time += Duration::from_millis(chunk_duration_ms);
-                        
-                        // Sleep precisely until next chunk
-                        let now = Instant::now();
-                        if next_chunk_time > now {
-                            thread::sleep(next_chunk_time - now);
-                        } else {
-                            // We're behind - reset timing
-                            next_chunk_time = now;
-                        }
-                    },
-                    Err(_) => {
-                        // Handle partial read at end of file
-                        match reader.read(&mut buffer) {
-                            Ok(0) => break, // EOF
-                            Ok(n) => {
-                                // Send final partial chunk only if listeners
-                                if has_listeners && n > 0 {
-                                    let chunk = AudioChunk {
-                                        data: Bytes::copy_from_slice(&buffer[..n]),
-                                        position: total_bytes + n as u64,
-                                        timestamp: Instant::now(),
-                                        chunk_id: chunk_id + 1,
-                                    };
-                                    let _ = broadcast_tx.send(chunk);
-                                }
-                                
-                                // Sleep for partial chunk duration
-                                let partial_duration = (n as f64 / bytes_per_ms) as u64;
-                                thread::sleep(Duration::from_millis(partial_duration));
-                                break;
-                            },
-                            Err(_) => break,
+                            
+                            // Precise timing
+                            next_chunk_time += Duration::from_millis(chunk_duration_ms);
+                            let now = Instant::now();
+                            if next_chunk_time > now {
+                                thread::sleep(next_chunk_time - now);
+                            } else {
+                                next_chunk_time = now;
+                            }
+                        },
+                        Err(_) => {
+                            // Try partial read
+                            match reader.read(&mut buffer) {
+                                Ok(0) => break 'track,
+                                Ok(n) => {
+                                    if n > 0 {
+                                        let chunk = AudioChunk {
+                                            data: Bytes::copy_from_slice(&buffer[..n]),
+                                            position: total_bytes + n as u64,
+                                            timestamp: Instant::now(),
+                                            chunk_id: chunk_id + 1,
+                                        };
+                                        let _ = broadcast_tx.send(chunk);
+                                    }
+                                    break 'track;
+                                },
+                                Err(_) => break 'track,
+                            }
                         }
                     }
                 }
+                
+                // Listeners disconnected - go back to virtual playback
+                drop(reader); // Close file
             }
             
             // Advance to next track
             Self::advance_to_next_track(&playlist, track_index);
-            cached_playlist = None; // Force reload
+            cached_playlist = None;
             
-            // Small gap between tracks
-            thread::sleep(Duration::from_millis(1000));
+            // Gap between tracks
+            thread::sleep(Duration::from_millis(500));
+            
+            // Clear track info
+            *current_track_json.write() = None;
+            track_position_ms.store(0, Ordering::SeqCst);
         }
         
-        info!("Broadcast loop ending");
         is_streaming.store(false, Ordering::Relaxed);
     }
     
     fn skip_id3_simple(reader: &mut BufReader<File>) -> std::io::Result<()> {
         let mut header = [0u8; 3];
-        let bytes_read = reader.read(&mut header)?;
-        
-        if bytes_read == 3 && &header == b"ID3" {
-            // Skip ID3v2 tag - just seek forward a fixed amount
-            reader.seek(SeekFrom::Current(1024))?; // Skip 1KB which covers most ID3 tags
+        if reader.read(&mut header)? == 3 && &header == b"ID3" {
+            let _ = reader.seek(SeekFrom::Current(1024));
         } else {
-            reader.seek(SeekFrom::Start(0))?;
+            let _ = reader.seek(SeekFrom::Start(0));
         }
-        
         Ok(())
     }
     
@@ -351,7 +350,7 @@ impl StreamManager {
         crate::services::playlist::invalidate_playlist_cache();
     }
     
-    // Public methods - simplified
+    // Public methods remain the same...
     pub fn subscribe(&self) -> (String, broadcast::Receiver<AudioChunk>) {
         let connection_id = uuid::Uuid::new_v4().to_string();
         let receiver = self.broadcast_tx.subscribe();
@@ -378,7 +377,7 @@ impl StreamManager {
     pub fn cleanup_stale_connections(&self) {
         let now = Instant::now();
         self.connections.write().retain(|_, conn| {
-            now.duration_since(conn.last_heartbeat).as_secs() < 300 // 5 minutes
+            now.duration_since(conn.last_heartbeat).as_secs() < 300
         });
     }
     
@@ -439,7 +438,6 @@ impl StreamManager {
         }
     }
     
-    // Compatibility methods
     pub fn get_broadcast_receiver(&self) -> broadcast::Receiver<AudioChunk> {
         self.broadcast_tx.subscribe()
     }
