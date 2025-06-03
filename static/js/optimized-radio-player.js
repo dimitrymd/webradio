@@ -1,4 +1,4 @@
-// static/js/optimized-radio-player.js - Fixed UI disconnect bug
+// static/js/optimized-radio-player.js - Fixed Audio Source Handling
 
 // Radio state management
 const radioState = {
@@ -22,7 +22,7 @@ const radioState = {
     lastSuccessfulConnection: null,
     
     // UI state
-    isTogglingConnection: false  // NEW: Prevent rapid toggle clicks
+    isTogglingConnection: false
 };
 
 // UI Elements
@@ -42,7 +42,8 @@ const elements = {
 
 // Initialize the radio player
 function initRadioPlayer() {
-    console.log('🎵 ChillOut Radio - Initializing v2.6.0...');
+    console.log('🎵 ChillOut Radio - True Radio Mode v3.1...');
+    console.log('📻 Server-controlled playback only - no track control');
     
     // Get UI elements
     elements.startBtn = document.getElementById('start-btn');
@@ -64,6 +65,13 @@ function initRadioPlayer() {
         return;
     }
     
+    // Remove any skip/next/previous buttons if they exist
+    const skipButtons = document.querySelectorAll('[id*="skip"], [id*="next"], [id*="prev"], [id*="switch"]');
+    skipButtons.forEach(btn => {
+        btn.style.display = 'none';
+        btn.disabled = true;
+    });
+    
     // Set up event listeners
     setupEventListeners();
     
@@ -76,18 +84,17 @@ function initRadioPlayer() {
     // Initial health check
     performHealthCheck();
     
-    console.log('✅ Radio player initialized successfully');
-    showStatus('📻 Radio ready - click "Tune In" to start listening');
+    console.log('✅ Radio player initialized in true radio mode');
+    showStatus('📻 True Radio Mode - Click "Tune In" to listen');
 }
 
-// Set up event listeners with proper UI state handling
+// Set up event listeners
 function setupEventListeners() {
-    // Main toggle button with debouncing
+    // Main toggle button
     elements.startBtn.addEventListener('click', (event) => {
         event.preventDefault();
         event.stopPropagation();
         
-        // Prevent rapid clicking
         if (radioState.isTogglingConnection) {
             console.log('⏸️ Ignoring click - already toggling connection');
             return;
@@ -134,7 +141,7 @@ async function performHealthCheck() {
     }
 }
 
-// Toggle radio on/off with proper state management
+// Toggle radio on/off
 async function toggleRadio() {
     console.log('🔄 Toggle radio clicked, current state:', {
         isPlaying: radioState.isPlaying,
@@ -142,7 +149,6 @@ async function toggleRadio() {
         isTogglingConnection: radioState.isTogglingConnection
     });
     
-    // Set toggle lock
     radioState.isTogglingConnection = true;
     
     try {
@@ -155,14 +161,13 @@ async function toggleRadio() {
         console.error('❌ Error during toggle:', error);
         showStatus(`❌ Toggle failed: ${error.message}`, true);
     } finally {
-        // Release toggle lock after a delay
         setTimeout(() => {
             radioState.isTogglingConnection = false;
         }, 500);
     }
 }
 
-// Start radio with improved error handling
+// Start radio
 async function startRadio() {
     console.log('🎵 Starting radio...');
     
@@ -171,22 +176,15 @@ async function startRadio() {
         return;
     }
     
-    // Update state immediately
     radioState.isPlaying = true;
     radioState.isReconnecting = false;
     radioState.consecutiveErrors = 0;
     
-    // Update UI immediately
     updateUIForConnecting();
     
     try {
-        // Create audio element
         await createAudioElement();
-        
-        // Start streaming
         await startStreaming();
-        
-        // Update UI on success
         updateUIForConnected();
         
     } catch (error) {
@@ -194,16 +192,16 @@ async function startRadio() {
         radioState.isPlaying = false;
         updateUIForDisconnected();
         showStatus(`❌ Failed to start: ${error.message}`, true);
-        throw error; // Re-throw for toggle handler
+        throw error;
     }
 }
 
-// Update UI functions for better state management
+// Update UI functions
 function updateUIForConnecting() {
     elements.startBtn.disabled = true;
     elements.startBtn.textContent = '📻 Connecting...';
     elements.startBtn.dataset.connected = 'connecting';
-    showStatus('📻 Connecting to radio stream...');
+    showStatus('📻 Connecting to live radio stream...');
 }
 
 function updateUIForConnected() {
@@ -219,61 +217,50 @@ function updateUIForDisconnected() {
     elements.startBtn.dataset.connected = 'false';
 }
 
-// Create audio element with better error handling
+// Create audio element
 async function createAudioElement() {
     console.log('🔊 Creating audio element...');
     
-    // Clean up existing element more thoroughly
+    // Clean up existing element properly
     if (radioState.audioElement) {
         try {
             radioState.audioElement.pause();
-            radioState.audioElement.src = '';
-            radioState.audioElement.load(); // Force cleanup
+            // Remove event listeners before clearing src
             radioState.audioElement.removeEventListener('error', handleAudioError);
+            radioState.audioElement.removeEventListener('loadstart', handleLoadStart);
+            radioState.audioElement.removeEventListener('canplay', handleCanPlay);
+            radioState.audioElement.removeEventListener('playing', handlePlaying);
+            radioState.audioElement.removeEventListener('waiting', handleWaiting);
+            radioState.audioElement.removeEventListener('ended', handleEnded);
             
-            // Remove all event listeners
-            const events = ['loadstart', 'loadedmetadata', 'canplay', 'canplaythrough', 
-                          'play', 'playing', 'pause', 'waiting', 'stalled', 'suspend', 
-                          'progress', 'timeupdate', 'ended', 'emptied', 'abort'];
-            
-            events.forEach(event => {
-                radioState.audioElement.removeEventListener(event, () => {});
-            });
-            
+            // Clear source properly
+            radioState.audioElement.removeAttribute('src');
+            radioState.audioElement.load();
         } catch (error) {
             console.warn('⚠️ Error during audio cleanup:', error);
         }
-        
         radioState.audioElement = null;
     }
     
-    // Small delay to ensure cleanup is complete
+    // Small delay to ensure cleanup
     await new Promise(resolve => setTimeout(resolve, 100));
     
-    // Create new audio element
     try {
         radioState.audioElement = new Audio();
         
-        // Verify the element was created successfully
         if (!radioState.audioElement) {
             throw new Error('Failed to create Audio element');
         }
         
-        // Set basic properties
+        // Set properties
         radioState.audioElement.volume = radioState.volume;
         radioState.audioElement.muted = radioState.isMuted;
         radioState.audioElement.crossOrigin = "anonymous";
+        radioState.audioElement.preload = radioState.isIOS ? 'none' : 'metadata';
         
-        // Platform-specific settings
         if (radioState.isIOS) {
-            radioState.audioElement.preload = 'none';
             radioState.audioElement.playsInline = true;
-        } else {
-            radioState.audioElement.preload = 'metadata';
         }
-        
-        // Set up comprehensive event listeners
-        setupAudioEventListeners();
         
         console.log('✅ Audio element created successfully');
         
@@ -282,95 +269,39 @@ async function createAudioElement() {
         radioState.audioElement = null;
         throw new Error(`Audio creation failed: ${error.message}`);
     }
-    
-    return Promise.resolve();
 }
 
-// Set up comprehensive audio event listeners
-function setupAudioEventListeners() {
-    const audio = radioState.audioElement;
-    
-    // Loading events
-    audio.addEventListener('loadstart', () => {
-        console.log('🔄 Audio: Load started');
-        showStatus('📻 Connecting to stream...');
-    });
-    
-    audio.addEventListener('loadedmetadata', () => {
-        console.log('📊 Audio: Metadata loaded');
-    });
-    
-    audio.addEventListener('canplay', () => {
-        console.log('✅ Audio: Can play');
-        showStatus('📻 Stream ready to play...');
-    });
-    
-    audio.addEventListener('canplaythrough', () => {
-        console.log('✅ Audio: Can play through');
-    });
-    
-    // Playback events
-    audio.addEventListener('play', () => {
-        console.log('▶️ Audio: Play event');
-    });
-    
-    audio.addEventListener('playing', () => {
-        console.log('▶️ Audio: Playing');
-        showStatus('📻 🎵 Live on ChillOut Radio!');
-        radioState.consecutiveErrors = 0;
-        radioState.lastSuccessfulConnection = Date.now();
-    });
-    
-    audio.addEventListener('pause', () => {
-        console.log('⏸️ Audio: Paused');
-    });
-    
-    // Buffering events
-    audio.addEventListener('waiting', () => {
-        console.log('⏳ Audio: Waiting/Buffering');
-        showStatus('📻 Buffering...');
-    });
-    
-    audio.addEventListener('stalled', () => {
-        console.log('⚠️ Audio: Stalled');
-        showStatus('📻 Connection slow - buffering...');
-    });
-    
-    audio.addEventListener('suspend', () => {
-        console.log('⏸️ Audio: Suspended');
-    });
-    
-    // Progress events
-    audio.addEventListener('progress', () => {
-        console.log('📊 Audio: Progress');
-    });
-    
-    audio.addEventListener('timeupdate', () => {
-        // Don't log this one as it's too frequent
-    });
-    
-    // Error handling
-    audio.addEventListener('error', handleAudioError);
-    
-    // End events
-    audio.addEventListener('ended', () => {
-        console.log('🔄 Audio: Ended - this should not happen in radio mode');
-        if (radioState.isPlaying) {
-            scheduleReconnect('Stream ended unexpectedly');
-        }
-    });
-    
-    // Network state changes
-    audio.addEventListener('emptied', () => {
-        console.log('📭 Audio: Emptied');
-    });
-    
-    audio.addEventListener('abort', () => {
-        console.log('🛑 Audio: Aborted');
-    });
+// Audio event handlers
+function handleLoadStart() {
+    console.log('🔄 Audio: Load started');
+    showStatus('📻 Connecting to stream...');
 }
 
-// Handle audio errors with detailed logging
+function handleCanPlay() {
+    console.log('✅ Audio: Can play');
+    showStatus('📻 Stream ready...');
+}
+
+function handlePlaying() {
+    console.log('▶️ Audio: Playing');
+    showStatus('📻 🎵 Live on ChillOut Radio!');
+    radioState.consecutiveErrors = 0;
+    radioState.lastSuccessfulConnection = Date.now();
+}
+
+function handleWaiting() {
+    console.log('⏳ Audio: Buffering');
+    showStatus('📻 Buffering...');
+}
+
+function handleEnded() {
+    console.log('🔄 Stream ended - this should not happen in radio mode');
+    if (radioState.isPlaying) {
+        scheduleReconnect('Stream ended unexpectedly');
+    }
+}
+
+// Handle audio errors
 function handleAudioError(e) {
     const error = e.target.error;
     let errorMsg = 'Unknown error';
@@ -379,11 +310,11 @@ function handleAudioError(e) {
     if (error) {
         switch (error.code) {
             case MediaError.MEDIA_ERR_ABORTED:
-                errorMsg = 'Playback aborted by user';
+                errorMsg = 'Playback aborted';
                 shouldReconnect = false;
                 break;
             case MediaError.MEDIA_ERR_NETWORK:
-                errorMsg = 'Network error while loading';
+                errorMsg = 'Network error';
                 break;
             case MediaError.MEDIA_ERR_DECODE:
                 errorMsg = 'Audio decoding error';
@@ -400,41 +331,25 @@ function handleAudioError(e) {
     console.error('❌ Audio error:', errorMsg, error);
     radioState.consecutiveErrors++;
     
-    // Only handle errors if we're still supposed to be playing
     if (!radioState.isPlaying) {
         console.log('⏭️ Ignoring audio error - player was stopped');
         return;
     }
     
-    // Show appropriate error message
-    if (error && error.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) {
-        showStatus('❌ Audio format not supported by your browser', true);
-        stopRadio(true);
-    } else if (error && error.code === MediaError.MEDIA_ERR_NETWORK) {
-        showStatus('📻 Network error - attempting to reconnect...', true);
-        if (shouldReconnect && radioState.consecutiveErrors < 5) {
-            scheduleReconnect('Network error');
-        } else {
-            stopRadio(true);
-        }
+    if (shouldReconnect && radioState.consecutiveErrors < 5) {
+        scheduleReconnect(errorMsg);
     } else {
-        showStatus(`❌ Playback error: ${errorMsg}`, true);
-        if (shouldReconnect && radioState.consecutiveErrors < 3) {
-            scheduleReconnect(errorMsg);
-        } else {
-            stopRadio(true);
-        }
+        stopRadio(true);
     }
 }
 
-// Start streaming with better error handling
+// Start streaming with proper source setting
 async function startStreaming() {
-    // Verify audio element exists
     if (!radioState.audioElement) {
-        throw new Error('Audio element is null - createAudioElement may have failed');
+        throw new Error('Audio element is null');
     }
     
-    console.log('🌐 Starting streaming with audio element:', radioState.audioElement);
+    console.log('🌐 Starting streaming...');
     
     // Check server status first
     try {
@@ -457,11 +372,10 @@ async function startStreaming() {
         throw new Error(`Server not ready: ${error.message}`);
     }
     
-    // Create stream URL with cache busting and platform info
+    // Build stream URL
     const timestamp = Date.now();
     let streamUrl = `/direct-stream?t=${timestamp}`;
     
-    // Add platform info
     if (radioState.isIOS) {
         streamUrl += '&platform=ios';
     } else if (radioState.isMobile) {
@@ -472,160 +386,141 @@ async function startStreaming() {
     
     console.log('🌐 Stream URL:', streamUrl);
     
-    // Verify audio element still exists before setting src
-    if (!radioState.audioElement) {
-        throw new Error('Audio element became null during setup');
-    }
+    // Set up event listeners BEFORE setting src
+    radioState.audioElement.addEventListener('loadstart', handleLoadStart);
+    radioState.audioElement.addEventListener('canplay', handleCanPlay);
+    radioState.audioElement.addEventListener('playing', handlePlaying);
+    radioState.audioElement.addEventListener('waiting', handleWaiting);
+    radioState.audioElement.addEventListener('ended', handleEnded);
+    radioState.audioElement.addEventListener('error', handleAudioError);
     
-    // Set source with error handling
-    try {
-        radioState.audioElement.src = streamUrl;
-        console.log('✅ Audio src set successfully');
-    } catch (error) {
-        console.error('❌ Failed to set audio src:', error);
-        throw new Error(`Failed to set audio source: ${error.message}`);
-    }
-    
-    // Start playback with timeout
+    // Set source and start playing
     return new Promise((resolve, reject) => {
+        let playAttempted = false;
         let timeoutId;
-        let resolved = false;
         
         const cleanup = () => {
             if (timeoutId) clearTimeout(timeoutId);
         };
         
         const handleSuccess = () => {
-            if (resolved) return;
-            resolved = true;
             cleanup();
             console.log('✅ Streaming started successfully');
             resolve();
         };
         
         const handleError = (error) => {
-            if (resolved) return;
-            resolved = true;
             cleanup();
             console.error('❌ Streaming failed:', error);
             reject(error);
         };
         
-        // Set up timeout
+        // Set timeout
         timeoutId = setTimeout(() => {
-            handleError(new Error('Connection timeout after 10 seconds'));
-        }, 10000);
+            if (!playAttempted) {
+                handleError(new Error('Connection timeout after 15 seconds'));
+            }
+        }, 15000);
         
-        // Verify audio element exists before adding listeners
+        // Verify audio element still exists
         if (!radioState.audioElement) {
-            handleError(new Error('Audio element is null'));
+            handleError(new Error('Audio element became null'));
             return;
         }
         
-        // Set up success listener
+        // Set up one-time playing listener
         const playingHandler = () => {
-            if (radioState.audioElement) {
-                radioState.audioElement.removeEventListener('playing', playingHandler);
-            }
+            radioState.audioElement.removeEventListener('playing', playingHandler);
             handleSuccess();
         };
         
         radioState.audioElement.addEventListener('playing', playingHandler);
         
-        // Attempt to play
-        const playPromise = radioState.audioElement.play();
-        
-        if (playPromise !== undefined) {
-            playPromise.then(() => {
-                console.log('✅ Play promise resolved');
-                // Success will be handled by 'playing' event
-            }).catch(error => {
-                console.error('❌ Play promise rejected:', error);
-                
-                if (error.name === 'NotAllowedError') {
-                    // Autoplay blocked - need user interaction
-                    resolved = true;
-                    cleanup();
-                    if (radioState.audioElement) {
-                        radioState.audioElement.removeEventListener('playing', playingHandler);
-                    }
+        try {
+            // Set the source
+            radioState.audioElement.src = streamUrl;
+            
+            // Attempt to play
+            playAttempted = true;
+            const playPromise = radioState.audioElement.play();
+            
+            if (playPromise !== undefined) {
+                playPromise.then(() => {
+                    console.log('✅ Play promise resolved');
+                }).catch(error => {
+                    console.error('❌ Play promise rejected:', error);
+                    radioState.audioElement.removeEventListener('playing', playingHandler);
                     
-                    showStatus('🔊 Click to enable audio playback', true);
-                    elements.startBtn.textContent = '🔊 Enable Audio';
-                    elements.startBtn.disabled = false;
-                    
-                    elements.startBtn.onclick = async () => {
-                        try {
-                            if (radioState.audioElement) {
-                                await radioState.audioElement.play();
-                                elements.startBtn.onclick = null; // Clear this handler
-                                setupEventListeners(); // Restore normal handlers
-                                updateUIForConnected();
-                                showStatus('📻 🎵 Live on ChillOut Radio!');
-                                resolve();
-                            } else {
-                                reject(new Error('Audio element is null during manual play'));
+                    if (error.name === 'NotAllowedError') {
+                        // Autoplay blocked
+                        cleanup();
+                        showStatus('🔊 Click to enable audio playback', true);
+                        elements.startBtn.textContent = '🔊 Enable Audio';
+                        elements.startBtn.disabled = false;
+                        
+                        // Set up one-time click handler
+                        const enableAudio = async () => {
+                            elements.startBtn.removeEventListener('click', enableAudio);
+                            try {
+                                if (radioState.audioElement) {
+                                    await radioState.audioElement.play();
+                                    setupEventListeners(); // Restore normal handlers
+                                    updateUIForConnected();
+                                    showStatus('📻 🎵 Live on ChillOut Radio!');
+                                    resolve();
+                                } else {
+                                    reject(new Error('Audio element is null'));
+                                }
+                            } catch (playError) {
+                                console.error('❌ Manual play failed:', playError);
+                                reject(playError);
                             }
-                        } catch (playError) {
-                            console.error('❌ Manual play failed:', playError);
-                            reject(playError);
-                        }
-                    };
-                } else {
-                    handleError(error);
-                }
-            });
+                        };
+                        
+                        elements.startBtn.addEventListener('click', enableAudio);
+                    } else {
+                        handleError(error);
+                    }
+                });
+            }
+        } catch (error) {
+            handleError(error);
         }
     });
 }
 
-// Stop radio with comprehensive cleanup
+// Stop radio
 async function stopRadio(isError = false) {
     console.log('⏹️ Stopping radio...');
     
-    // Update state immediately
     radioState.isPlaying = false;
     radioState.isReconnecting = false;
     
-    // Comprehensive audio cleanup
     if (radioState.audioElement) {
         try {
-            // Pause and clear source
             radioState.audioElement.pause();
-            radioState.audioElement.src = '';
-            radioState.audioElement.load(); // Force resource cleanup
             
-            // Remove specific event listeners we know about
+            // Remove all event listeners
             radioState.audioElement.removeEventListener('error', handleAudioError);
+            radioState.audioElement.removeEventListener('loadstart', handleLoadStart);
+            radioState.audioElement.removeEventListener('canplay', handleCanPlay);
+            radioState.audioElement.removeEventListener('playing', handlePlaying);
+            radioState.audioElement.removeEventListener('waiting', handleWaiting);
+            radioState.audioElement.removeEventListener('ended', handleEnded);
             
-            // Remove all possible event listeners
-            const events = ['loadstart', 'loadedmetadata', 'canplay', 'canplaythrough', 
-                          'play', 'playing', 'pause', 'waiting', 'stalled', 'suspend', 
-                          'progress', 'timeupdate', 'ended', 'emptied', 'abort'];
-            
-            events.forEach(event => {
-                // Clone and replace the element to remove all listeners
-                const newAudio = radioState.audioElement.cloneNode(false);
-                if (radioState.audioElement.parentNode) {
-                    radioState.audioElement.parentNode.replaceChild(newAudio, radioState.audioElement);
-                }
-            });
-            
+            // Clear source
+            radioState.audioElement.removeAttribute('src');
+            radioState.audioElement.load();
         } catch (error) {
             console.warn('⚠️ Error during audio cleanup:', error);
         }
-        
         radioState.audioElement = null;
     }
     
-    // Clear timers
     clearTimers();
-    
-    // Reset connection state
     radioState.connectionId = null;
     radioState.consecutiveErrors = 0;
     
-    // Update UI
     updateUIForDisconnected();
     
     if (!isError) {
@@ -636,7 +531,7 @@ async function stopRadio(isError = false) {
     }
 }
 
-// Schedule reconnect with exponential backoff and better state management
+// Schedule reconnect
 function scheduleReconnect(reason = 'Unknown error') {
     if (radioState.isReconnecting || !radioState.isPlaying) {
         console.log('⏭️ Skipping reconnect - already reconnecting or not playing');
@@ -646,11 +541,10 @@ function scheduleReconnect(reason = 'Unknown error') {
     radioState.isReconnecting = true;
     console.log(`🔄 Scheduling reconnect due to: ${reason}`);
     
-    // Clean up current audio element first
     if (radioState.audioElement) {
         try {
             radioState.audioElement.pause();
-            radioState.audioElement.src = '';
+            radioState.audioElement.removeAttribute('src');
             radioState.audioElement.load();
             radioState.audioElement = null;
         } catch (error) {
@@ -658,7 +552,6 @@ function scheduleReconnect(reason = 'Unknown error') {
         }
     }
     
-    // Exponential backoff: 1s, 2s, 4s, 8s, max 10s
     const delay = Math.min(1000 * Math.pow(2, radioState.consecutiveErrors), 10000);
     
     showStatus(`📻 Reconnecting in ${Math.round(delay/1000)}s... (${reason})`);
@@ -669,19 +562,15 @@ function scheduleReconnect(reason = 'Unknown error') {
             
             try {
                 radioState.isReconnecting = false;
-                
-                // Create fresh audio element
                 await createAudioElement();
                 
-                // Verify element was created
                 if (!radioState.audioElement) {
                     throw new Error('Failed to create audio element during reconnect');
                 }
                 
-                // Start streaming
                 await startStreaming();
                 showStatus('📻 🎵 Reconnected successfully!');
-                radioState.consecutiveErrors = 0; // Reset on success
+                radioState.consecutiveErrors = 0;
                 
             } catch (error) {
                 console.error('❌ Reconnect failed:', error);
@@ -696,7 +585,7 @@ function scheduleReconnect(reason = 'Unknown error') {
                 }
             }
         } else {
-            console.log('⏭️ Reconnect cancelled - player stopped or already reconnecting');
+            console.log('⏭️ Reconnect cancelled - player stopped');
             radioState.isReconnecting = false;
         }
     }, delay);
@@ -718,7 +607,6 @@ async function checkConnectionHealth() {
         
         const data = await response.json();
         
-        // Update listener count from heartbeat
         if (data.active_listeners !== undefined && elements.listenerCount) {
             elements.listenerCount.innerHTML = `<span class="radio-live">LIVE</span> • Listeners: ${data.active_listeners}`;
         }
@@ -740,7 +628,6 @@ function toggleMute() {
     
     elements.muteBtn.textContent = radioState.isMuted ? '🔇 Unmute' : '🔊 Mute';
     
-    // Save setting
     try {
         localStorage.setItem('radioMuted', radioState.isMuted.toString());
     } catch (e) {
@@ -756,7 +643,6 @@ function updateVolume(volume) {
         radioState.audioElement.volume = volume;
     }
     
-    // Save setting
     try {
         localStorage.setItem('radioVolume', volume.toString());
     } catch (e) {
@@ -788,16 +674,11 @@ function loadSettings() {
 
 // Start track info updates
 function startTrackInfoUpdates() {
-    // Clear existing timers
     clearTimers();
     
-    // Fetch now playing every 5 seconds (reduced from 8)
     radioState.nowPlayingTimer = setInterval(fetchNowPlaying, 5000);
-    
-    // Send heartbeat every 15 seconds
     radioState.heartbeatTimer = setInterval(sendHeartbeat, 15000);
     
-    // Initial fetch
     fetchNowPlaying();
 }
 
@@ -813,7 +694,7 @@ function clearTimers() {
     }
 }
 
-// Fetch now playing with better error handling
+// Fetch now playing
 async function fetchNowPlaying() {
     try {
         const response = await fetch('/api/now-playing', {
@@ -833,11 +714,10 @@ async function fetchNowPlaying() {
         
     } catch (error) {
         console.error('❌ Error fetching now playing:', error);
-        // Don't show error to user for this - it's not critical
     }
 }
 
-// Update track info with comprehensive error handling
+// Update track info
 function updateTrackInfo(info) {
     try {
         if (!info || typeof info !== 'object') {
@@ -890,15 +770,6 @@ function updateTrackInfo(info) {
             document.title = `📻 ${info.title} - ${info.artist} | ChillOut Radio`;
         }
         
-        // Log successful update (occasionally)
-        if (Math.random() < 0.1) { // 10% of the time
-            console.log('📊 Track info updated:', {
-                title: info.title,
-                position: radioState.serverPosition,
-                listeners: info.active_listeners
-            });
-        }
-        
     } catch (error) {
         console.error('❌ Error updating track info:', error);
     }
@@ -918,7 +789,6 @@ async function sendHeartbeat() {
         if (response.ok) {
             const data = await response.json();
             
-            // Update listener count from heartbeat
             if (data.active_listeners !== undefined && elements.listenerCount) {
                 elements.listenerCount.innerHTML = `<span class="radio-live">LIVE</span> • Listeners: ${data.active_listeners}`;
             }
@@ -960,7 +830,8 @@ function formatTime(seconds) {
 document.addEventListener('DOMContentLoaded', () => {
     try {
         initRadioPlayer();
-        console.log('🎵 ChillOut Radio v2.6.0 - UI Bug Fixed');
+        console.log('🎵 ChillOut Radio v3.1 - True Radio Mode');
+        console.log('📻 Server-controlled playback only');
     } catch (error) {
         console.error('❌ Failed to initialize radio player:', error);
         alert('Radio player failed to initialize. Please refresh the page.');
@@ -973,7 +844,7 @@ window.addEventListener('beforeunload', () => {
     clearTimers();
     if (radioState.audioElement) {
         radioState.audioElement.pause();
-        radioState.audioElement.src = '';
+        radioState.audioElement.removeAttribute('src');
     }
 });
 
@@ -991,7 +862,7 @@ window.addEventListener('offline', () => {
     showStatus('📡 Network offline - will reconnect when available', true);
 });
 
-// Debug object for troubleshooting
+// Debug object
 window.ChillOutRadio = {
     state: radioState,
     elements: elements,
@@ -999,11 +870,11 @@ window.ChillOutRadio = {
     stop: stopRadio,
     fetchInfo: fetchNowPlaying,
     healthCheck: performHealthCheck,
-    version: '2.6.0-ui-fix',
+    version: '3.1.0-fixed',
+    mode: 'server-controlled',
     
-    // Debug methods
     getAudioState: () => {
-        if (!radioState.audioElement) return 'No audio element (NULL)';
+        if (!radioState.audioElement) return 'No audio element';
         return {
             paused: radioState.audioElement.paused,
             ended: radioState.audioElement.ended,
@@ -1011,67 +882,28 @@ window.ChillOutRadio = {
             readyState: radioState.audioElement.readyState,
             networkState: radioState.audioElement.networkState,
             src: radioState.audioElement.src,
-            srcIsNull: radioState.audioElement.src === null,
-            srcIsEmpty: radioState.audioElement.src === ''
+            currentSrc: radioState.audioElement.currentSrc
         };
     },
     
-    reconnect: () => scheduleReconnect('Manual reconnect'),
-    
-    testStream: async () => {
+    testDirectStream: async () => {
         try {
-            const response = await fetch('/stream-status');
-            const data = await response.json();
-            console.log('Stream test result:', data);
-            return data;
+            const url = `/direct-stream?t=${Date.now()}`;
+            const response = await fetch(url, { method: 'HEAD' });
+            console.log('Direct stream test:', {
+                url: url,
+                status: response.status,
+                contentType: response.headers.get('content-type'),
+                headers: Object.fromEntries(response.headers.entries())
+            });
+            return response.ok;
         } catch (error) {
-            console.error('Stream test failed:', error);
-            return { error: error.message };
+            console.error('Direct stream test failed:', error);
+            return false;
         }
-    },
-    
-    // New debug methods for null audio element issues
-    forceCleanup: () => {
-        console.log('🧹 Force cleanup requested');
-        stopRadio(false);
-    },
-    
-    checkAudioElementStatus: () => {
-        console.log('🔍 Audio element status:');
-        console.log('  - radioState.audioElement:', radioState.audioElement);
-        console.log('  - typeof audioElement:', typeof radioState.audioElement);
-        console.log('  - audioElement === null:', radioState.audioElement === null);
-        console.log('  - audioElement === undefined:', radioState.audioElement === undefined);
-        return {
-            exists: !!radioState.audioElement,
-            type: typeof radioState.audioElement,
-            isNull: radioState.audioElement === null,
-            isUndefined: radioState.audioElement === undefined
-        };
-    },
-    
-    // UI state debugging
-    getUIState: () => {
-        return {
-            isPlaying: radioState.isPlaying,
-            isReconnecting: radioState.isReconnecting,
-            isTogglingConnection: radioState.isTogglingConnection,
-            buttonText: elements.startBtn ? elements.startBtn.textContent : 'No button',
-            buttonDisabled: elements.startBtn ? elements.startBtn.disabled : 'No button',
-            buttonDataset: elements.startBtn ? elements.startBtn.dataset.connected : 'No button'
-        };
-    },
-    
-    // Force UI reset
-    resetUI: () => {
-        console.log('🔄 Forcing UI reset');
-        radioState.isTogglingConnection = false;
-        radioState.isReconnecting = false;
-        updateUIForDisconnected();
     }
 };
 
-console.log('🎵 ChillOut Radio v2.6.0 - UI Disconnect Bug Fixed');
-console.log('🔧 Debug: window.ChillOutRadio available for troubleshooting');
-console.log('✅ Fixed: Disconnect button immediately reconnecting');
-console.log('🛡️ Added: Toggle connection lock to prevent rapid clicks');
+console.log('🎵 ChillOut Radio v3.1 - Fixed Audio Source Handling');
+console.log('📻 No empty src attribute errors');
+console.log('🔧 Debug: window.ChillOutRadio available');

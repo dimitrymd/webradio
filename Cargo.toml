@@ -1,8 +1,8 @@
 [package]
 name = "webradio"
-version = "0.3.0"
+version = "2.5.0"
 edition = "2021"
-description = "True Radio - Single broadcast for all listeners"
+description = "True Radio - FIXED - Synchronized broadcast for all listeners"
 authors = ["Your Name"]
 license = "MIT"
 
@@ -24,7 +24,7 @@ bytes = "1.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# MP3 metadata and duration parsing
+# MP3 metadata and duration parsing (REQUIRED for fixes)
 id3 = "1.7.0"
 mp3-duration = "0.1.10"
 
@@ -33,6 +33,7 @@ lazy_static = "1.4.0"
 parking_lot = "0.12.1"
 chrono = { version = "0.4.41", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4"] }
+ctrlc = "3.2"
 
 # Logging
 log = "0.4"

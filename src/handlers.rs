@@ -1,4 +1,4 @@
-// src/handlers.rs - Minimal working version
+// src/handlers.rs - True Radio Mode (No Client Track Control)
 
 use rocket::State;
 use rocket::serde::json::Json;
@@ -9,7 +9,7 @@ use rocket::http::Header;
 use rocket::response::Responder;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use log::{info, warn};
+use log::warn;
 
 use crate::services::streamer::StreamManager;
 use crate::services::playlist;
@@ -40,7 +40,8 @@ impl<'r, T: Responder<'r, 'static>> Responder<'r, 'static> for CorsResponse<T> {
 pub async fn index() -> Template {
     Template::render("index", context! {
         title: "ChillOut Radio - Live Radio Stream",
-        version: "2.4.0-fixed"
+        version: "3.1.0",
+        mode: "true-radio"
     })
 }
 
@@ -59,7 +60,7 @@ pub async fn now_playing(
     let active_listeners = sm.get_active_listeners();
     let is_mobile = mobile_client.unwrap_or(false) || android_client.unwrap_or(false);
     
-    // PRIORITY: Get track info from stream manager first (this is what's actually playing)
+    // Get track info from stream manager (what's actually playing)
     if let Some(track_json) = &track_state.track_info {
         if let Ok(mut track_value) = serde_json::from_str::<serde_json::Value>(track_json) {
             if let serde_json::Value::Object(ref mut map) = track_value {
@@ -103,14 +104,17 @@ pub async fn now_playing(
                 );
                 
                 // Radio metadata
-                map.insert("streaming_mode".to_string(), serde_json::Value::String("radio".to_string()));
+                map.insert("streaming_mode".to_string(), serde_json::Value::String("true-radio".to_string()));
+                map.insert("client_control_enabled".to_string(), serde_json::Value::Bool(false));
                 map.insert("seeking_enabled".to_string(), serde_json::Value::Bool(false));
+                map.insert("skip_enabled".to_string(), serde_json::Value::Bool(false));
                 map.insert("synchronized_playback".to_string(), serde_json::Value::Bool(true));
                 map.insert("streaming".to_string(), serde_json::Value::Bool(sm.is_streaming()));
                 map.insert("track_ended".to_string(), serde_json::Value::Bool(sm.track_ended()));
                 
-                // Add source indicator for debugging
-                map.insert("track_source".to_string(), serde_json::Value::String("stream_manager".to_string()));
+                // Track timing info
+                map.insert("remaining_seconds".to_string(), serde_json::Value::Number(serde_json::Number::from(track_state.remaining_time)));
+                map.insert("is_near_end".to_string(), serde_json::Value::Bool(track_state.is_near_end));
                 
                 if is_mobile {
                     map.insert("mobile_optimized".to_string(), serde_json::Value::Bool(true));
@@ -120,61 +124,32 @@ pub async fn now_playing(
         }
     }
     
-    // FALLBACK: If stream manager has no track info, try playlist as fallback
-    warn!("Stream manager has no track info, falling back to playlist");
-    if let Some(current_track) = playlist::get_current_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER) {
-        CorsResponse::new(Json(serde_json::json!({
-            "title": current_track.title,
-            "artist": current_track.artist,
-            "album": current_track.album,
-            "duration": current_track.duration,
-            "path": current_track.path,
-            "radio_position": track_state.position_seconds,
-            "radio_position_ms": track_state.position_milliseconds,
-            "playback_position": track_state.position_seconds,
-            "playback_position_ms": track_state.position_milliseconds,
-            "active_listeners": active_listeners,
-            "bitrate": track_state.bitrate / 1000,
-            "server_timestamp": std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-            "streaming_mode": "radio",
-            "seeking_enabled": false,
-            "synchronized_playback": true,
-            "streaming": sm.is_streaming(),
-            "mobile_optimized": is_mobile,
-            "track_ended": sm.track_ended(),
-            "track_source": "playlist_fallback"
-        })))
-    } else {
-        // LAST RESORT: Default response
-        warn!("No track info available from any source");
-        CorsResponse::new(Json(serde_json::json!({
-            "title": "ChillOut Radio",
-            "artist": "Live Stream",
-            "album": "Now Playing",
-            "duration": track_state.duration,
-            "path": "live.mp3",
-            "radio_position": track_state.position_seconds,
-            "radio_position_ms": track_state.position_milliseconds,
-            "playback_position": track_state.position_seconds,
-            "playback_position_ms": track_state.position_milliseconds,
-            "active_listeners": active_listeners,
-            "bitrate": track_state.bitrate / 1000,
-            "server_timestamp": std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-            "streaming_mode": "radio",
-            "seeking_enabled": false,
-            "synchronized_playback": true,
-            "streaming": sm.is_streaming(),
-            "mobile_optimized": is_mobile,
-            "track_ended": sm.track_ended(),
-            "track_source": "default"
-        })))
-    }
+    // Fallback response
+    warn!("Stream manager has no track info, returning default");
+    CorsResponse::new(Json(serde_json::json!({
+        "title": "ChillOut Radio",
+        "artist": "Live Stream",
+        "album": "Broadcasting",
+        "duration": 0,
+        "radio_position": track_state.position_seconds,
+        "radio_position_ms": track_state.position_milliseconds,
+        "playback_position": track_state.position_seconds,
+        "playback_position_ms": track_state.position_milliseconds,
+        "active_listeners": active_listeners,
+        "bitrate": track_state.bitrate / 1000,
+        "server_timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        "streaming_mode": "true-radio",
+        "client_control_enabled": false,
+        "seeking_enabled": false,
+        "skip_enabled": false,
+        "synchronized_playback": true,
+        "streaming": sm.is_streaming(),
+        "mobile_optimized": is_mobile,
+        "track_ended": sm.track_ended()
+    })))
 }
 
 #[get("/api/heartbeat?<connection_id>")]
@@ -201,7 +176,7 @@ pub async fn heartbeat(
         "radio_position": position_secs,
         "radio_position_ms": position_ms,
         "streaming": sm.is_streaming(),
-        "streaming_mode": "radio"
+        "streaming_mode": "true-radio"
     })))
 }
 
@@ -222,8 +197,11 @@ pub async fn get_stats(stream_manager: &State<Arc<StreamManager>>) -> CorsRespon
         "radio_position": track_state.position_seconds,
         "radio_position_ms": track_state.position_milliseconds,
         "track_duration": track_state.duration,
-        "streaming_mode": "radio",
+        "remaining_seconds": track_state.remaining_time,
+        "streaming_mode": "true-radio",
+        "client_control_enabled": false,
         "seeking_enabled": false,
+        "skip_enabled": false,
         "synchronized_playback": true,
         "server_timestamp": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -242,7 +220,8 @@ pub async fn get_position(stream_manager: &State<Arc<StreamManager>>) -> CorsRes
         "radio_position_ms": track_state.position_milliseconds,
         "duration": track_state.duration,
         "remaining_time": track_state.remaining_time,
-        "streaming_mode": "radio",
+        "is_near_end": track_state.is_near_end,
+        "streaming_mode": "true-radio",
         "server_timestamp": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -255,63 +234,27 @@ pub async fn get_playlist() -> CorsResponse<Json<serde_json::Value>> {
     let playlist_data = playlist::get_playlist(&config::PLAYLIST_FILE);
     let current_track = playlist::get_current_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER);
     
+    // Don't expose current_track index to prevent client-side track control attempts
+    let tracks_without_index: Vec<_> = playlist_data.tracks.iter().enumerate().map(|(i, track)| {
+        serde_json::json!({
+            "title": track.title,
+            "artist": track.artist,
+            "album": track.album,
+            "duration": track.duration,
+            "is_current": current_track.as_ref().map(|ct| ct.path == track.path).unwrap_or(false),
+            "order": i
+        })
+    }).collect();
+    
     CorsResponse::new(Json(serde_json::json!({
-        "tracks": playlist_data.tracks,
+        "tracks": tracks_without_index,
         "total_tracks": playlist_data.tracks.len(),
-        "current_track": current_track,
-        "streaming_mode": "radio",
-        "seeking_enabled": false
+        "streaming_mode": "true-radio",
+        "client_control_enabled": false,
+        "seeking_enabled": false,
+        "skip_enabled": false,
+        "info": "Tracks play in server-controlled order"
     })))
-}
-
-// Track switching endpoints
-#[get("/api/switch-track")]
-pub async fn switch_track(stream_manager: &State<Arc<StreamManager>>) -> CorsResponse<Json<serde_json::Value>> {
-    let sm = stream_manager.as_ref();
-    
-    info!("Manual track switch requested via API");
-    sm.request_track_switch();
-    
-    // Get current track state
-    let track_state = sm.get_track_state();
-    
-    CorsResponse::new(Json(serde_json::json!({
-        "status": "track_switch_requested",
-        "message": "Track switch has been requested",
-        "current_position": track_state.position_seconds,
-        "current_duration": track_state.duration,
-        "remaining_time": track_state.remaining_time,
-        "server_timestamp": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    })))
-}
-
-#[get("/api/next-track")]
-pub async fn get_next_track() -> CorsResponse<Json<serde_json::Value>> {
-    let next_track = playlist::get_next_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER);
-    
-    match next_track {
-        Some(track) => {
-            CorsResponse::new(Json(serde_json::json!({
-                "status": "success",
-                "next_track": {
-                    "title": track.title,
-                    "artist": track.artist,
-                    "album": track.album,
-                    "duration": track.duration,
-                    "path": track.path
-                }
-            })))
-        },
-        None => {
-            CorsResponse::new(Json(serde_json::json!({
-                "status": "error",
-                "message": "No next track available"
-            })))
-        }
-    }
 }
 
 #[get("/api/health")]
@@ -322,7 +265,7 @@ pub async fn health_check(stream_manager: &State<Arc<StreamManager>>) -> CorsRes
         "status": "healthy",
         "streaming": sm.is_streaming(),
         "active_listeners": sm.get_active_listeners(),
-        "uptime": "unknown",
+        "mode": "true-radio",
         "server_timestamp": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -338,6 +281,7 @@ pub async fn get_connections(stream_manager: &State<Arc<StreamManager>>) -> Cors
     CorsResponse::new(Json(serde_json::json!({
         "active_connections": sm.get_active_listeners(),
         "streaming": sm.is_streaming(),
+        "mode": "true-radio",
         "server_timestamp": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -397,4 +341,9 @@ pub async fn service_unavailable() -> Template {
         status: 503,
         message: "Service temporarily unavailable"
     })
+}
+
+#[get("/test")]
+pub async fn test_endpoint() -> &'static str {
+    "Server is running! Audio stream should be at /direct-stream"
 }
