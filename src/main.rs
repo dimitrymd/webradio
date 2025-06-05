@@ -1,4 +1,4 @@
-// src/main.rs - CPU-optimized entry point
+// src/main.rs - Async I/O entry point
 
 extern crate rocket;
 
@@ -17,17 +17,17 @@ use crate::services::streamer::StreamManager;
 use crate::services::playlist;
 
 #[launch]
-fn rocket() -> rocket::Rocket<rocket::Build> {
+async fn rocket() -> rocket::Rocket<rocket::Build> {
     // Set up minimal logging
     std::env::set_var("RUST_LOG", "error");
     env_logger::init();
     
     println!("============================================================");
-    println!("ChillOut Radio - Ultra CPU-Optimized v6.0");
-    println!("Minimal CPU usage configuration active");
+    println!("ChillOut Radio - Async I/O v7.0");
+    println!("Using async/await for efficient I/O operations");
     println!("============================================================");
 
-    // Initialize stream manager
+    // Initialize stream manager with async runtime handle
     let stream_manager = Arc::new(StreamManager::new(
         &config::MUSIC_FOLDER,
         config::CHUNK_SIZE,
@@ -37,16 +37,21 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     
     // Ensure music directory exists
     if !config::MUSIC_FOLDER.exists() {
-        std::fs::create_dir_all(&*config::MUSIC_FOLDER).unwrap_or_else(|e| {
+        tokio::fs::create_dir_all(&*config::MUSIC_FOLDER).await.unwrap_or_else(|e| {
             eprintln!("Failed to create music directory: {}", e);
         });
     }
     
-    // Initial scan
+    // Initial scan (async)
     println!("Scanning for MP3 files...");
-    playlist::scan_music_folder(&config::MUSIC_FOLDER, &config::PLAYLIST_FILE);
+    let playlist_data = match playlist::scan_music_folder_async(&config::MUSIC_FOLDER, &config::PLAYLIST_FILE).await {
+        Ok(playlist) => playlist,
+        Err(e) => {
+            eprintln!("Error scanning music folder: {}", e);
+            crate::models::playlist::Playlist::default()
+        }
+    };
     
-    let playlist_data = playlist::get_playlist(&config::PLAYLIST_FILE);
     if playlist_data.tracks.is_empty() {
         println!("⚠️  No MP3 files found in music folder");
         println!("   Add MP3 files to: {}", config::MUSIC_FOLDER.display());
@@ -54,54 +59,53 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
         println!("✅ Found {} tracks", playlist_data.tracks.len());
     }
 
-    // Update durations once at startup
-    playlist::rescan_and_update_durations(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER);
+    // Update durations once at startup (async)
+    if let Err(e) = playlist::rescan_and_update_durations_async(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER).await {
+        eprintln!("Error updating track durations: {}", e);
+    }
 
-    // Start broadcast thread
-    println!("Starting CPU-optimized radio broadcast...");
+    // Start broadcast task (async)
+    println!("Starting async radio broadcast...");
     stream_manager.start_broadcast_thread();
     
-    // Start minimal monitor thread
+    // Start monitor task (async)
     let monitor_manager = stream_manager.clone();
-    std::thread::Builder::new()
-        .name("monitor".to_string())
-        .spawn(move || {
-            // Set monitor thread to lower priority
-            #[cfg(unix)]
-            {
-                unsafe {
-                    libc::nice(15); // Even lower priority than broadcast
-                }
-            }
-            playlist::track_switcher(monitor_manager);
-        })
-        .expect("Failed to spawn monitor thread");
+    tokio::spawn(async move {
+        playlist::track_switcher_async(monitor_manager).await;
+    });
     
     // Set up shutdown handler
     let stream_manager_for_shutdown = stream_manager.clone();
-    ctrlc::set_handler(move || {
-        println!("\n📻 Shutting down...");
-        stream_manager_for_shutdown.stop_broadcasting();
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        std::process::exit(0);
-    }).expect("Error setting Ctrl-C handler");
+    tokio::spawn(async move {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                println!("\n📻 Shutting down...");
+                stream_manager_for_shutdown.stop_broadcasting();
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                std::process::exit(0);
+            }
+            Err(err) => {
+                eprintln!("Unable to listen for shutdown signal: {}", err);
+            }
+        }
+    });
     
-    println!("✅ CPU-optimized radio is broadcasting!");
+    println!("✅ Async radio is broadcasting!");
     println!("🌐 Server at: http://localhost:8000");
     println!("📻 Stream at: http://localhost:8000/direct-stream");
     println!("🛑 Press Ctrl+C to stop");
     println!("============================================================");
     
-    // Configure Rocket for minimal CPU usage
+    // Configure Rocket for async I/O
     let rocket_config = Config {
         port: config::PORT,
         address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
         keep_alive: config::KEEP_ALIVE_TIMEOUT,
-        workers: 1,              // Single worker thread!
-        max_blocking: 1,         // Minimal blocking threads
-        ident: rocket::config::Ident::none(), // Disable ident header
-        ip_header: None,         // No IP header parsing
-        log_level: rocket::config::LogLevel::Off, // Disable Rocket logging
+        workers: 2,              // Can use more workers with async
+        max_blocking: 4,         // Slightly more blocking threads
+        ident: rocket::config::Ident::none(),
+        ip_header: None,
+        log_level: rocket::config::LogLevel::Off,
         ..Config::default()
     };
     
