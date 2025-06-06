@@ -1,9 +1,9 @@
-// src/main.rs - Async I/O entry point
+// src/main.rs - Fully optimized entry point
 
 extern crate rocket;
 
 use rocket_dyn_templates::Template;
-use rocket::{launch, routes, catchers, Config};
+use rocket::{routes, catchers, Config};
 use std::sync::Arc;
 
 mod config;
@@ -16,15 +16,43 @@ mod direct_stream;
 use crate::services::streamer::StreamManager;
 use crate::services::playlist;
 
-#[launch]
-async fn rocket() -> rocket::Rocket<rocket::Build> {
+// Create optimized runtime
+fn create_optimized_runtime() -> tokio::runtime::Runtime {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    
+    builder
+        .worker_threads(2)  // Only 2 worker threads
+        .max_blocking_threads(1)
+        .thread_name("radio-worker")
+        .thread_stack_size(2 * 1024 * 1024); // 2MB stack
+    
+    // Set thread affinity on Linux
+    #[cfg(target_os = "linux")]
+    builder.on_thread_start(|| {
+        use libc::{cpu_set_t, CPU_SET, CPU_ZERO, sched_setaffinity};
+        unsafe {
+            let mut cpu_set: cpu_set_t = std::mem::zeroed();
+            CPU_ZERO(&mut cpu_set);
+            CPU_SET(0, &mut cpu_set); // Pin to CPU 0
+            sched_setaffinity(0, std::mem::size_of::<cpu_set_t>(), &cpu_set);
+            
+            // Set thread priority
+            libc::nice(10); // Lower priority for worker threads
+        }
+    });
+    
+    builder.enable_all().build().unwrap()
+}
+
+#[rocket::main]
+async fn main() -> Result<(), rocket::Error> {
     // Set up minimal logging
     std::env::set_var("RUST_LOG", "error");
     env_logger::init();
     
     println!("============================================================");
-    println!("ChillOut Radio - Async I/O v7.0");
-    println!("Using async/await for efficient I/O operations");
+    println!("ChillOut Radio - Fully Optimized v4.0");
+    println!("Minimal CPU usage with all optimizations");
     println!("============================================================");
 
     // Initialize stream manager with async runtime handle
@@ -41,6 +69,9 @@ async fn rocket() -> rocket::Rocket<rocket::Build> {
             eprintln!("Failed to create music directory: {}", e);
         });
     }
+    
+    // Initialize playlist watcher
+    playlist::init_playlist_watcher(&config::PLAYLIST_FILE);
     
     // Initial scan (async)
     println!("Scanning for MP3 files...");
@@ -65,7 +96,7 @@ async fn rocket() -> rocket::Rocket<rocket::Build> {
     }
 
     // Start broadcast task (async)
-    println!("Starting async radio broadcast...");
+    println!("Starting optimized radio broadcast...");
     stream_manager.start_broadcast_thread();
     
     // Start monitor task (async)
@@ -90,19 +121,19 @@ async fn rocket() -> rocket::Rocket<rocket::Build> {
         }
     });
     
-    println!("✅ Async radio is broadcasting!");
+    println!("✅ Optimized radio is broadcasting!");
     println!("🌐 Server at: http://localhost:8000");
     println!("📻 Stream at: http://localhost:8000/direct-stream");
     println!("🛑 Press Ctrl+C to stop");
     println!("============================================================");
     
-    // Configure Rocket for async I/O
+    // Configure Rocket with optimizations
     let rocket_config = Config {
         port: config::PORT,
         address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
         keep_alive: config::KEEP_ALIVE_TIMEOUT,
-        workers: 2,              // Can use more workers with async
-        max_blocking: 4,         // Slightly more blocking threads
+        workers: 2,              // Minimal workers
+        max_blocking: 2,         // Minimal blocking threads
         ident: rocket::config::Ident::none(),
         ip_header: None,
         log_level: rocket::config::LogLevel::Off,
@@ -110,7 +141,7 @@ async fn rocket() -> rocket::Rocket<rocket::Build> {
     };
     
     // Build Rocket server
-    rocket::custom(rocket_config)
+    let rocket = rocket::custom(rocket_config)
         .manage(stream_manager)
         .mount("/", routes![
             // Streaming endpoints
@@ -143,5 +174,9 @@ async fn rocket() -> rocket::Rocket<rocket::Build> {
             handlers::server_error,
             handlers::service_unavailable,
         ])
-        .attach(Template::fairing())
+        .attach(Template::fairing());
+    
+    rocket.launch().await?;
+    Ok(())?;
+    Ok(())
 }

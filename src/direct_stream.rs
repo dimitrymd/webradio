@@ -1,4 +1,4 @@
-// src/direct_stream.rs - CPU-optimized streaming implementation
+// src/direct_stream.rs - Optimized streaming implementation
 
 use rocket::http::{ContentType, Status};
 use rocket::response::{self, Responder, Response};
@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::services::streamer::{StreamManager, AudioChunk};
 
-// Balanced buffer for smooth streaming
+// Optimized buffer for smooth streaming
 const STREAM_BUFFER_SIZE: usize = 32768; // 32KB internal buffer
 
 pub struct AudioStream {
@@ -21,7 +21,7 @@ pub struct AudioStream {
     stream_manager: Arc<StreamManager>,
     current_chunk: Option<Vec<u8>>,
     chunk_position: usize,
-    internal_buffer: Vec<u8>, // Reusable buffer
+    internal_buffer: Vec<u8>,
 }
 
 impl AudioStream {
@@ -31,7 +31,6 @@ impl AudioStream {
         
         stream_manager.update_connection_info(&connection_id, platform_str, String::new());
         
-        // Log only in debug mode
         #[cfg(debug_assertions)]
         info!("New listener {} connected", &connection_id[..8]);
         
@@ -88,18 +87,21 @@ impl AsyncRead for AudioStream {
             
             // Try to get multiple chunks at once for efficiency
             let mut chunks_received = 0;
-            const MAX_CHUNKS_PER_POLL: usize = 3; // Balanced
+            const MAX_CHUNKS_PER_POLL: usize = 3;
             
             while chunks_received < MAX_CHUNKS_PER_POLL {
                 match self.receiver.try_recv() {
                     Ok(audio_chunk) => {
+                        // Convert Arc<[u8]> to Vec<u8> for the chunk
+                        let chunk_data = audio_chunk.data.to_vec();
+                        
                         if chunks_received == 0 {
                             // First chunk goes to current_chunk
-                            self.current_chunk = Some(audio_chunk.data.to_vec());
+                            self.current_chunk = Some(chunk_data);
                             self.chunk_position = 0;
                         } else {
                             // Additional chunks go to internal buffer
-                            self.internal_buffer.extend_from_slice(&audio_chunk.data);
+                            self.internal_buffer.extend_from_slice(&chunk_data);
                         }
                         chunks_received += 1;
                     },
@@ -112,7 +114,6 @@ impl AsyncRead for AudioStream {
                         return Poll::Pending;
                     },
                     Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
-                        // Log only in debug mode
                         #[cfg(debug_assertions)]
                         info!("Listener {} lagged by {} chunks", &self.connection_id[..8], skipped);
                         continue;
@@ -133,7 +134,6 @@ impl AsyncRead for AudioStream {
 
 impl Drop for AudioStream {
     fn drop(&mut self) {
-        // Log only in debug mode
         #[cfg(debug_assertions)]
         info!("Listener {} disconnected", &self.connection_id[..8]);
         

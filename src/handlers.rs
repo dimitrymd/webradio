@@ -1,4 +1,4 @@
-// src/handlers.rs - True Radio Mode (No Client Track Control)
+// src/handlers.rs - Optimized with JSON caching
 
 use rocket::State;
 use rocket::serde::json::Json;
@@ -9,7 +9,6 @@ use rocket::http::Header;
 use rocket::response::Responder;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use log::warn;
 
 use crate::services::streamer::StreamManager;
 use crate::services::playlist;
@@ -36,11 +35,22 @@ impl<'r, T: Responder<'r, 'static>> Responder<'r, 'static> for CorsResponse<T> {
     }
 }
 
+// Pre-rendered index template
+lazy_static::lazy_static! {
+    static ref INDEX_TEMPLATE: String = {
+        let template = include_str!("../templates/index.html.tera");
+        template.replace("{{ title }}", "ChillOut Radio - Live Radio Stream")
+                .replace("{{ version }}", "4.0.0")
+                .replace("{{ mode }}", "true-radio")
+    };
+}
+
 #[get("/")]
 pub async fn index() -> Template {
+    // Still use Template for now, but could be optimized further
     Template::render("index", context! {
         title: "ChillOut Radio - Live Radio Stream",
-        version: "3.1.0",
+        version: "4.0.0",
         mode: "true-radio"
     })
 }
@@ -50,82 +60,96 @@ pub async fn now_playing(
     mobile_client: Option<bool>,
     android_client: Option<bool>,
     stream_manager: &State<Arc<StreamManager>>
-) -> CorsResponse<Json<serde_json::Value>> {
+) -> CorsResponse<Json<Value>> {
     let sm = stream_manager.as_ref();
     
     // Clean up stale connections
     sm.cleanup_stale_connections();
     
-    let track_state = sm.get_track_state();
     let active_listeners = sm.get_active_listeners();
     let is_mobile = mobile_client.unwrap_or(false) || android_client.unwrap_or(false);
     
-    // Get track info from stream manager (what's actually playing)
-    if let Some(track_json) = &track_state.track_info {
-        if let Ok(mut track_value) = serde_json::from_str::<serde_json::Value>(track_json) {
-            if let serde_json::Value::Object(ref mut map) = track_value {
-                // Add radio position
-                map.insert(
-                    "radio_position".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(track_state.position_seconds))
-                );
-                map.insert(
-                    "radio_position_ms".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(track_state.position_milliseconds))
-                );
+    // Try to get cached JSON first
+    if let Some(cached_json) = sm.get_cached_track_info() {
+        if let Ok(mut track_value) = serde_json::from_str::<Value>(&cached_json) {
+            if let Value::Object(ref mut map) = track_value {
+                // Update dynamic fields
+                let (pos_secs, pos_ms) = sm.get_precise_position();
+                let duration = sm.get_current_track_duration();
+                let remaining = if duration > pos_secs { duration - pos_secs } else { 0 };
                 
-                // Legacy compatibility
-                map.insert(
-                    "playback_position".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(track_state.position_seconds))
-                );
-                map.insert(
-                    "playback_position_ms".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(track_state.position_milliseconds))
-                );
+                map.insert("active_listeners".to_string(), Value::Number(active_listeners.into()));
+                map.insert("radio_position".to_string(), Value::Number(pos_secs.into()));
+                map.insert("radio_position_ms".to_string(), Value::Number(pos_ms.into()));
+                map.insert("playback_position".to_string(), Value::Number(pos_secs.into()));
+                map.insert("playback_position_ms".to_string(), Value::Number(pos_ms.into()));
+                map.insert("remaining_seconds".to_string(), Value::Number(remaining.into()));
+                map.insert("is_near_end".to_string(), Value::Bool(remaining <= 10));
+                map.insert("streaming".to_string(), Value::Bool(sm.is_streaming()));
+                map.insert("track_ended".to_string(), Value::Bool(sm.track_ended()));
+                map.insert("bitrate".to_string(), Value::Number((sm.get_current_bitrate() / 1000).into()));
                 
-                // Additional metadata
-                map.insert(
-                    "active_listeners".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(active_listeners))
-                );
-                map.insert(
-                    "bitrate".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(track_state.bitrate / 1000))
-                );
-                map.insert(
-                    "server_timestamp".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64
-                    ))
-                );
-                
-                // Radio metadata
-                map.insert("streaming_mode".to_string(), serde_json::Value::String("true-radio".to_string()));
-                map.insert("client_control_enabled".to_string(), serde_json::Value::Bool(false));
-                map.insert("seeking_enabled".to_string(), serde_json::Value::Bool(false));
-                map.insert("skip_enabled".to_string(), serde_json::Value::Bool(false));
-                map.insert("synchronized_playback".to_string(), serde_json::Value::Bool(true));
-                map.insert("streaming".to_string(), serde_json::Value::Bool(sm.is_streaming()));
-                map.insert("track_ended".to_string(), serde_json::Value::Bool(sm.track_ended()));
-                
-                // Track timing info
-                map.insert("remaining_seconds".to_string(), serde_json::Value::Number(serde_json::Number::from(track_state.remaining_time)));
-                map.insert("is_near_end".to_string(), serde_json::Value::Bool(track_state.is_near_end));
+                map.insert("server_timestamp".to_string(), Value::Number(
+                    (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64)
+                        .into()
+                ));
                 
                 if is_mobile {
-                    map.insert("mobile_optimized".to_string(), serde_json::Value::Bool(true));
+                    map.insert("mobile_optimized".to_string(), Value::Bool(true));
                 }
             }
             return CorsResponse::new(Json(track_value));
         }
     }
     
-    // Fallback response
-    warn!("Stream manager has no track info, returning default");
+    // Fallback to generating JSON
+    let track_state = sm.get_track_state();
+    
+    // Get track info from stream manager
+    if let Some(track_json) = &track_state.track_info {
+        if let Ok(mut track_value) = serde_json::from_str::<Value>(track_json) {
+            if let Value::Object(ref mut map) = track_value {
+                // Add all metadata
+                map.insert("radio_position".to_string(), Value::Number(track_state.position_seconds.into()));
+                map.insert("radio_position_ms".to_string(), Value::Number(track_state.position_milliseconds.into()));
+                map.insert("playback_position".to_string(), Value::Number(track_state.position_seconds.into()));
+                map.insert("playback_position_ms".to_string(), Value::Number(track_state.position_milliseconds.into()));
+                map.insert("active_listeners".to_string(), Value::Number(active_listeners.into()));
+                map.insert("bitrate".to_string(), Value::Number((track_state.bitrate / 1000).into()));
+                map.insert("server_timestamp".to_string(), Value::Number(
+                    (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64)
+                        .into()
+                ));
+                
+                // Radio metadata
+                map.insert("streaming_mode".to_string(), Value::String("true-radio".to_string()));
+                map.insert("client_control_enabled".to_string(), Value::Bool(false));
+                map.insert("seeking_enabled".to_string(), Value::Bool(false));
+                map.insert("skip_enabled".to_string(), Value::Bool(false));
+                map.insert("synchronized_playback".to_string(), Value::Bool(true));
+                map.insert("streaming".to_string(), Value::Bool(sm.is_streaming()));
+                map.insert("track_ended".to_string(), Value::Bool(sm.track_ended()));
+                
+                // Track timing info
+                map.insert("remaining_seconds".to_string(), Value::Number(track_state.remaining_time.into()));
+                map.insert("is_near_end".to_string(), Value::Bool(track_state.is_near_end));
+                
+                if is_mobile {
+                    map.insert("mobile_optimized".to_string(), Value::Bool(true));
+                }
+            }
+            return CorsResponse::new(Json(track_value));
+        }
+    }
+    
+    // Ultimate fallback
+    warn!("No track info available, returning default");
     CorsResponse::new(Json(serde_json::json!({
         "title": "ChillOut Radio",
         "artist": "Live Stream",
@@ -231,7 +255,7 @@ pub async fn get_position(stream_manager: &State<Arc<StreamManager>>) -> CorsRes
 
 #[get("/api/playlist")]
 pub async fn get_playlist() -> CorsResponse<Json<serde_json::Value>> {
-    let playlist_data = playlist::get_playlist(&config::PLAYLIST_FILE);
+    let playlist_data = playlist::get_playlist_cached();
     let current_track = playlist::get_current_track(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER);
     
     // Don't expose current_track index to prevent client-side track control attempts

@@ -1,8 +1,8 @@
 [package]
 name = "webradio"
-version = "3.0.0"
+version = "4.0.0"
 edition = "2021"
-description = "True Radio - Async I/O - Efficient CPU usage with async/await"
+description = "True Radio - Fully Optimized - Minimal CPU usage web radio"
 authors = ["Your Name"]
 license = "MIT"
 
@@ -28,6 +28,11 @@ serde_json = "1.0"
 id3 = "1.7.0"
 mp3-duration = "0.1.10"
 
+# Performance optimizations
+dashmap = "5.5"         # Lock-free concurrent HashMap
+notify = "4.0"          # File system watcher
+crossbeam = "0.8"       # Memory pool support
+
 # Utilities
 lazy_static = "1.4.0"
 parking_lot = "0.12.1"
@@ -41,21 +46,23 @@ env_logger = "0.10.0"
 # Error handling
 thiserror = "1.0"
 
-# Async traits
-async-trait = "0.1"
+# System optimization
+libc = "0.2"
 
 [profile.release]
-opt-level = 3        # Optimize for speed with async
-lto = "thin"         # Thin LTO for better async performance
-codegen-units = 8    # More parallelism for async
-panic = "unwind"     # Better error handling with async
-strip = true
-debug = false
+opt-level = 3           # Maximum optimization
+lto = "fat"             # Full link-time optimization
+codegen-units = 1       # Single codegen unit for best optimization
+panic = "abort"         # Smaller binary, faster panic
+strip = true            # Strip symbols
+debug = false           # No debug info
 
-[profile.dev]
-opt-level = 3       # Some optimization even in dev
-lto = "thin"
-codegen-units = 8
-panic = "unwind"   
-strip = true
-debug = false
+# Enable CPU-specific optimizations
+[profile.release.package."*"]
+opt-level = 3
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

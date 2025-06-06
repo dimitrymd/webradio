@@ -1,11 +1,14 @@
-// src/services/playlist.rs - Async I/O implementation
+// src/services/playlist.rs - Fully optimized with file watching and caching
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::sync::Arc;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::time::interval;
+use parking_lot::RwLock;
+use notify::{Watcher, RecursiveMode, watcher, DebouncedEvent};
+use std::sync::mpsc::channel;
 
 use crate::models::playlist::{Track, Playlist};
 use crate::services::streamer::StreamManager;
@@ -14,44 +17,84 @@ use crate::utils::mp3_scanner;
 // Longer intervals for less CPU usage
 const STATUS_LOG_INTERVAL_SECS: u64 = 600;    // 10 minutes
 const CLEANUP_INTERVAL_SECS: u64 = 600;       // 10 minutes
-const FILE_SCAN_INTERVAL_SECS: u64 = 7200;    // 2 hours
 
-// Enhanced caching with longer TTL
-static mut CACHED_PLAYLIST: Option<(Playlist, Instant)> = None;
-static mut CACHE_MUTEX: parking_lot::Mutex<()> = parking_lot::const_mutex(());
-const CACHE_TTL_SECS: u64 = 60; // 1 minute cache
+// Global playlist cache with file watcher
+lazy_static::lazy_static! {
+    static ref PLAYLIST_CACHE: Arc<RwLock<Option<Playlist>>> = Arc::new(RwLock::new(None));
+    static ref PLAYLIST_WATCHER: Arc<RwLock<Option<PlaylistWatcher>>> = Arc::new(RwLock::new(None));
+}
 
-// Track duration cache to avoid repeated mp3_duration calls
+// Track duration cache
 static mut DURATION_CACHE: Option<std::collections::HashMap<String, u64>> = None;
 static mut DURATION_CACHE_MUTEX: parking_lot::Mutex<()> = parking_lot::const_mutex(());
 
-pub fn invalidate_playlist_cache() {
-    unsafe {
-        let _lock = CACHE_MUTEX.lock();
-        CACHED_PLAYLIST = None;
-    }
+struct PlaylistWatcher {
+    _watcher: notify::FsEventWatcher,
+    _thread: std::thread::JoinHandle<()>,
 }
 
-pub fn get_playlist(playlist_file: &Path) -> Playlist {
-    unsafe {
-        let _lock = CACHE_MUTEX.lock();
-        
-        // Check cache first
-        if let Some((ref cached_playlist, cache_time)) = CACHED_PLAYLIST {
-            if cache_time.elapsed().as_secs() < CACHE_TTL_SECS {
-                return cached_playlist.clone();
+// Initialize the file watcher for the playlist
+pub fn init_playlist_watcher(playlist_file: &Path) {
+    let playlist_path = playlist_file.to_path_buf();
+    let playlist_dir = playlist_file.parent().unwrap_or(Path::new(".")).to_path_buf();
+    
+    // Load initial playlist
+    let initial_playlist = read_playlist_from_file(&playlist_path);
+    *PLAYLIST_CACHE.write() = Some(initial_playlist);
+    
+    // Set up file watcher
+    let (tx, rx) = channel();
+    let mut watcher = watcher(tx, Duration::from_secs(1))
+        .expect("Failed to create file watcher");
+    
+    watcher.watch(&playlist_dir, RecursiveMode::NonRecursive)
+        .expect("Failed to watch playlist directory");
+    
+    let playlist_path_clone = playlist_path.clone();
+    let thread = std::thread::spawn(move || {
+        loop {
+            match rx.recv() {
+                Ok(DebouncedEvent::Write(path)) | Ok(DebouncedEvent::Create(path)) => {
+                    if path == playlist_path_clone {
+                        log::info!("Playlist file changed, reloading...");
+                        let new_playlist = read_playlist_from_file(&playlist_path_clone);
+                        *PLAYLIST_CACHE.write() = Some(new_playlist);
+                    }
+                }
+                Err(e) => {
+                    log::error!("Watcher error: {:?}", e);
+                    break;
+                }
+                _ => {}
             }
         }
-        
-        // Read from file only if cache miss
-        let playlist = read_playlist_from_file(playlist_file);
-        CACHED_PLAYLIST = Some((playlist.clone(), Instant::now()));
-        playlist
+    });
+    
+    *PLAYLIST_WATCHER.write() = Some(PlaylistWatcher {
+        _watcher: watcher,
+        _thread: thread,
+    });
+}
+
+// Get playlist from cache (no file I/O)
+pub fn get_playlist_cached() -> Playlist {
+    PLAYLIST_CACHE.read()
+        .as_ref()
+        .cloned()
+        .unwrap_or_default()
+}
+
+// For compatibility
+pub fn get_playlist(playlist_file: &Path) -> Playlist {
+    // Initialize watcher on first access
+    if PLAYLIST_WATCHER.read().is_none() {
+        init_playlist_watcher(playlist_file);
     }
+    
+    get_playlist_cached()
 }
 
 fn read_playlist_from_file(playlist_file: &Path) -> Playlist {
-    // Use blocking read for now, but could be converted to async
     if playlist_file.exists() {
         match std::fs::read_to_string(playlist_file) {
             Ok(content) => {
@@ -73,18 +116,6 @@ fn read_playlist_from_file(playlist_file: &Path) -> Playlist {
 
 // Async version for saving playlist
 pub async fn save_playlist_async(playlist: &Playlist, playlist_file: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    // Only save if changed - compare with cache
-    unsafe {
-        let _lock = CACHE_MUTEX.lock();
-        if let Some((ref cached_playlist, _)) = CACHED_PLAYLIST {
-            if cached_playlist.current_track == playlist.current_track &&
-               cached_playlist.tracks.len() == playlist.tracks.len() {
-                // No significant changes, skip save
-                return Ok(());
-            }
-        }
-    }
-    
     if let Some(parent) = playlist_file.parent() {
         fs::create_dir_all(parent).await?;
     }
@@ -95,13 +126,11 @@ pub async fn save_playlist_async(playlist: &Playlist, playlist_file: &Path) -> R
     file.write_all(json.as_bytes()).await?;
     file.flush().await?;
     
-    invalidate_playlist_cache();
     Ok(())
 }
 
 // Keep sync version for compatibility
 pub fn save_playlist(playlist: &Playlist, playlist_file: &Path) {
-    // Use tokio's block_in_place for sync context
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
             if let Err(e) = save_playlist_async(playlist, playlist_file).await {
@@ -201,7 +230,7 @@ pub fn scan_music_folder(music_folder: &Path, playlist_file: &Path) -> Playlist 
     })
 }
 
-// Async track duration updater
+// Async track duration updater with caching
 pub async fn rescan_and_update_durations_async(playlist_file: &Path, music_folder: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut playlist = get_playlist(playlist_file);
     let mut updated_count = 0;
@@ -296,18 +325,16 @@ pub fn rescan_and_update_durations(playlist_file: &Path, music_folder: &Path) {
     });
 }
 
-// Async monitor function
+// Optimized async monitor function
 pub async fn track_switcher_async(stream_manager: Arc<StreamManager>) {
-    log::info!("Starting async monitor");
+    log::info!("Starting optimized async monitor");
     
     let mut status_interval = interval(Duration::from_secs(STATUS_LOG_INTERVAL_SECS));
     let mut cleanup_interval = interval(Duration::from_secs(CLEANUP_INTERVAL_SECS));
-    let mut file_scan_interval = interval(Duration::from_secs(FILE_SCAN_INTERVAL_SECS));
     
     // Set missed tick behavior to avoid accumulating ticks
     status_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    file_scan_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     
     loop {
         tokio::select! {
@@ -320,16 +347,6 @@ pub async fn track_switcher_async(stream_manager: Arc<StreamManager>) {
             
             _ = cleanup_interval.tick() => {
                 stream_manager.cleanup_stale_connections();
-            }
-            
-            _ = file_scan_interval.tick() => {
-                let playlist = get_playlist(&crate::config::PLAYLIST_FILE);
-                
-                if playlist.tracks.is_empty() {
-                    if let Err(e) = scan_music_folder_async(&crate::config::MUSIC_FOLDER, &crate::config::PLAYLIST_FILE).await {
-                        log::error!("Error scanning music folder: {}", e);
-                    }
-                }
             }
         }
     }
@@ -365,3 +382,5 @@ pub fn verify_track_durations(_playlist_file: &Path, _music_folder: &Path) {
     // Disabled for CPU optimization
     log::debug!("Track duration verification disabled for CPU optimization");
 }
+
+// No need for invalidate_playlist_cache anymore as the watcher handles it
