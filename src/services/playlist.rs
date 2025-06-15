@@ -15,12 +15,12 @@ use crate::services::streamer::StreamManager;
 use crate::utils::mp3_scanner;
 
 // Longer intervals for less CPU usage
-const STATUS_LOG_INTERVAL_SECS: u64 = 600;    // 10 minutes
-const CLEANUP_INTERVAL_SECS: u64 = 600;       // 10 minutes
+const STATUS_LOG_INTERVAL_SECS: u64 = 3600;    // 1 hour
+const CLEANUP_INTERVAL_SECS: u64 = 3600;       // 1 hour
 
 // Global playlist cache with file watcher
 lazy_static::lazy_static! {
-    static ref PLAYLIST_CACHE: Arc<RwLock<Option<Playlist>>> = Arc::new(RwLock::new(None));
+    pub static ref PLAYLIST_CACHE: Arc<RwLock<Option<Playlist>>> = Arc::new(RwLock::new(None));
     static ref PLAYLIST_WATCHER: Arc<RwLock<Option<PlaylistWatcher>>> = Arc::new(RwLock::new(None));
 }
 
@@ -35,45 +35,13 @@ struct PlaylistWatcher {
 
 // Initialize the file watcher for the playlist
 pub fn init_playlist_watcher(playlist_file: &Path) {
+    // Just load the playlist once without watching
     let playlist_path = playlist_file.to_path_buf();
-    let playlist_dir = playlist_file.parent().unwrap_or(Path::new(".")).to_path_buf();
-    
-    // Load initial playlist
     let initial_playlist = read_playlist_from_file(&playlist_path);
     *PLAYLIST_CACHE.write() = Some(initial_playlist);
     
-    // Set up file watcher
-    let (tx, rx) = channel();
-    let mut watcher = watcher(tx, Duration::from_secs(1))
-        .expect("Failed to create file watcher");
-    
-    watcher.watch(&playlist_dir, RecursiveMode::NonRecursive)
-        .expect("Failed to watch playlist directory");
-    
-    let playlist_path_clone = playlist_path.clone();
-    let thread = std::thread::spawn(move || {
-        loop {
-            match rx.recv() {
-                Ok(DebouncedEvent::Write(path)) | Ok(DebouncedEvent::Create(path)) => {
-                    if path == playlist_path_clone {
-                        log::info!("Playlist file changed, reloading...");
-                        let new_playlist = read_playlist_from_file(&playlist_path_clone);
-                        *PLAYLIST_CACHE.write() = Some(new_playlist);
-                    }
-                }
-                Err(e) => {
-                    log::error!("Watcher error: {:?}", e);
-                    break;
-                }
-                _ => {}
-            }
-        }
-    });
-    
-    *PLAYLIST_WATCHER.write() = Some(PlaylistWatcher {
-        _watcher: watcher,
-        _thread: thread,
-    });
+    // Don't create a file watcher - this saves a thread
+    log::info!("Playlist loaded (file watching disabled for CPU optimization)");
 }
 
 // Get playlist from cache (no file I/O)
@@ -82,6 +50,11 @@ pub fn get_playlist_cached() -> Playlist {
         .as_ref()
         .cloned()
         .unwrap_or_default()
+}
+
+// Update the cached playlist
+pub fn update_playlist_cache(playlist: &Playlist) {
+    *PLAYLIST_CACHE.write() = Some(playlist.clone());
 }
 
 // For compatibility

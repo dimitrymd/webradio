@@ -13,14 +13,14 @@ lazy_static! {
 // ===== BALANCED CPU OPTIMIZATION SETTINGS =====
 
 // Balanced chunks for smooth playback with lower CPU
-pub const CHUNK_SIZE: usize = 1024 * 64;          // 64KB chunks
-pub const BUFFER_SIZE: usize = 1024 * 128;        // 128KB buffer
+pub const CHUNK_SIZE: usize = 1024 * 32;          // 32KB chunks for less frequent operations
+pub const BUFFER_SIZE: usize = 1024 * 512;        // 512KB buffer for stability
 
 // Platform-specific chunk sizes
-pub const IOS_CHUNK_SIZE: usize = 1024 * 32;      // 32KB for iOS
-pub const IOS_MAX_BUFFER: usize = 1024 * 64;      // 64KB max
-pub const ANDROID_CHUNK_SIZE: usize = 1024 * 32;  // 32KB for Android
-pub const DESKTOP_CHUNK_SIZE: usize = 1024 * 64;  // 64KB for desktop
+pub const IOS_CHUNK_SIZE: usize = 1024 * 16;      // 16KB for iOS
+pub const IOS_MAX_BUFFER: usize = 1024 * 256;     // 256KB max
+pub const ANDROID_CHUNK_SIZE: usize = 1024 * 16;  // 16KB for Android
+pub const DESKTOP_CHUNK_SIZE: usize = 1024 * 32;  // 32KB for desktop
 
 // Stream configuration
 pub const STREAM_CACHE_TIME: u64 = 120;           // 2 minutes cache

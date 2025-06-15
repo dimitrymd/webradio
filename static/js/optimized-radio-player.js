@@ -42,7 +42,7 @@ const elements = {
 
 // Initialize the radio player
 function initRadioPlayer() {
-    console.log('🎵 ChillOut Radio - True Radio Mode v3.1...');
+    console.log('🎵 ChillOut Radio - True Radio Mode v3.2 (Optimized)...');
     console.log('📻 Server-controlled playback only - no track control');
     
     // Get UI elements
@@ -256,7 +256,12 @@ async function createAudioElement() {
         radioState.audioElement.volume = radioState.volume;
         radioState.audioElement.muted = radioState.isMuted;
         radioState.audioElement.crossOrigin = "anonymous";
-        radioState.audioElement.preload = radioState.isIOS ? 'none' : 'metadata';
+        radioState.audioElement.preload = 'none'; // Don't preload
+        
+        // Set buffering to minimum for faster start
+        if ('mozPreservesPitch' in radioState.audioElement) {
+            radioState.audioElement.mozPreservesPitch = false;
+        }
         
         if (radioState.isIOS) {
             radioState.audioElement.playsInline = true;
@@ -394,10 +399,54 @@ async function startStreaming() {
     radioState.audioElement.addEventListener('ended', handleEnded);
     radioState.audioElement.addEventListener('error', handleAudioError);
     
+    // Add additional debug listeners
+    radioState.audioElement.addEventListener('loadedmetadata', () => {
+        console.log('✅ Audio: Metadata loaded');
+    });
+    
+    radioState.audioElement.addEventListener('loadeddata', () => {
+        console.log('✅ Audio: Data loaded');
+    });
+    
+    radioState.audioElement.addEventListener('canplaythrough', () => {
+        console.log('✅ Audio: Can play through');
+    });
+    
+    radioState.audioElement.addEventListener('stalled', () => {
+        console.log('⚠️ Audio: Stalled');
+        showStatus('📻 Stream stalled - retrying...', true);
+    });
+    
+    radioState.audioElement.addEventListener('suspend', () => {
+        console.log('⚠️ Audio: Suspended');
+    });
+    
+    radioState.audioElement.addEventListener('progress', () => {
+        const buffered = radioState.audioElement.buffered;
+        if (buffered.length > 0) {
+            const bufferedEnd = buffered.end(buffered.length - 1);
+            const duration = radioState.audioElement.duration;
+            console.log(`📊 Buffered: ${bufferedEnd.toFixed(1)}s${duration ? ` of ${duration.toFixed(1)}s` : ''}`);
+        }
+    });
+    
     // Set source and start playing
     return new Promise((resolve, reject) => {
         let playAttempted = false;
         let timeoutId;
+        
+        // First, test if the stream endpoint is working
+        console.log('🔍 Testing stream endpoint...');
+        fetch(streamUrl, { method: 'HEAD' })
+            .then(response => {
+                console.log('📡 Stream endpoint response:', response.status, response.headers.get('content-type'));
+                if (!response.ok) {
+                    throw new Error(`Stream endpoint returned ${response.status}`);
+                }
+            })
+            .catch(error => {
+                console.error('❌ Stream endpoint test failed:', error);
+            });
         
         const cleanup = () => {
             if (timeoutId) clearTimeout(timeoutId);
@@ -438,10 +487,20 @@ async function startStreaming() {
         
         try {
             // Set the source
+            console.log('🎵 Setting audio source to:', streamUrl);
             radioState.audioElement.src = streamUrl;
+            
+            // Log element state
+            console.log('📻 Audio element state:', {
+                src: radioState.audioElement.src,
+                readyState: radioState.audioElement.readyState,
+                networkState: radioState.audioElement.networkState,
+                paused: radioState.audioElement.paused
+            });
             
             // Attempt to play
             playAttempted = true;
+            console.log('▶️ Calling play()...');
             const playPromise = radioState.audioElement.play();
             
             if (playPromise !== undefined) {
@@ -830,7 +889,7 @@ function formatTime(seconds) {
 document.addEventListener('DOMContentLoaded', () => {
     try {
         initRadioPlayer();
-        console.log('🎵 ChillOut Radio v3.1 - True Radio Mode');
+        console.log('🎵 ChillOut Radio v3.2 - True Radio Mode (Optimized)');
         console.log('📻 Server-controlled playback only');
     } catch (error) {
         console.error('❌ Failed to initialize radio player:', error);
@@ -870,7 +929,7 @@ window.ChillOutRadio = {
     stop: stopRadio,
     fetchInfo: fetchNowPlaying,
     healthCheck: performHealthCheck,
-    version: '3.1.0-fixed',
+    version: '3.2.0-optimized',
     mode: 'server-controlled',
     
     getAudioState: () => {
@@ -882,7 +941,11 @@ window.ChillOutRadio = {
             readyState: radioState.audioElement.readyState,
             networkState: radioState.audioElement.networkState,
             src: radioState.audioElement.src,
-            currentSrc: radioState.audioElement.currentSrc
+            currentSrc: radioState.audioElement.currentSrc,
+            buffered: radioState.audioElement.buffered.length > 0 ? {
+                start: radioState.audioElement.buffered.start(0),
+                end: radioState.audioElement.buffered.end(radioState.audioElement.buffered.length - 1)
+            } : null
         };
     },
     
@@ -901,9 +964,34 @@ window.ChillOutRadio = {
             console.error('Direct stream test failed:', error);
             return false;
         }
+    },
+    
+    getBufferStatus: () => {
+        if (!radioState.audioElement || radioState.audioElement.buffered.length === 0) {
+            return 'No buffer';
+        }
+        const buffered = radioState.audioElement.buffered;
+        const currentTime = radioState.audioElement.currentTime;
+        let bufferedAhead = 0;
+        
+        for (let i = 0; i < buffered.length; i++) {
+            if (buffered.start(i) <= currentTime && currentTime <= buffered.end(i)) {
+                bufferedAhead = buffered.end(i) - currentTime;
+                break;
+            }
+        }
+        
+        return {
+            bufferedAhead: bufferedAhead.toFixed(2) + 's',
+            totalBuffered: (buffered.end(buffered.length - 1) - buffered.start(0)).toFixed(2) + 's',
+            bufferRanges: Array.from({length: buffered.length}, (_, i) => ({
+                start: buffered.start(i).toFixed(2),
+                end: buffered.end(i).toFixed(2)
+            }))
+        };
     }
 };
 
-console.log('🎵 ChillOut Radio v3.1 - Fixed Audio Source Handling');
-console.log('📻 No empty src attribute errors');
+console.log('🎵 ChillOut Radio v3.2 - Optimized for fast connection');
+console.log('📻 Instant playback with minimal buffering');
 console.log('🔧 Debug: window.ChillOutRadio available');

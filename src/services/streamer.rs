@@ -16,9 +16,10 @@ use serde_json::Value;
 
 // MP3 frame-aligned streaming with optimized chunk size
 const MP3_FRAME_SIZE: usize = 1152;  // Samples per MP3 frame
-const FRAMES_PER_CHUNK: usize = 40;   // 40 frames = ~1 second at 44.1kHz
-const BROADCAST_CHUNK_SIZE: usize = 4608; // Average MP3 frame size * frames
-const BROADCAST_BUFFER_SIZE: usize = 256;
+const MP3_FRAME_DURATION_MS: f64 = 26.122449; // Exact duration at 44.1kHz
+const FRAMES_PER_CHUNK: usize = 50;   // 50 frames = ~1.3 seconds at 44.1kHz
+const BROADCAST_CHUNK_SIZE: usize = 16384; // 16KB chunks for smoother streaming
+const BROADCAST_BUFFER_SIZE: usize = 4096; // Very large buffer
 
 // Pre-allocated chunk with reference counting
 #[derive(Clone)]
@@ -98,9 +99,6 @@ pub struct StreamManager {
     
     // Track cache
     cached_track: Arc<RwLock<Option<CachedTrack>>>,
-    
-    // Async runtime handle
-    runtime_handle: tokio::runtime::Handle,
 }
 
 // Conditional logging macros
@@ -114,13 +112,14 @@ macro_rules! debug_log {
     ($($arg:tt)*) => {};
 }
 
+#[allow(unused_macros)]
 impl StreamManager {
     pub fn new(music_folder: &std::path::Path, _chunk_size: usize, _buffer_size: usize, _cache_time: u64) -> Self {
         info!("Initializing Fully Optimized StreamManager");
         
         let (broadcast_tx, _) = broadcast::channel(BROADCAST_BUFFER_SIZE);
         
-        Self {
+        let manager = Self {
             is_streaming: Arc::new(AtomicBool::new(false)),
             should_stop: Arc::new(AtomicBool::new(false)),
             
@@ -138,9 +137,81 @@ impl StreamManager {
             music_folder: music_folder.to_path_buf(),
             
             cached_track: Arc::new(RwLock::new(None)),
-            
-            runtime_handle: tokio::runtime::Handle::current(),
+        };
+        
+        // Preload first track to avoid delay on first connection
+        manager.preload_first_track();
+        
+        manager
+    }
+    
+    fn preload_first_track(&self) {
+        let playlist = crate::services::playlist::get_playlist_cached();
+        if playlist.tracks.is_empty() {
+            return;
         }
+        
+        let track_index = playlist.current_track % playlist.tracks.len();
+        let track = &playlist.tracks[track_index];
+        let track_path = self.music_folder.join(&track.path);
+        
+        if !track_path.exists() {
+            return;
+        }
+        
+        info!("Preloading first track: \"{}\"", track.title);
+        
+        // Load track synchronously during startup
+        let file_data = match std::fs::read(&track_path) {
+            Ok(data) => data,
+            Err(e) => {
+                error!("Failed to preload track: {}", e);
+                return;
+            }
+        };
+        
+        // Analyze MP3 frames
+        let (audio_start_offset, frame_positions) = Self::analyze_mp3_frames(&file_data);
+        
+        // Calculate bitrate
+        let bitrate = if frame_positions.len() > 10 {
+            let mut total_frame_size = 0;
+            for i in 0..frame_positions.len().saturating_sub(1).min(100) {
+                total_frame_size += frame_positions[i + 1] - frame_positions[i];
+            }
+            let avg_frame_size = total_frame_size / frame_positions.len().min(100).max(1);
+            let ms_per_frame = 26.122449;
+            let bytes_per_ms = avg_frame_size as f64 / ms_per_frame;
+            (bytes_per_ms * 8.0 * 1000.0) as u64
+        } else {
+            192000
+        };
+        
+        // Calculate duration
+        let duration = (frame_positions.len() as f64 * 26.122449 / 1000.0) as u64;
+        
+        let data_arc = Arc::new(file_data);
+        let cached = CachedTrack {
+            data: data_arc,
+            audio_start_offset,
+            bitrate,
+            duration,
+            frame_positions,
+            pre_allocated_chunks: Vec::new(),
+        };
+        
+        // Store in cache
+        *self.cached_track.write() = Some(cached);
+        
+        // Cache track info
+        Self::cache_track_info(&self.track_info_cache, &self.current_track_json, track);
+        
+        // Update metadata
+        let actual_duration = if track.duration > 0 { track.duration } else { duration };
+        self.track_duration_secs.store(actual_duration, Ordering::Relaxed);
+        self.track_bitrate.store(bitrate, Ordering::Relaxed);
+        
+        info!("First track preloaded and ready for streaming");
     }
     
     pub fn start_broadcast_thread(&self) {
@@ -161,8 +232,8 @@ impl StreamManager {
         let track_bitrate = self.track_bitrate.clone();
         let cached_track = self.cached_track.clone();
         
-        // Spawn async task
-        self.runtime_handle.spawn(async move {
+        // Use the current runtime without creating new threads
+        tokio::spawn(async move {
             Self::async_broadcast_loop(
                 music_folder,
                 broadcast_tx,
@@ -192,7 +263,6 @@ impl StreamManager {
         track_bitrate: Arc<AtomicU64>,
         cached_track: Arc<RwLock<Option<CachedTrack>>>,
     ) {
-        info!("Optimized broadcast loop started");
         is_streaming.store(true, Ordering::Relaxed);
         
         'main: loop {
@@ -202,19 +272,42 @@ impl StreamManager {
             
             // When no listeners, use async sleep
             if broadcast_tx.receiver_count() == 0 {
-                // Update virtual position
-                let start_time = track_start_time.read().clone();
-                let elapsed = start_time.elapsed().as_millis() as u64;
-                track_position_ms.store(elapsed, Ordering::Relaxed);
+                // Update virtual position even when no listeners
+                let playlist = crate::services::playlist::get_playlist_cached();
+                if !playlist.tracks.is_empty() {
+                    let track_index = playlist.current_track % playlist.tracks.len();
+                    let _track = &playlist.tracks[track_index];
+                    
+                    let start_time = track_start_time.read().clone();
+                    let elapsed = start_time.elapsed();
+                    let elapsed_secs = elapsed.as_secs();
+                    
+                    // Check if current track would have ended
+                    let duration = track_duration_secs.load(Ordering::Relaxed);
+                    if duration > 0 && elapsed_secs >= duration {
+                        // Advance to next track
+                        Self::advance_to_next_track(&playlist, track_index);
+                        *track_start_time.write() = Instant::now();
+                        track_position_ms.store(0, Ordering::Relaxed);
+                        
+                        // Update to new track
+                        let new_index = (track_index + 1) % playlist.tracks.len();
+                        if let Some(new_track) = playlist.tracks.get(new_index) {
+                            Self::cache_track_info(&track_info_cache, &current_track_json, new_track);
+                            track_duration_secs.store(new_track.duration, Ordering::Relaxed);
+                        }
+                    } else {
+                        track_position_ms.store(elapsed.as_millis() as u64, Ordering::Relaxed);
+                    }
+                }
                 
                 // Clear cache when no listeners
                 if cached_track.read().is_some() {
                     info!("No listeners - clearing track cache");
                     *cached_track.write() = None;
-                    *track_info_cache.write() = None;
                 }
                 
-                sleep(Duration::from_secs(30)).await;
+                sleep(Duration::from_secs(5)).await;
                 continue;
             }
             
@@ -242,8 +335,7 @@ impl StreamManager {
             let cached = match Self::load_track_to_memory_optimized(&track_path).await {
                 Ok(cached) => {
                     let file_size_mb = cached.data.len() as f64 / (1024.0 * 1024.0);
-                    info!("Loaded track: \"{}\" - {:.1}MB, {} chunks", 
-                        track.title, file_size_mb, cached.pre_allocated_chunks.len());
+                    info!("Loaded track: \"{}\" - {:.1}MB", track.title, file_size_mb);
                     
                     // Store in cache
                     *cached_track.write() = Some(cached.clone());
@@ -274,8 +366,13 @@ impl StreamManager {
             
             info!("Playing: \"{}\" - {}s", track.title, actual_duration);
             
-            // Stream using pre-allocated chunks
-            let stream_result = Self::stream_with_pre_allocated_chunks(
+            // Get track duration for streaming
+            let actual_duration = track_duration_secs.load(Ordering::Relaxed);
+            
+            info!("Starting stream for track with duration: {}s", actual_duration);
+            
+            // Stream using simple method
+            let stream_result = Self::stream_track_simple(
                 &cached,
                 &broadcast_tx,
                 actual_duration,
@@ -284,7 +381,9 @@ impl StreamManager {
             ).await;
             
             match stream_result {
-                Ok(_) => debug_log!("Track completed"),
+                Ok(_) => {
+                    info!("Track \"{}\" completed successfully", track.title);
+                }
                 Err(e) => error!("Streaming error: {}", e),
             }
             
@@ -293,14 +392,15 @@ impl StreamManager {
             *track_info_cache.write() = None;
             
             // Advance to next track
+            info!("Advancing to next track...");
             Self::advance_to_next_track(&playlist, track_index);
             
-            // Gap between tracks
-            sleep(Duration::from_millis(500)).await;
+            // Small gap between tracks
+            sleep(Duration::from_millis(100)).await;
             
             // Clear track info
             *current_track_json.write() = None;
-            track_position_ms.store(0, Ordering::SeqCst);
+            track_position_ms.store(0, Ordering::Relaxed);
         }
         
         is_streaming.store(false, Ordering::Relaxed);
@@ -326,7 +426,7 @@ impl StreamManager {
                 total_frame_size += frame_positions[i + 1] - frame_positions[i];
             }
             let avg_frame_size = total_frame_size / frame_positions.len().min(100).max(1);
-            let ms_per_frame = 26.12; // 26,122449
+            let ms_per_frame = 26.122449; // Exact MP3 frame duration at 44.1kHz
             let bytes_per_ms = avg_frame_size as f64 / ms_per_frame;
             (bytes_per_ms * 8.0 * 1000.0) as u64
         } else {
@@ -334,7 +434,7 @@ impl StreamManager {
         };
         
         // Calculate duration
-        let duration = (frame_positions.len() as f64 * 26.12 / 1000.0) as u64;
+        let duration = (frame_positions.len() as f64 * 26.122449 / 1000.0) as u64;
         
         // Pre-allocate all chunks
         let data_arc = Arc::new(data);
@@ -350,27 +450,9 @@ impl StreamManager {
         })
     }
     
-    fn pre_allocate_chunks(data: &Arc<Vec<u8>>, frame_positions: &[usize]) -> Vec<Arc<[u8]>> {
-        let mut chunks = Vec::new();
-        
-        for chunk_start in (0..frame_positions.len()).step_by(FRAMES_PER_CHUNK) {
-            let chunk_end = (chunk_start + FRAMES_PER_CHUNK).min(frame_positions.len());
-            
-            if chunk_start < frame_positions.len() {
-                let start_pos = frame_positions[chunk_start];
-                let end_pos = if chunk_end < frame_positions.len() {
-                    frame_positions[chunk_end]
-                } else {
-                    data.len()
-                };
-                
-                // Create Arc slice without copying
-                let chunk_data = data[start_pos..end_pos].to_vec();
-                chunks.push(Arc::from(chunk_data.into_boxed_slice()));
-            }
-        }
-        
-        chunks
+    fn pre_allocate_chunks(_data: &Arc<Vec<u8>>, _frame_positions: &[usize]) -> Vec<Arc<[u8]>> {
+        // Don't pre-allocate - we'll chunk on demand
+        Vec::new()
     }
     
     fn cache_track_info(
@@ -401,6 +483,148 @@ impl StreamManager {
         *current_json.write() = Some(track_json);
     }
     
+    async fn stream_track_simple(
+        cached: &CachedTrack,
+        broadcast_tx: &Arc<broadcast::Sender<AudioChunk>>,
+        duration: u64,
+        track_position_ms: &Arc<AtomicU64>,
+        should_stop: &Arc<AtomicBool>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        info!("stream_track_simple: Starting stream, duration={}s", duration);
+        
+        let track_start = Instant::now();
+        let chunk_size = BROADCAST_CHUNK_SIZE;
+        let mut position = 0;
+        let mut chunk_id = 0u64;
+        
+        // Calculate chunk timing
+        let bitrate = cached.bitrate as f64;
+        let chunk_duration_ms = (chunk_size as f64 * 8.0 / bitrate * 1000.0) as u64;
+        let chunk_duration = Duration::from_millis(chunk_duration_ms);
+        
+        // Add 10% buffer to prevent underruns
+        let adjusted_chunk_duration = Duration::from_millis((chunk_duration_ms as f64 * 0.9) as u64);
+        
+        info!("Streaming at {}kbps, chunk every {}ms (adjusted to {}ms)", 
+            bitrate / 1000.0, chunk_duration_ms, adjusted_chunk_duration.as_millis());
+        
+        // Send initial buffer - 1 chunk for instant start
+        let initial_chunks = 1;
+        for i in 0..initial_chunks {
+            if position >= cached.data.len() {
+                break;
+            }
+            
+            let end = (position + chunk_size).min(cached.data.len());
+            let chunk_data = cached.data[position..end].to_vec();
+            
+            let chunk = AudioChunk {
+                data: Arc::from(chunk_data.into_boxed_slice()),
+                position: position as u64,
+                timestamp: track_start,
+                chunk_id,
+            };
+            
+            match broadcast_tx.send(chunk) {
+                Ok(receivers) => {
+                    debug_log!("Sent initial chunk {} to {} receivers", i, receivers);
+                },
+                Err(e) => {
+                    error!("Failed to send initial chunk: {}", e);
+                    return Err("No receivers".into());
+                }
+            }
+            
+            position = end;
+            chunk_id += 1;
+        }
+        
+        info!("Sent {} initial chunks, starting continuous stream", initial_chunks);
+        
+        // Immediately start sending more chunks without waiting
+        for _ in 0..10 {
+            if position >= cached.data.len() {
+                break;
+            }
+            
+            let end = (position + chunk_size).min(cached.data.len());
+            let chunk_data = cached.data[position..end].to_vec();
+            
+            let chunk = AudioChunk {
+                data: Arc::from(chunk_data.into_boxed_slice()),
+                position: position as u64,
+                timestamp: Instant::now(),
+                chunk_id,
+            };
+            
+            let _ = broadcast_tx.send(chunk);
+            position = end;
+            chunk_id += 1;
+        }
+        
+        // Main streaming loop
+        let mut next_send = track_start + (adjusted_chunk_duration * 11 as u32); // Account for initial burst
+        
+        while position < cached.data.len() {
+            // Check exit conditions
+            if should_stop.load(Ordering::Relaxed) {
+                info!("Stream stopped by request");
+                return Ok(());
+            }
+            
+            if broadcast_tx.receiver_count() == 0 {
+                info!("No receivers, stopping stream");
+                return Ok(());
+            }
+            
+            // Update position
+            let elapsed = track_start.elapsed();
+            track_position_ms.store(elapsed.as_millis() as u64, Ordering::Relaxed);
+            
+            // Check if track should end
+            if elapsed.as_secs() >= duration {
+                info!("Track duration reached");
+                return Ok(());
+            }
+            
+            // Sleep until next chunk with smaller precision
+            let now = Instant::now();
+            if next_send > now {
+                let sleep_duration = next_send - now;
+                // Only sleep if more than 1ms to avoid timing issues
+                if sleep_duration > Duration::from_millis(1) {
+                    tokio::time::sleep(sleep_duration).await;
+                }
+            }
+            next_send += adjusted_chunk_duration;
+            
+            // Send chunk
+            let end = (position + chunk_size).min(cached.data.len());
+            let chunk_data = cached.data[position..end].to_vec();
+            
+            let chunk = AudioChunk {
+                data: Arc::from(chunk_data.into_boxed_slice()),
+                position: position as u64,
+                timestamp: Instant::now(),
+                chunk_id,
+            };
+            
+            match broadcast_tx.send(chunk) {
+                Ok(_) => {
+                    position = end;
+                    chunk_id += 1;
+                }
+                Err(_) => {
+                    info!("No receivers during stream");
+                    return Ok(());
+                }
+            }
+        }
+        
+        info!("Track streaming completed");
+        Ok(())
+    }
+    
     async fn stream_with_pre_allocated_chunks(
         cached: &CachedTrack,
         broadcast_tx: &Arc<broadcast::Sender<AudioChunk>>,
@@ -413,27 +637,46 @@ impl StreamManager {
         }
         
         let track_start = Instant::now();
-        let ms_per_frame = 26.12;
-        let chunk_duration = Duration::from_millis((FRAMES_PER_CHUNK as f64 * ms_per_frame) as u64);
+        
+        // Calculate precise timing based on frame count or bitrate
+        let chunk_duration_ms = if !cached.frame_positions.is_empty() && cached.frame_positions.len() > FRAMES_PER_CHUNK {
+            // Use exact frame timing
+            FRAMES_PER_CHUNK as f64 * MP3_FRAME_DURATION_MS
+        } else {
+            // Fall back to bitrate-based timing
+            let bitrate = cached.bitrate as f64;
+            let bytes_per_second = bitrate / 8.0;
+            let avg_chunk_size = cached.pre_allocated_chunks.iter()
+                .take(10)
+                .map(|c| c.len())
+                .sum::<usize>() / 10.max(1);
+            avg_chunk_size as f64 / bytes_per_second * 1000.0
+        };
+        
+        let chunk_duration = Duration::from_micros((chunk_duration_ms * 1000.0) as u64);
         
         let mut chunk_index = 0;
         let mut last_position_update = Instant::now();
+        let mut bytes_sent = 0u64;
         
-        // Send initial burst
-        for i in 0..3.min(cached.pre_allocated_chunks.len()) {
+        // Send initial burst (10-15 chunks for ~20-30 seconds of buffer)
+        let initial_burst = 15.min(cached.pre_allocated_chunks.len());
+        for i in 0..initial_burst {
             let chunk = AudioChunk {
                 data: cached.pre_allocated_chunks[i].clone(),
-                position: (i * BROADCAST_CHUNK_SIZE) as u64,
+                position: bytes_sent,
                 timestamp: track_start,
                 chunk_id: i as u64,
             };
             
+            bytes_sent += chunk.data.len() as u64;
             let _ = broadcast_tx.send(chunk);
             chunk_index = i + 1;
         }
         
-        // Main streaming loop
-        let mut next_send_time = Instant::now() + chunk_duration;
+        // Main streaming loop with microsecond precision
+        let mut next_chunk_time = track_start + (chunk_duration * initial_burst as u32);
+        let mut accumulated_error = Duration::ZERO;
         
         while chunk_index < cached.pre_allocated_chunks.len() {
             // Check exit conditions
@@ -446,26 +689,44 @@ impl StreamManager {
                 return Ok(());
             }
             
-            // Wait for next send time
+            // High precision timing
             let now = Instant::now();
-            if next_send_time > now {
-                sleep(next_send_time - now).await;
+            if next_chunk_time > now {
+                let sleep_duration = next_chunk_time - now;
+                if sleep_duration > Duration::from_micros(100) {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(next_chunk_time)).await;
+                }
+            } else {
+                // Track timing drift
+                accumulated_error += now - next_chunk_time;
             }
-            next_send_time = now + chunk_duration;
             
-            // Update position atomically only once per second
-            if last_position_update.elapsed() >= Duration::from_secs(1) {
-                track_position_ms.store(elapsed.as_millis() as u64, Ordering::Relaxed);
-                last_position_update = now;
+            // Calculate next chunk time with drift compensation
+            next_chunk_time = next_chunk_time + chunk_duration;
+            if accumulated_error > Duration::from_millis(10) {
+                // Compensate for accumulated drift
+                if let Some(compensated_time) = next_chunk_time.checked_sub(accumulated_error) {
+                    next_chunk_time = compensated_time;
+                }
+                accumulated_error = Duration::ZERO;
             }
             
-            // Send pre-allocated chunk
+            // Update position more slowly
+            if last_position_update.elapsed() >= Duration::from_secs(2) {
+                let accurate_elapsed = track_start.elapsed();
+                track_position_ms.store(accurate_elapsed.as_millis() as u64, Ordering::Relaxed);
+                last_position_update = Instant::now();
+            }
+            
+            // Send chunk
             let chunk = AudioChunk {
                 data: cached.pre_allocated_chunks[chunk_index].clone(),
-                position: (chunk_index * BROADCAST_CHUNK_SIZE) as u64,
-                timestamp: now,
+                position: bytes_sent,
+                timestamp: Instant::now(),
                 chunk_id: chunk_index as u64,
             };
+            
+            bytes_sent += chunk.data.len() as u64;
             
             match broadcast_tx.send(chunk) {
                 Ok(_) => chunk_index += 1,
@@ -540,7 +801,14 @@ impl StreamManager {
     fn advance_to_next_track(playlist: &crate::models::playlist::Playlist, current_index: usize) {
         let mut new_playlist = playlist.clone();
         new_playlist.current_track = (current_index + 1) % new_playlist.tracks.len();
+        
+        // Update the cache immediately
+        crate::services::playlist::update_playlist_cache(&new_playlist);
+        
+        // Also save to file
         crate::services::playlist::save_playlist(&new_playlist, &crate::config::PLAYLIST_FILE);
+        
+        info!("Advanced to track index {} of {}", new_playlist.current_track, new_playlist.tracks.len());
     }
     
     // Optimized public methods using DashMap
@@ -593,8 +861,20 @@ impl StreamManager {
     }
     
     pub fn get_precise_position(&self) -> (u64, u64) {
-        let ms = self.track_position_ms.load(Ordering::Relaxed);
-        (ms / 1000, ms % 1000)
+        // Calculate actual position based on start time
+        let start_time = self.track_start_time.read().clone();
+        let elapsed = start_time.elapsed();
+        let ms = elapsed.as_millis() as u64;
+        
+        // Clamp to track duration
+        let duration = self.track_duration_secs.load(Ordering::Relaxed) * 1000;
+        let clamped_ms = if duration > 0 && ms > duration {
+            duration
+        } else {
+            ms
+        };
+        
+        (clamped_ms / 1000, clamped_ms % 1000)
     }
     
     pub fn get_track_info(&self) -> Option<String> {

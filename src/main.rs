@@ -18,36 +18,28 @@ use crate::services::playlist;
 
 // Create optimized runtime
 fn create_optimized_runtime() -> tokio::runtime::Runtime {
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    
-    builder
-        .worker_threads(2)  // Only 2 worker threads
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)  // Single worker thread
         .max_blocking_threads(1)
-        .thread_name("radio-worker")
-        .thread_stack_size(2 * 1024 * 1024); // 2MB stack
-    
-    // Set thread affinity on Linux
-    #[cfg(target_os = "linux")]
-    builder.on_thread_start(|| {
-        use libc::{cpu_set_t, CPU_SET, CPU_ZERO, sched_setaffinity};
-        unsafe {
-            let mut cpu_set: cpu_set_t = std::mem::zeroed();
-            CPU_ZERO(&mut cpu_set);
-            CPU_SET(0, &mut cpu_set); // Pin to CPU 0
-            sched_setaffinity(0, std::mem::size_of::<cpu_set_t>(), &cpu_set);
-            
-            // Set thread priority
-            libc::nice(10); // Lower priority for worker threads
-        }
-    });
-    
-    builder.enable_all().build().unwrap()
+        .thread_name("radio")
+        .enable_time()
+        .enable_io()
+        .build()
+        .unwrap()
 }
 
-#[rocket::main]
-async fn main() -> Result<(), rocket::Error> {
-    // Set up minimal logging
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create and use our optimized runtime
+    let runtime = create_optimized_runtime();
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
+    // Set up minimal logging and thread configuration
     std::env::set_var("RUST_LOG", "error");
+    std::env::set_var("ROCKET_WORKERS", "1");
+    std::env::set_var("ROCKET_MAX_BLOCKING", "1");
+    std::env::set_var("ROCKET_ASYNC_WORKERS", "1");
     env_logger::init();
     
     println!("============================================================");
@@ -132,8 +124,8 @@ async fn main() -> Result<(), rocket::Error> {
         port: config::PORT,
         address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
         keep_alive: config::KEEP_ALIVE_TIMEOUT,
-        workers: 2,              // Minimal workers
-        max_blocking: 2,         // Minimal blocking threads
+        workers: 1,              // Single worker thread
+        max_blocking: 1,         // Single blocking thread
         ident: rocket::config::Ident::none(),
         ip_header: None,
         log_level: rocket::config::LogLevel::Off,
@@ -177,6 +169,5 @@ async fn main() -> Result<(), rocket::Error> {
         .attach(Template::fairing());
     
     rocket.launch().await?;
-    Ok(())?;
     Ok(())
 }
