@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRadio</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 2rem;
+            background-color: #f5f5f5;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 12px;
+            padding: 2rem;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        
+        h1 {
+            margin: 0 0 2rem 0;
+            color: #333;
+        }
+        
+        .player {
+            margin: 2rem 0;
+        }
+        
+        audio {
+            width: 100%;
+            margin: 1rem 0;
+        }
+        
+        .info {
+            background: #f8f9fa;
+            padding: 1rem;
+            border-radius: 8px;
+            margin: 1rem 0;
+        }
+        
+        .info h3 {
+            margin: 0 0 0.5rem 0;
+            color: #666;
+        }
+        
+        .now-playing {
+            font-size: 1.2rem;
+            margin: 0.5rem 0;
+        }
+        
+        .stats {
+            display: flex;
+            gap: 2rem;
+            margin: 1rem 0;
+            font-size: 0.9rem;
+            color: #666;
+        }
+        
+        .stat {
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .stat-value {
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: #333;
+        }
+        
+        .controls {
+            margin: 1rem 0;
+        }
+        
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 6px;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        
+        button:hover {
+            background: #0056b3;
+        }
+        
+        button:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+        }
+        
+        .error {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 1rem;
+            border-radius: 6px;
+            margin: 1rem 0;
+            display: none;
+        }
+        
+        .loading {
+            text-align: center;
+            color: #666;
+            padding: 2rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎵 WebRadio</h1>
+        
+        <div class="player">
+            <audio id="audioPlayer" controls>
+                Your browser does not support the audio element.
+            </audio>
+            
+            <div class="controls">
+                <button id="playBtn" onclick="togglePlay()">Play</button>
+                <button id="refreshBtn" onclick="refreshInfo()">Refresh</button>
+            </div>
+        </div>
+        
+        <div class="info">
+            <h3>Now Playing</h3>
+            <div id="nowPlaying" class="now-playing">
+                <div class="loading">Loading...</div>
+            </div>
+        </div>
+        
+        <div class="stats">
+            <div class="stat">
+                <span class="stat-value" id="listeners">0</span>
+                <span>Listeners</span>
+            </div>
+            <div class="stat">
+                <span class="stat-value" id="uptime">0h</span>
+                <span>Uptime</span>
+            </div>
+        </div>
+        
+        <div id="error" class="error"></div>
+    </div>
+    
+    <script>
+        const audioPlayer = document.getElementById('audioPlayer');
+        const playBtn = document.getElementById('playBtn');
+        const nowPlaying = document.getElementById('nowPlaying');
+        const listenersEl = document.getElementById('listeners');
+        const uptimeEl = document.getElementById('uptime');
+        const errorEl = document.getElementById('error');
+        
+        let eventSource = null;
+        let isPlaying = false;
+        
+        // Initialize
+        function init() {
+            refreshInfo();
+            startEventStream();
+            
+            // Set up audio player
+            audioPlayer.addEventListener('play', () => {
+                isPlaying = true;
+                playBtn.textContent = 'Pause';
+            });
+            
+            audioPlayer.addEventListener('pause', () => {
+                isPlaying = false;
+                playBtn.textContent = 'Play';
+            });
+            
+            audioPlayer.addEventListener('error', (e) => {
+                showError('Audio playback error');
+                console.error('Audio error:', e);
+            });
+        }
+        
+        // Toggle play/pause
+        function togglePlay() {
+            if (isPlaying) {
+                audioPlayer.pause();
+            } else {
+                // Clear any existing source
+                audioPlayer.pause();
+                audioPlayer.src = '';
+                
+                // Set new source with cache buster
+                const streamUrl = '/stream?t=' + Date.now();
+                console.log('Setting audio source:', streamUrl);
+                audioPlayer.src = streamUrl;
+                
+                // Load and play
+                audioPlayer.load();
+                
+                const playPromise = audioPlayer.play();
+                if (playPromise !== undefined) {
+                    playPromise.then(() => {
+                        console.log('Audio playback started');
+                    }).catch(e => {
+                        showError('Failed to start playback: ' + e.message);
+                        console.error('Play error:', e);
+                        isPlaying = false;
+                        playBtn.textContent = 'Play';
+                    });
+                }
+            }
+        }
+        
+        // Refresh current info
+        async function refreshInfo() {
+            try {
+                const response = await fetch('/api/now-playing');
+                if (!response.ok) throw new Error('Failed to fetch');
+                
+                const data = await response.json();
+                updateNowPlaying(data);
+                
+                // Also update stats
+                const statsResponse = await fetch('/api/listeners');
+                if (statsResponse.ok) {
+                    const stats = await statsResponse.json();
+                    updateStats(stats);
+                }
+            } catch (error) {
+                console.error('Refresh error:', error);
+                showError('Failed to refresh information');
+            }
+        }
+        
+        // Start server-sent events
+        function startEventStream() {
+            if (eventSource) {
+                eventSource.close();
+            }
+            
+            eventSource = new EventSource('/events');
+            
+            eventSource.addEventListener('now-playing', (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    updateNowPlaying(data);
+                } catch (error) {
+                    console.error('Event parse error:', error);
+                }
+            });
+            
+            eventSource.addEventListener('error', (error) => {
+                console.error('EventSource error:', error);
+                // Retry after a delay
+                setTimeout(() => startEventStream(), 5000);
+            });
+        }
+        
+        // Update now playing display
+        function updateNowPlaying(data) {
+            if (data.title === 'No track playing') {
+                nowPlaying.innerHTML = '<div class="loading">No track playing</div>';
+            } else {
+                let html = `
+                    <div><strong>${data.title}</strong></div>
+                    <div>${data.artist} - ${data.album || 'Unknown Album'}</div>`;
+                
+                if (data.bitrate) {
+                    html += `<div><small>Bitrate: ${data.bitrate} kbps</small></div>`;
+                }
+                
+                if (data.duration) {
+                    html += `<div><small>Duration: ${formatDuration(data.duration)}</small></div>`;
+                }
+                
+                nowPlaying.innerHTML = html;
+            }
+            
+            if (data.listeners !== undefined) {
+                listenersEl.textContent = data.listeners;
+            }
+        }
+        
+        // Update statistics
+        function updateStats(stats) {
+            listenersEl.textContent = stats.listeners || 0;
+            uptimeEl.textContent = formatUptime(stats.uptime || 0);
+        }
+        
+        // Show error message
+        function showError(message, isError = true) {
+            errorEl.textContent = message;
+            errorEl.style.display = 'block';
+            errorEl.style.background = isError ? '#f8d7da' : '#d1ecf1';
+            errorEl.style.color = isError ? '#721c24' : '#0c5460';
+            
+            if (isError) {
+                setTimeout(() => {
+                    errorEl.style.display = 'none';
+                }, 5000);
+            } else {
+                // Don't auto-hide non-error messages
+                setTimeout(() => {
+                    errorEl.style.display = 'none';
+                }, 2000);
+            }
+        }
+        
+        // Format duration in seconds to mm:ss
+        function formatDuration(seconds) {
+            const mins = Math.floor(seconds / 60);
+            const secs = seconds % 60;
+            return `${mins}:${secs.toString().padStart(2, '0')}`;
+        }
+        
+        // Format uptime
+        function formatUptime(seconds) {
+            if (seconds < 3600) {
+                return Math.floor(seconds / 60) + 'm';
+            } else if (seconds < 86400) {
+                return Math.floor(seconds / 3600) + 'h';
+            } else {
+                return Math.floor(seconds / 86400) + 'd';
+            }
+        }
+        
+        // Start when page loads
+        document.addEventListener('DOMContentLoaded', init);
+    </script>
+</body>
+</html>

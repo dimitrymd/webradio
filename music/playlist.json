@@ -1,0 +1,29 @@
+{
+  "tracks": [
+    {
+      "path": "Capillaris concentration.mp3",
+      "title": "Capillaris concentration",
+      "artist": "seagull_sparrow",
+      "album": "Unknown",
+      "duration": null,
+      "bitrate": null
+    },
+    {
+      "path": "Dhiyana.mp3",
+      "title": "Dhiyana",
+      "artist": "seagull_sparrow",
+      "album": "Unknown",
+      "duration": null,
+      "bitrate": null
+    },
+    {
+      "path": "Singing Birds.mp3",
+      "title": "Singing Birds",
+      "artist": "seagull_sparrow",
+      "album": "Unknown",
+      "duration": null,
+      "bitrate": null
+    }
+  ],
+  "current_index": 0
+}

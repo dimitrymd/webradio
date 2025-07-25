@@ -1,173 +1,249 @@
-// src/main.rs - Fully optimized entry point
+use axum::{
+    Router,
+    extract::State,
+    response::{Html, Response, sse::{Event, KeepAlive, Sse}},
+    routing::{get, get_service},
+    http::{StatusCode, header},
+    Json,
+};
+use tower_http::{
+    services::ServeDir,
+    cors::{CorsLayer, Any},
+    trace::TraceLayer,
+};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
+use tracing::info;
+use tokio::signal;
+use futures::stream::Stream;
 
-extern crate rocket;
-
-use rocket_dyn_templates::Template;
-use rocket::{routes, catchers, Config};
-use std::sync::Arc;
-
+mod error;
+mod radio;
+mod playlist;
 mod config;
-mod handlers;
-mod models;  
-mod services;
-mod utils;
-mod direct_stream;
 
-use crate::services::streamer::StreamManager;
-use crate::services::playlist;
+use error::AppError;
+use radio::RadioStation;
+use config::Config;
 
-// Create optimized runtime
-fn create_optimized_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)  // Single worker thread
-        .max_blocking_threads(1)
-        .thread_name("radio")
-        .enable_time()
-        .enable_io()
-        .build()
-        .unwrap()
-}
+type AppState = Arc<RadioStation>;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create and use our optimized runtime
-    let runtime = create_optimized_runtime();
-    runtime.block_on(async_main())
-}
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Initialize tracing
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "webradio=debug,tower_http=info,axum=info".into()),
+        )
+        .init();
 
-async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
-    // Set up minimal logging and thread configuration
-    std::env::set_var("RUST_LOG", "error");
-    std::env::set_var("ROCKET_WORKERS", "1");
-    std::env::set_var("ROCKET_MAX_BLOCKING", "1");
-    std::env::set_var("ROCKET_ASYNC_WORKERS", "1");
-    env_logger::init();
+    // Load configuration
+    let config = Config::from_env();
+    info!("Starting WebRadio v5.0 on {}:{}", config.host, config.port);
+
+    // Create radio station
+    let station = Arc::new(RadioStation::new(config.clone()).await?);
     
-    println!("============================================================");
-    println!("ChillOut Radio - Fully Optimized v4.0");
-    println!("Minimal CPU usage with all optimizations");
-    println!("============================================================");
+    // Start the radio broadcast
+    station.start_broadcast();
 
-    // Initialize stream manager with async runtime handle
-    let stream_manager = Arc::new(StreamManager::new(
-        &config::MUSIC_FOLDER,
-        config::CHUNK_SIZE,
-        config::BUFFER_SIZE,
-        config::STREAM_CACHE_TIME,
-    ));
-    
-    // Ensure music directory exists
-    if !config::MUSIC_FOLDER.exists() {
-        tokio::fs::create_dir_all(&*config::MUSIC_FOLDER).await.unwrap_or_else(|e| {
-            eprintln!("Failed to create music directory: {}", e);
-        });
-    }
-    
-    // Initialize playlist watcher
-    playlist::init_playlist_watcher(&config::PLAYLIST_FILE);
-    
-    // Initial scan (async)
-    println!("Scanning for MP3 files...");
-    let playlist_data = match playlist::scan_music_folder_async(&config::MUSIC_FOLDER, &config::PLAYLIST_FILE).await {
-        Ok(playlist) => playlist,
-        Err(e) => {
-            eprintln!("Error scanning music folder: {}", e);
-            crate::models::playlist::Playlist::default()
-        }
-    };
-    
-    if playlist_data.tracks.is_empty() {
-        println!("⚠️  No MP3 files found in music folder");
-        println!("   Add MP3 files to: {}", config::MUSIC_FOLDER.display());
-    } else {
-        println!("✅ Found {} tracks", playlist_data.tracks.len());
-    }
+    // Build router
+    let app = create_router(station.clone(), &config);
 
-    // Update durations once at startup (async)
-    if let Err(e) = playlist::rescan_and_update_durations_async(&config::PLAYLIST_FILE, &config::MUSIC_FOLDER).await {
-        eprintln!("Error updating track durations: {}", e);
-    }
+    // Create address
+    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    info!("Server listening on http://{}", addr);
 
-    // Start broadcast task (async)
-    println!("Starting optimized radio broadcast...");
-    stream_manager.start_broadcast_thread();
+    // Run server with graceful shutdown
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(station.clone()));
     
-    // Start monitor task (async)
-    let monitor_manager = stream_manager.clone();
+    // Handle CTRL+C in a separate task
+    let station_for_shutdown = station.clone();
     tokio::spawn(async move {
-        playlist::track_switcher_async(monitor_manager).await;
+        tokio::signal::ctrl_c().await.expect("Failed to install CTRL+C handler");
+        info!("CTRL+C received, initiating shutdown...");
+        station_for_shutdown.stop_broadcast().await;
+        // Give a moment for cleanup
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::process::exit(0);
     });
     
-    // Set up shutdown handler
-    let stream_manager_for_shutdown = stream_manager.clone();
-    tokio::spawn(async move {
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => {
-                println!("\n📻 Shutting down...");
-                stream_manager_for_shutdown.stop_broadcasting();
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                std::process::exit(0);
-            }
-            Err(err) => {
-                eprintln!("Unable to listen for shutdown signal: {}", err);
-            }
-        }
-    });
-    
-    println!("✅ Optimized radio is broadcasting!");
-    println!("🌐 Server at: http://localhost:8000");
-    println!("📻 Stream at: http://localhost:8000/direct-stream");
-    println!("🛑 Press Ctrl+C to stop");
-    println!("============================================================");
-    
-    // Configure Rocket with optimizations
-    let rocket_config = Config {
-        port: config::PORT,
-        address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
-        keep_alive: config::KEEP_ALIVE_TIMEOUT,
-        workers: 1,              // Single worker thread
-        max_blocking: 1,         // Single blocking thread
-        ident: rocket::config::Ident::none(),
-        ip_header: None,
-        log_level: rocket::config::LogLevel::Off,
-        ..Config::default()
-    };
-    
-    // Build Rocket server
-    let rocket = rocket::custom(rocket_config)
-        .manage(stream_manager)
-        .mount("/", routes![
-            // Streaming endpoints
-            direct_stream::direct_stream,
-            direct_stream::direct_stream_options,
-            direct_stream::stream_status,
-            direct_stream::radio_stream,
-            
-            // API endpoints
-            handlers::now_playing,
-            handlers::heartbeat,
-            handlers::get_stats,
-            handlers::get_position,
-            handlers::get_playlist,
-            handlers::health_check,
-            handlers::get_connections,
-            
-            // Web interface
-            handlers::index,
-            
-            // Static files
-            handlers::static_files,
-            handlers::diagnostic_page,
-            handlers::favicon,
-            handlers::robots,
-            handlers::cors_preflight,
-        ])
-        .register("/", catchers![
-            handlers::not_found,
-            handlers::server_error,
-            handlers::service_unavailable,
-        ])
-        .attach(Template::fairing());
-    
-    rocket.launch().await?;
+    server.await?;
+
     Ok(())
+}
+
+fn create_router(state: AppState, _config: &Config) -> Router {
+    Router::new()
+        // Main routes
+        .route("/", get(index))
+        .route("/stream", get(audio_stream))
+        .route("/test-audio", get(test_audio))
+        .route("/events", get(sse_events))
+        
+        // API routes
+        .route("/api/now-playing", get(now_playing))
+        .route("/api/listeners", get(listener_count))
+        .route("/api/playlist", get(get_playlist))
+        .route("/api/stats", get(get_stats))
+        .route("/api/health", get(health_check))
+        .route("/api/debug", get(debug_info))
+        
+        // Static files
+        .nest_service(
+            "/static",
+            get_service(ServeDir::new("static"))
+                .handle_error(|_| async { StatusCode::NOT_FOUND }),
+        )
+        
+        // Add middleware
+        .layer(CorsLayer::new().allow_origin(Any))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+async fn shutdown_signal(station: AppState) {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("Received CTRL+C signal");
+        },
+        _ = terminate => {
+            info!("Received terminate signal");
+        },
+    }
+
+    info!("Shutdown signal received, stopping broadcast...");
+    station.stop_broadcast().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+}
+
+// Route handlers
+
+async fn index() -> Html<&'static str> {
+    Html(include_str!("../templates/index.html"))
+}
+
+async fn audio_stream(
+    State(station): State<AppState>,
+) -> Result<Response, AppError> {
+    info!("New audio stream request");
+    
+    let stream = station.create_audio_stream().await?;
+    
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "audio/mpeg")
+        .header(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")
+        .header(header::CONNECTION, "close")
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Accept-Ranges", "none")
+        .body(axum::body::Body::from_stream(stream))?)
+}
+
+async fn test_audio() -> Result<Response, AppError> {
+    info!("Test audio request");
+    
+    // Generate a simple sine wave as MP3-like data for testing
+    let test_data = vec![0xFF, 0xFB, 0x90, 0x00]; // MP3 frame header
+    let mut audio_data = test_data;
+    
+    // Add some data
+    for _ in 0..1000 {
+        audio_data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    }
+    
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "audio/mpeg")
+        .header(header::CONTENT_LENGTH, audio_data.len().to_string())
+        .body(axum::body::Body::from(audio_data))?)
+}
+
+async fn sse_events(
+    State(station): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, AppError>>> {
+    let stream = station.create_event_stream();
+    
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
+}
+
+async fn now_playing(
+    State(station): State<AppState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let info = station.get_now_playing();
+    Ok(Json(info))
+}
+
+async fn listener_count(
+    State(station): State<AppState>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "listeners": station.listener_count(),
+        "uptime": station.uptime_seconds(),
+    }))
+}
+
+async fn get_playlist(
+    State(station): State<AppState>,
+) -> Result<Json<playlist::Playlist>, AppError> {
+    let playlist = station.get_playlist()?;
+    Ok(Json(playlist))
+}
+
+async fn get_stats(
+    State(station): State<AppState>,
+) -> Json<serde_json::Value> {
+    Json(station.get_statistics())
+}
+
+async fn health_check(
+    State(station): State<AppState>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "status": "healthy",
+        "is_broadcasting": station.is_broadcasting(),
+        "listeners": station.listener_count(),
+        "uptime": station.uptime_seconds(),
+    }))
+}
+
+async fn debug_info(
+    State(station): State<AppState>,
+) -> Json<serde_json::Value> {
+    let now_playing = station.get_now_playing();
+    let stats = station.get_statistics();
+    
+    Json(serde_json::json!({
+        "debug": {
+            "is_broadcasting": station.is_broadcasting(),
+            "broadcast_receiver_count": station.get_broadcast_receiver_count(),
+            "listener_count": station.listener_count(),
+            "now_playing": now_playing,
+            "stats": stats,
+        }
+    }))
 }
