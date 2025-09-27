@@ -299,11 +299,10 @@ impl RadioStation {
         let duration_seconds = total_audio_bytes as f64 / bytes_per_second;
         let ms_per_frame = (duration_seconds * 1000.0) / frames.len() as f64;
 
-        // Simple consistent streaming approach
-        // Stream at slightly faster than playbook rate (205kbps vs 192kbps)
-        // This allows browser to maintain a healthy buffer without underruns
-        const STREAM_RATE_KBPS: f64 = 205.0;  // Slightly faster than 192kbps
-        const CHUNK_SIZE_MS: f64 = 500.0;     // 500ms chunks for smooth delivery
+        // Mobile-optimized streaming approach
+        // Smaller chunks and closer to target rate for mobile stability
+        const STREAM_RATE_KBPS: f64 = 195.0;  // Closer to target rate for mobile
+        const CHUNK_SIZE_MS: f64 = 250.0;     // 250ms chunks for mobile compatibility
 
         let stream_bytes_per_second = (STREAM_RATE_KBPS * 1000.0) / 8.0;
         let chunk_size_bytes = ((stream_bytes_per_second * CHUNK_SIZE_MS) / 1000.0) as usize;
@@ -382,7 +381,7 @@ impl RadioStation {
             // Build up initial buffer for smooth startup
             let mut initial_buffer = Vec::new();
             let mut buffered_bytes = 0;
-            const TARGET_BUFFER: usize = 64 * 1024; // 64KB buffer (about 2-3 seconds at 205kbps)
+            const TARGET_BUFFER: usize = 20 * 1024; // 20KB buffer for mobile startup
 
             // Collect initial data with longer timeout for chunk-based streaming
             while buffered_bytes < TARGET_BUFFER {
@@ -400,7 +399,7 @@ impl RadioStation {
                     }
                     Err(_) => {
                         // Timeout - start if we have reasonable data
-                        if buffered_bytes >= 32 * 1024 { // At least 32KB
+                        if buffered_bytes >= 8 * 1024 { // At least 8KB
                             break;
                         }
                     }

@@ -185,7 +185,7 @@
 
         let isPlaying = false;
         let reconnectAttempts = 0;
-        const maxReconnectAttempts = 5;
+        const maxReconnectAttempts = 3;
         let reconnectTimer = null;
         let eventSource = null;
 
@@ -318,10 +318,17 @@
                 playBtn.textContent = 'Play';
                 playBtn.classList.remove('playing');
             } else {
-                // Start playing with optimized settings
+                // Start playing with mobile-optimized settings
                 audioPlayer.preload = 'none';  // Don't preload, stream directly
+
+                // Mobile-specific optimizations
+                if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
+                    audioPlayer.crossOrigin = 'anonymous';
+                    // Ensure mobile browsers don't pause on background
+                    audioPlayer.setAttribute('playsinline', 'true');
+                }
+
                 audioPlayer.src = '/stream?t=' + Date.now() + '&client=' + Math.random().toString(36).substr(2, 9);
-                // Don't call load() - let play() handle it
 
                 const playPromise = audioPlayer.play();
                 if (playPromise !== undefined) {
