@@ -1,4 +1,5 @@
 use std::{
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -7,7 +8,7 @@ use std::{
 };
 use tokio::{
     fs::File,
-    io::{AsyncReadExt, BufReader},
+    io::AsyncReadExt,
     sync::{broadcast, RwLock},
     time::{interval, sleep},
 };
@@ -16,7 +17,7 @@ use axum::response::sse::Event;
 use bytes::Bytes;
 use dashmap::DashMap;
 use arc_swap::ArcSwap;
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, debug};
 
 use crate::{
     error::Result,
@@ -24,17 +25,64 @@ use crate::{
     config::Config,
 };
 
-const CHUNK_SIZE: usize = 16384; // 16KB chunks
-const BUFFER_DURATION: Duration = Duration::from_secs(3);
+// MP3 frame size calculation
+fn calculate_mp3_frame_size(header: u32) -> Option<usize> {
+    // Extract MPEG version (bits 19-20)
+    let version = match (header >> 19) & 0b11 {
+        0b11 => 1, // MPEG 1
+        0b10 => 2, // MPEG 2
+        0b00 => 3, // MPEG 2.5
+        _ => return None,
+    };
 
-#[derive(Clone)]
+    // Extract layer (bits 17-18)
+    let layer = match (header >> 17) & 0b11 {
+        0b01 => 3, // Layer III
+        0b10 => 2, // Layer II
+        0b11 => 1, // Layer I
+        _ => return None,
+    };
+
+    // Only handle Layer III (MP3)
+    if layer != 3 {
+        return None;
+    }
+
+    // Extract bitrate index (bits 12-15)
+    let bitrate_index = ((header >> 12) & 0xF) as usize;
+
+    // Bitrate tables for MPEG1 Layer III
+    let bitrates = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
+    if bitrate_index == 0 || bitrate_index == 15 {
+        return None;
+    }
+    let bitrate = bitrates[bitrate_index] * 1000;
+
+    // Extract sample rate index (bits 10-11)
+    let samplerate_index = ((header >> 10) & 0b11) as usize;
+    let samplerates = [44100, 48000, 32000, 0];
+    let samplerate = samplerates[samplerate_index];
+    if samplerate == 0 {
+        return None;
+    }
+
+    // Extract padding bit (bit 9)
+    let padding = ((header >> 9) & 1) as usize;
+
+    // Calculate frame size for MPEG1 Layer III
+    // Frame size = (144 * bitrate) / samplerate + padding
+    let frame_size = (144 * bitrate) / samplerate + padding;
+
+    Some(frame_size)
+}
+
 pub struct RadioStation {
-    config: Config,
+    _config: Config,
     playlist: Arc<RwLock<Playlist>>,
     current_track: Arc<ArcSwap<Option<Track>>>,
     
     // Broadcasting
-    broadcast_tx: broadcast::Sender<Bytes>,
+    broadcast_tx: Arc<RwLock<broadcast::Sender<Bytes>>>,
     is_broadcasting: Arc<AtomicBool>,
     
     // Statistics
@@ -53,21 +101,25 @@ struct ListenerInfo {
     bytes_received: u64,
 }
 
+// Removed unused MP3 frame parsing functions - can be re-added if frame-level parsing is needed
+
 impl RadioStation {
     pub async fn new(config: Config) -> Result<Self> {
         // Load playlist
         let playlist = Playlist::load_or_scan(&config.music_dir).await?;
         info!("Loaded {} tracks", playlist.tracks.len());
         
-        // Create broadcast channel with reasonable capacity
-        let (broadcast_tx, _) = broadcast::channel(128);
+        // Create broadcast channel with much larger capacity to handle timing variations
+        // At 192kbps, we send ~24KB/s. With 240-byte chunks, that's 100 messages/second
+        // 5 minutes = 300 seconds = 30,000 messages. Use 32K to be safe.
+        let (broadcast_tx, _) = broadcast::channel(32768);
         let (shutdown_tx, _) = broadcast::channel(1);
         
         Ok(Self {
-            config,
+            _config: config,
             playlist: Arc::new(RwLock::new(playlist)),
             current_track: Arc::new(ArcSwap::from_pointee(None)),
-            broadcast_tx,
+            broadcast_tx: Arc::new(RwLock::new(broadcast_tx)),
             is_broadcasting: Arc::new(AtomicBool::new(false)),
             listeners: Arc::new(DashMap::new()),
             total_bytes_sent: Arc::new(AtomicU64::new(0)),
@@ -77,15 +129,15 @@ impl RadioStation {
         })
     }
     
-    pub fn start_broadcast(&self) {
+    pub fn start_broadcast(self: Arc<Self>) {
         if self.is_broadcasting.swap(true, Ordering::Relaxed) {
             warn!("Broadcast already running");
             return;
         }
-        
+
         info!("Starting radio broadcast...");
-        
-        let station = self.clone();
+
+        let station = Arc::clone(&self);
         tokio::spawn(async move {
             if let Err(e) = station.broadcast_loop().await {
                 error!("Broadcast loop error: {}", e);
@@ -136,10 +188,13 @@ impl RadioStation {
                 continue;
             };
             
+            // Don't create a new channel - just continue using the same one
+            // This keeps clients connected across track changes
+
             // Update current track
             self.current_track.store(Arc::new(Some(track.clone())));
             info!("Now playing: {} - {} ({})", track.artist, track.title, track.path.display());
-            
+
             // Stream the track
             tokio::select! {
                 result = self.stream_track(&track) => {
@@ -153,9 +208,8 @@ impl RadioStation {
                     break;
                 }
             }
-            
-            // Small gap between tracks
-            sleep(Duration::from_millis(500)).await;
+
+            // No gap between tracks - immediately start next track
         }
         
         info!("Broadcast loop ended");
@@ -163,135 +217,207 @@ impl RadioStation {
     }
     
     async fn stream_track(&self, track: &Track) -> Result<()> {
-        let path = self.config.music_dir.join(&track.path);
-        
-        info!("Streaming track: {} at {}kbps", path.display(), track.bitrate.unwrap_or(128000) / 1000);
-        
-        let file = File::open(&path).await?;
+        // Track path is relative to music directory
+        let path = if track.path.is_absolute() {
+            track.path.clone()
+        } else {
+            PathBuf::from("music").join(&track.path)
+        };
+
+        info!("Streaming track: {} at {}kbps", path.display(), track.bitrate.unwrap_or(192000) / 1000);
+
+        // Read entire file into memory for smooth streaming
+        let mut file = File::open(&path).await?;
         let metadata = file.metadata().await?;
         let file_size = metadata.len();
-        
-        let mut reader = BufReader::new(file);
-        let mut buffer = vec![0u8; CHUNK_SIZE];
-        let mut position = 0u64;
-        
+
+        let mut file_data = Vec::with_capacity(file_size as usize);
+        file.read_to_end(&mut file_data).await?;
+        drop(file); // Close file immediately
+
+        info!("Loaded {} KB of audio data into memory", file_data.len() / 1024);
+
         // Skip ID3v2 tag if present
-        let mut id3_buffer = vec![0u8; 10];
-        if reader.read_exact(&mut id3_buffer).await.is_ok() {
-            if &id3_buffer[..3] == b"ID3" {
-                // Calculate ID3v2 tag size
-                let size = ((id3_buffer[6] as u32 & 0x7F) << 21)
-                    | ((id3_buffer[7] as u32 & 0x7F) << 14)
-                    | ((id3_buffer[8] as u32 & 0x7F) << 7)
-                    | (id3_buffer[9] as u32 & 0x7F);
-                
-                // Skip the ID3 tag
-                let mut skip_buffer = vec![0u8; size as usize];
-                reader.read_exact(&mut skip_buffer).await?;
-                position = 10 + size as u64;
-                
-                info!("Skipped ID3v2 tag of {} bytes", 10 + size);
-            } else {
-                // Not an ID3 tag, rewind by sending the first 10 bytes
-                if self.broadcast_tx.receiver_count() > 0 {
-                    let _ = self.broadcast_tx.send(Bytes::copy_from_slice(&id3_buffer));
-                    self.total_bytes_sent.fetch_add(10, Ordering::Relaxed);
+        let mut position = 0usize;
+        if file_data.len() > 10 && &file_data[..3] == b"ID3" {
+            // Calculate ID3v2 tag size
+            let size = ((file_data[6] as u32 & 0x7F) << 21)
+                | ((file_data[7] as u32 & 0x7F) << 14)
+                | ((file_data[8] as u32 & 0x7F) << 7)
+                | (file_data[9] as u32 & 0x7F);
+
+            position = 10 + size as usize;
+            info!("Skipped ID3v2 tag of {} bytes", position);
+        }
+
+        // Get bitrate for timing
+        let bitrate = track.bitrate.unwrap_or(192000);
+        let bytes_per_second = bitrate as f64 / 8.0;
+
+        info!("Streaming at {}kbps ({} bytes/second)", bitrate / 1000, bytes_per_second as u32);
+
+        // Stream the track with accurate bitrate-based timing
+        let start_time = Instant::now();
+        let mut last_log = Instant::now();
+
+        // Find all MP3 frame boundaries for accurate streaming
+        let mut frames = Vec::new();
+        let mut scan_pos = position;
+
+        while scan_pos < file_data.len() - 4 {
+            // Look for MP3 frame sync (11 bits set)
+            if file_data[scan_pos] == 0xFF && (file_data[scan_pos + 1] & 0xE0) == 0xE0 {
+                // Valid frame header found
+                let header = u32::from_be_bytes([
+                    file_data[scan_pos],
+                    file_data[scan_pos + 1],
+                    file_data[scan_pos + 2],
+                    file_data[scan_pos + 3],
+                ]);
+
+                // Calculate frame size
+                if let Some(frame_size) = calculate_mp3_frame_size(header) {
+                    frames.push((scan_pos, frame_size));
+                    scan_pos += frame_size;
+                } else {
+                    scan_pos += 1;
                 }
-                position = 10;
+            } else {
+                scan_pos += 1;
             }
         }
-        
-        // Use actual bitrate from track or detect it
-        let bitrate = track.bitrate.unwrap_or_else(|| {
-            warn!("No bitrate info for track, defaulting to 192kbps");
-            192000
-        });
-        
-        // Calculate timing based on actual bitrate
-        let chunk_duration_ms = (CHUNK_SIZE as f64 * 8.0 * 1000.0) / bitrate as f64;
-        let chunk_duration = Duration::from_micros((chunk_duration_ms * 1000.0) as u64);
-        
-        info!("Streaming at {}kbps, chunk every {:.2}ms", bitrate / 1000, chunk_duration_ms);
-        
-        let mut interval = interval(chunk_duration);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        
-        // Send initial chunks immediately for faster start
-        let initial_chunks = 3;
-        for _ in 0..initial_chunks {
-            if position >= file_size {
-                break;
-            }
-            
-            let bytes_read = reader.read(&mut buffer).await?;
-            if bytes_read == 0 {
-                break;
-            }
-            
-            let chunk = Bytes::copy_from_slice(&buffer[..bytes_read]);
-            position += bytes_read as u64;
-            
-            if self.broadcast_tx.receiver_count() > 0 {
-                let _ = self.broadcast_tx.send(chunk);
-                self.total_bytes_sent.fetch_add(bytes_read as u64, Ordering::Relaxed);
-            }
+
+        info!("Found {} MP3 frames in track", frames.len());
+
+        if frames.is_empty() {
+            warn!("No valid MP3 frames found, falling back to raw streaming");
+            return Ok(());
         }
-        
-        // Continue streaming with proper timing
-        while position < file_size {
-            // Check if we should stop
+
+        // Calculate frame duration based on actual bitrate
+        let total_audio_bytes: usize = frames.iter().map(|(_, size)| size).sum();
+        let duration_seconds = total_audio_bytes as f64 / bytes_per_second;
+        let ms_per_frame = (duration_seconds * 1000.0) / frames.len() as f64;
+
+        // Simple consistent streaming approach
+        // Stream at slightly faster than playbook rate (205kbps vs 192kbps)
+        // This allows browser to maintain a healthy buffer without underruns
+        const STREAM_RATE_KBPS: f64 = 205.0;  // Slightly faster than 192kbps
+        const CHUNK_SIZE_MS: f64 = 500.0;     // 500ms chunks for smooth delivery
+
+        let stream_bytes_per_second = (STREAM_RATE_KBPS * 1000.0) / 8.0;
+        let chunk_size_bytes = ((stream_bytes_per_second * CHUNK_SIZE_MS) / 1000.0) as usize;
+        let chunk_interval = Duration::from_millis(CHUNK_SIZE_MS as u64);
+
+        info!("Streaming at {:.0}kbps ({} byte chunks every {}ms)",
+            STREAM_RATE_KBPS, chunk_size_bytes, CHUNK_SIZE_MS);
+
+        let mut data_index = 0;
+        let data_len = file_data.len();
+        let stream_start = Instant::now();
+        let mut chunks_sent = 0;
+
+        while data_index < data_len {
             if !self.is_broadcasting.load(Ordering::Relaxed) {
                 break;
             }
-            
-            // Wait for next chunk time
-            interval.tick().await;
-            
-            // Read chunk
-            let bytes_read = reader.read(&mut buffer).await?;
-            if bytes_read == 0 {
-                break;
+
+            // Calculate when to send next chunk
+            let target_time = stream_start + Duration::from_millis((chunks_sent * CHUNK_SIZE_MS as u64));
+            let now = Instant::now();
+            if target_time > now {
+                sleep(target_time - now).await;
             }
-            
-            let chunk = Bytes::copy_from_slice(&buffer[..bytes_read]);
-            position += bytes_read as u64;
-            
-            // Update position
-            self.current_position.store(position, Ordering::Relaxed);
-            
-            // Broadcast to all listeners
-            if self.broadcast_tx.receiver_count() > 0 {
-                if let Err(e) = self.broadcast_tx.send(chunk) {
-                    warn!("Failed to broadcast chunk: {}", e);
-                }
-                self.total_bytes_sent.fetch_add(bytes_read as u64, Ordering::Relaxed);
+
+            // Prepare chunk
+            let chunk_end = (data_index + chunk_size_bytes).min(data_len);
+            let chunk_data = file_data[data_index..chunk_end].to_vec();
+
+            if !chunk_data.is_empty() {
+                let chunk = Bytes::from(chunk_data);
+                self.total_bytes_sent.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                self.current_position.store(data_index as u64, Ordering::Relaxed);
+
+                let tx = self.broadcast_tx.read().await;
+                let _ = tx.send(chunk);
+            }
+
+            data_index = chunk_end;
+            chunks_sent += 1;
+
+            // Log progress occasionally
+            if last_log.elapsed() > Duration::from_secs(5) {
+                let progress = (data_index as f64 / data_len as f64) * 100.0;
+                let elapsed = stream_start.elapsed();
+                let rate_kbps = (data_index as f64 * 8.0) / (elapsed.as_secs_f64() * 1000.0);
+
+                info!("Streaming: {:.1}% complete, rate: {:.0}kbps", progress, rate_kbps);
+                last_log = Instant::now();
             }
         }
-        
-        info!("Finished streaming track: {} (sent {} MB)", 
-            track.title, 
-            self.total_bytes_sent.load(Ordering::Relaxed) as f64 / 1_048_576.0
+
+        info!("Finished streaming track: {} (sent {} chunks)",
+            track.title,
+            chunks_sent
         );
         Ok(())
     }
     
     pub async fn create_audio_stream(&self) -> Result<impl Stream<Item = Result<Bytes>>> {
         let listener_id = uuid::Uuid::new_v4().to_string();
-        let mut receiver = self.broadcast_tx.subscribe();
-        
+        let mut receiver = self.broadcast_tx.read().await.subscribe();
+
         // Register listener
         self.listeners.insert(listener_id.clone(), ListenerInfo {
             connected_at: Instant::now(),
             bytes_received: 0,
         });
-        
+
         let listeners = self.listeners.clone();
-        
-        info!("New audio listener connected: {}", &listener_id[..8]);
-        
+        let current_count = self.listener_count();
+
+        info!("New audio listener connected: {} (total: {})", &listener_id[..8], current_count);
+
         Ok(async_stream::stream! {
-            // Don't send initial silence - it can confuse some players
-            
+            // Build up initial buffer for smooth startup
+            let mut initial_buffer = Vec::new();
+            let mut buffered_bytes = 0;
+            const TARGET_BUFFER: usize = 64 * 1024; // 64KB buffer (about 2-3 seconds at 205kbps)
+
+            // Collect initial data with longer timeout for chunk-based streaming
+            while buffered_bytes < TARGET_BUFFER {
+                match tokio::time::timeout(Duration::from_millis(600), receiver.recv()).await {
+                    Ok(Ok(chunk)) => {
+                        buffered_bytes += chunk.len();
+                        initial_buffer.push(chunk);
+                    }
+                    Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                        warn!("Initial buffering lagged by {} messages", skipped);
+                        continue;
+                    }
+                    Ok(Err(broadcast::error::RecvError::Closed)) => {
+                        break;
+                    }
+                    Err(_) => {
+                        // Timeout - start if we have reasonable data
+                        if buffered_bytes >= 32 * 1024 { // At least 32KB
+                            break;
+                        }
+                    }
+                }
+            }
+
+            info!("Listener {} starting with {} KB buffer", &listener_id[..8], buffered_bytes / 1024);
+
+            // Send buffered chunks
+            for chunk in initial_buffer {
+                if let Some(mut info) = listeners.get_mut(&listener_id) {
+                    info.bytes_received += chunk.len() as u64;
+                }
+                yield Ok(chunk);
+            }
+
+            // Continue with normal streaming
             loop {
                 match receiver.recv().await {
                     Ok(chunk) => {
@@ -302,7 +428,8 @@ impl RadioStation {
                         yield Ok(chunk);
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!("Listener {} lagged by {} messages", listener_id, skipped);
+                        warn!("Listener {} lagged by {} messages, catching up", &listener_id[..8], skipped);
+                        // Just continue - the lagged messages are already skipped
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
@@ -314,25 +441,24 @@ impl RadioStation {
             
             // Cleanup on disconnect
             listeners.remove(&listener_id);
-            info!("Audio listener disconnected: {}", &listener_id[..8]);
+            let remaining = listeners.len();
+            info!("Audio listener disconnected: {} (remaining: {})", &listener_id[..8], remaining);
         })
     }
     
-    pub fn create_event_stream(&self) -> impl Stream<Item = Result<Event>> {
-        let station = self.clone();
-        
+    pub fn create_event_stream(self: Arc<Self>) -> impl Stream<Item = Result<Event>> {
         // Don't count SSE connections as listeners
         async_stream::stream! {
             let mut interval = interval(Duration::from_secs(5));
-            
+
             loop {
                 interval.tick().await;
-                
+
                 let event = Event::default()
                     .event("now-playing")
-                    .json_data(station.get_now_playing())
+                    .json_data(self.get_now_playing())
                     .unwrap();
-                    
+
                 yield Ok(event);
             }
         }
@@ -402,8 +528,8 @@ impl RadioStation {
         self.is_broadcasting.load(Ordering::Relaxed)
     }
     
-    pub fn get_broadcast_receiver_count(&self) -> usize {
-        self.broadcast_tx.receiver_count()
+    pub async fn get_broadcast_receiver_count(&self) -> usize {
+        self.broadcast_tx.read().await.receiver_count()
     }
 }
 

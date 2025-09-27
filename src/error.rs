@@ -7,6 +7,7 @@ use thiserror::Error;
 pub type Result<T> = std::result::Result<T, AppError>;
 
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum AppError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

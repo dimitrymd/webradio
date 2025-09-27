@@ -20,9 +20,17 @@
             box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
         }
         
+        .logo {
+            display: block;
+            max-width: 300px;
+            height: auto;
+            margin: 0 auto 2rem auto;
+        }
+
         h1 {
             margin: 0 0 2rem 0;
             color: #333;
+            text-align: center;
         }
         
         .player {
@@ -72,17 +80,38 @@
         
         .controls {
             margin: 1rem 0;
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
         }
-        
+
         button {
             background: #007bff;
             color: white;
             border: none;
-            padding: 0.75rem 1.5rem;
+            padding: 1rem 2rem;
             border-radius: 6px;
-            font-size: 1rem;
+            font-size: 1.1rem;
             cursor: pointer;
             transition: background-color 0.2s;
+            font-weight: 500;
+            min-width: 120px;
+        }
+
+        #playBtn {
+            background: #28a745;
+        }
+
+        #playBtn:hover {
+            background: #218838;
+        }
+
+        #playBtn.playing {
+            background: #dc3545;
+        }
+
+        #playBtn.playing:hover {
+            background: #c82333;
         }
         
         button:hover {
@@ -112,13 +141,13 @@
 </head>
 <body>
     <div class="container">
-        <h1>🎵 WebRadio</h1>
+        <img src="/static/images/cillout-radio-logo.png" alt="ChillOut Radio" class="logo" />
         
         <div class="player">
-            <audio id="audioPlayer" controls>
+            <audio id="audioPlayer">
                 Your browser does not support the audio element.
             </audio>
-            
+
             <div class="controls">
                 <button id="playBtn" onclick="togglePlay()">Play</button>
                 <button id="refreshBtn" onclick="refreshInfo()">Refresh</button>
@@ -153,92 +182,194 @@
         const listenersEl = document.getElementById('listeners');
         const uptimeEl = document.getElementById('uptime');
         const errorEl = document.getElementById('error');
-        
-        let eventSource = null;
+
         let isPlaying = false;
-        
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 5;
+        let reconnectTimer = null;
+        let eventSource = null;
+
         // Initialize
         function init() {
             refreshInfo();
-            startEventStream();
-            
+            setupEventStream();
+
             // Set up audio player
             audioPlayer.addEventListener('play', () => {
                 isPlaying = true;
-                playBtn.textContent = 'Pause';
+                playBtn.textContent = 'Stop';
+                playBtn.classList.add('playing');
+                reconnectAttempts = 0;
             });
-            
+
             audioPlayer.addEventListener('pause', () => {
-                isPlaying = false;
-                playBtn.textContent = 'Play';
+                // Only update UI if not already handled
+                if (isPlaying) {
+                    isPlaying = false;
+                    playBtn.textContent = 'Play';
+                    playBtn.classList.remove('playing');
+                }
             });
-            
+
             audioPlayer.addEventListener('error', (e) => {
-                showError('Audio playback error');
                 console.error('Audio error:', e);
+                handleStreamError();
+            });
+
+            audioPlayer.addEventListener('stalled', () => {
+                console.warn('Stream stalled, attempting recovery...');
+                // Only show buffering message if actually playing
+                if (isPlaying) {
+                    showError('Stream buffering...', false);
+                }
+            });
+
+            audioPlayer.addEventListener('waiting', () => {
+                console.log('Stream waiting for data...');
+                // Only show buffering message if actually playing
+                if (isPlaying) {
+                    showError('Buffering...', false);
+                }
+            });
+
+            audioPlayer.addEventListener('playing', () => {
+                errorEl.style.display = 'none';
+                reconnectAttempts = 0;
             });
         }
-        
-        // Toggle play/pause
-        function togglePlay() {
-            if (isPlaying) {
+
+        // Handle stream errors with reconnection
+        function handleStreamError() {
+            if (!isPlaying) return;
+
+            // Cancel any pending reconnection
+            if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+                reconnectTimer = null;
+            }
+
+            reconnectAttempts++;
+            if (reconnectAttempts > maxReconnectAttempts) {
+                showError('Connection lost. Please refresh the page.');
                 audioPlayer.pause();
-            } else {
-                // Clear any existing source
-                audioPlayer.pause();
-                audioPlayer.src = '';
-                
-                // Set new source with cache buster
-                const streamUrl = '/stream?t=' + Date.now();
-                console.log('Setting audio source:', streamUrl);
-                audioPlayer.src = streamUrl;
-                
-                // Load and play
-                audioPlayer.load();
-                
+                return;
+            }
+
+            showError(`Connection interrupted. Reconnecting (${reconnectAttempts}/${maxReconnectAttempts})...`, false);
+
+            // Exponential backoff with jitter to prevent thundering herd
+            const baseDelay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 10000);
+            const jitter = Math.random() * 1000;
+            const delay = baseDelay + jitter;
+
+            reconnectTimer = setTimeout(() => {
+                reconnectTimer = null;
+                if (isPlaying) {
+                    reconnectStream();
+                }
+            }, delay);
+        }
+
+        // Reconnect to stream
+        function reconnectStream() {
+            if (!isPlaying) return;
+
+            // Ensure we don't have a stale source
+            audioPlayer.pause();
+            audioPlayer.removeAttribute('src');
+
+            // Small delay to ensure cleanup
+            setTimeout(() => {
+                if (!isPlaying) return;
+
+                audioPlayer.src = '/stream?t=' + Date.now() + '&reconnect=' + reconnectAttempts;
+                // Don't call load() - let play() handle it
+
                 const playPromise = audioPlayer.play();
                 if (playPromise !== undefined) {
                     playPromise.then(() => {
-                        console.log('Audio playback started');
+                        console.log('Reconnected successfully');
+                        reconnectAttempts = 0;
                     }).catch(e => {
-                        showError('Failed to start playback: ' + e.message);
+                        console.error('Reconnect play error:', e);
+                        handleStreamError();
+                    });
+                }
+            }, 100);
+        }
+
+        // Toggle play/pause
+        function togglePlay() {
+            // Ensure button is always enabled
+            playBtn.disabled = false;
+
+            if (isPlaying) {
+                // Stop playing
+                isPlaying = false;  // Set this first to prevent event handler conflicts
+                audioPlayer.pause();
+                audioPlayer.removeAttribute('src');
+                reconnectAttempts = 0;
+                if (reconnectTimer) {
+                    clearTimeout(reconnectTimer);
+                    reconnectTimer = null;
+                }
+                // Clear any error messages when stopping
+                errorEl.style.display = 'none';
+                playBtn.textContent = 'Play';
+                playBtn.classList.remove('playing');
+            } else {
+                // Start playing with optimized settings
+                audioPlayer.preload = 'none';  // Don't preload, stream directly
+                audioPlayer.src = '/stream?t=' + Date.now() + '&client=' + Math.random().toString(36).substr(2, 9);
+                // Don't call load() - let play() handle it
+
+                const playPromise = audioPlayer.play();
+                if (playPromise !== undefined) {
+                    playPromise.then(() => {
+                        console.log('Playback started successfully');
+                        reconnectAttempts = 0;
+                    }).catch(e => {
+                        showError('Failed to start: ' + e.message);
                         console.error('Play error:', e);
                         isPlaying = false;
                         playBtn.textContent = 'Play';
+                        playBtn.classList.remove('playing');
                     });
                 }
             }
         }
-        
+
         // Refresh current info
         async function refreshInfo() {
             try {
-                const response = await fetch('/api/now-playing');
-                if (!response.ok) throw new Error('Failed to fetch');
-                
-                const data = await response.json();
-                updateNowPlaying(data);
-                
-                // Also update stats
-                const statsResponse = await fetch('/api/listeners');
+                const [nowPlayingResponse, statsResponse] = await Promise.all([
+                    fetch('/api/now-playing'),
+                    fetch('/api/listeners')
+                ]);
+
+                if (nowPlayingResponse.ok) {
+                    const data = await nowPlayingResponse.json();
+                    updateNowPlaying(data);
+                }
+
                 if (statsResponse.ok) {
                     const stats = await statsResponse.json();
                     updateStats(stats);
                 }
             } catch (error) {
                 console.error('Refresh error:', error);
-                showError('Failed to refresh information');
             }
         }
-        
-        // Start server-sent events
-        function startEventStream() {
+
+        // Set up server-sent events with auto-reconnect
+        function setupEventStream() {
+            // Close existing connection if any
             if (eventSource) {
                 eventSource.close();
             }
-            
+
             eventSource = new EventSource('/events');
-            
+
             eventSource.addEventListener('now-playing', (event) => {
                 try {
                     const data = JSON.parse(event.data);
@@ -247,71 +378,81 @@
                     console.error('Event parse error:', error);
                 }
             });
-            
-            eventSource.addEventListener('error', (error) => {
-                console.error('EventSource error:', error);
-                // Retry after a delay
-                setTimeout(() => startEventStream(), 5000);
+
+            eventSource.addEventListener('listeners', (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    updateStats(data);
+                } catch (error) {
+                    console.error('Event parse error:', error);
+                }
             });
+
+            eventSource.addEventListener('error', (e) => {
+                console.log('EventSource disconnected, will auto-reconnect');
+                // EventSource auto-reconnects on its own
+            });
+
+            // Periodic info refresh as backup (less frequent)
+            setInterval(refreshInfo, 30000);
         }
-        
+
         // Update now playing display
         function updateNowPlaying(data) {
-            if (data.title === 'No track playing') {
-                nowPlaying.innerHTML = '<div class="loading">No track playing</div>';
+            if (!data || data.title === 'No track playing') {
+                nowPlaying.innerHTML = '<div class="loading">Waiting for next track...</div>';
             } else {
                 let html = `
-                    <div><strong>${data.title}</strong></div>
-                    <div>${data.artist} - ${data.album || 'Unknown Album'}</div>`;
-                
+                    <div><strong>${data.title || 'Unknown'}</strong></div>
+                    <div>${data.artist || 'Unknown Artist'} - ${data.album || 'Unknown Album'}</div>`;
+
                 if (data.bitrate) {
-                    html += `<div><small>Bitrate: ${data.bitrate} kbps</small></div>`;
+                    html += `<div><small>Bitrate: ${Math.round(data.bitrate / 1000)} kbps</small></div>`;
                 }
-                
-                if (data.duration) {
+
+                if (data.duration && data.duration > 0) {
                     html += `<div><small>Duration: ${formatDuration(data.duration)}</small></div>`;
                 }
-                
+
                 nowPlaying.innerHTML = html;
             }
-            
+
             if (data.listeners !== undefined) {
                 listenersEl.textContent = data.listeners;
             }
         }
-        
+
         // Update statistics
         function updateStats(stats) {
-            listenersEl.textContent = stats.listeners || 0;
-            uptimeEl.textContent = formatUptime(stats.uptime || 0);
+            if (stats.listeners !== undefined) {
+                listenersEl.textContent = stats.listeners;
+            }
+            if (stats.uptime !== undefined) {
+                uptimeEl.textContent = formatUptime(stats.uptime);
+            }
         }
-        
-        // Show error message
+
+        // Show error/status message
         function showError(message, isError = true) {
             errorEl.textContent = message;
             errorEl.style.display = 'block';
             errorEl.style.background = isError ? '#f8d7da' : '#d1ecf1';
             errorEl.style.color = isError ? '#721c24' : '#0c5460';
-            
+
             if (isError) {
                 setTimeout(() => {
                     errorEl.style.display = 'none';
                 }, 5000);
-            } else {
-                // Don't auto-hide non-error messages
-                setTimeout(() => {
-                    errorEl.style.display = 'none';
-                }, 2000);
             }
         }
-        
+
         // Format duration in seconds to mm:ss
         function formatDuration(seconds) {
             const mins = Math.floor(seconds / 60);
-            const secs = seconds % 60;
+            const secs = Math.floor(seconds % 60);
             return `${mins}:${secs.toString().padStart(2, '0')}`;
         }
-        
+
         // Format uptime
         function formatUptime(seconds) {
             if (seconds < 3600) {
@@ -322,9 +463,23 @@
                 return Math.floor(seconds / 86400) + 'd';
             }
         }
-        
+
         // Start when page loads
         document.addEventListener('DOMContentLoaded', init);
+
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            if (audioPlayer) {
+                audioPlayer.pause();
+                audioPlayer.removeAttribute('src');
+            }
+            if (eventSource) {
+                eventSource.close();
+            }
+            if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+            }
+        });
     </script>
 </body>
 </html>
