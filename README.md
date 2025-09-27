@@ -36,7 +36,7 @@ The server uses a single-producer, multiple-consumer pattern with optimized stre
          ▼
 ┌─────────────────┐          ┌──────────────────────┐
 │  RadioStation   │  Sends   │  Broadcast Channel   │
-│  (Single Loop)  │────────▶│  (32K buffer)        │
+│  (Single Loop)  │────────▶ │  (32K buffer)        │
 │  205kbps stream │          │  500ms chunks        │
 └─────────────────┘          └──────────┬───────────┘
                                         │
