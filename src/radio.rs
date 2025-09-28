@@ -1,7 +1,7 @@
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU32, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -28,7 +28,7 @@ use crate::{
 // MP3 frame size calculation
 fn calculate_mp3_frame_size(header: u32) -> Option<usize> {
     // Extract MPEG version (bits 19-20)
-    let version = match (header >> 19) & 0b11 {
+    let _version = match (header >> 19) & 0b11 {
         0b11 => 1, // MPEG 1
         0b10 => 2, // MPEG 2
         0b00 => 3, // MPEG 2.5
@@ -90,7 +90,16 @@ pub struct RadioStation {
     total_bytes_sent: Arc<AtomicU64>,
     current_position: Arc<AtomicU64>,
     start_time: Instant,
-    
+
+    // Stream Health Monitoring
+    last_chunk_sent: Arc<AtomicU64>, // timestamp as u64
+    stream_gaps_detected: Arc<AtomicU32>,
+    recovery_attempts: Arc<AtomicU32>,
+
+    // Track Preloading (prevent transition gaps)
+    next_track_data: Arc<RwLock<Option<Vec<u8>>>>,
+    next_track_info: Arc<RwLock<Option<Track>>>,
+
     // Control
     shutdown_tx: broadcast::Sender<()>,
 }
@@ -125,6 +134,16 @@ impl RadioStation {
             total_bytes_sent: Arc::new(AtomicU64::new(0)),
             current_position: Arc::new(AtomicU64::new(0)),
             start_time: Instant::now(),
+
+            // Initialize stream health monitoring
+            last_chunk_sent: Arc::new(AtomicU64::new(0)),
+            stream_gaps_detected: Arc::new(AtomicU32::new(0)),
+            recovery_attempts: Arc::new(AtomicU32::new(0)),
+
+            // Initialize track preloading
+            next_track_data: Arc::new(RwLock::new(None)),
+            next_track_info: Arc::new(RwLock::new(None)),
+
             shutdown_tx,
         })
     }
@@ -195,12 +214,16 @@ impl RadioStation {
             self.current_track.store(Arc::new(Some(track.clone())));
             info!("Now playing: {} - {} ({})", track.artist, track.title, track.path.display());
 
-            // Stream the track
+            // Stream the track with automatic recovery
             tokio::select! {
-                result = self.stream_track(&track) => {
+                result = self.stream_track_with_recovery(&track) => {
                     match result {
                         Ok(_) => info!("Track completed successfully"),
-                        Err(e) => error!("Error streaming track: {}", e),
+                        Err(e) => {
+                            error!("Error streaming track after recovery attempts: {}", e);
+                            // Brief pause before trying next track to avoid rapid failure loops
+                            sleep(Duration::from_millis(500)).await;
+                        }
                     }
                 }
                 _ = shutdown.recv() => {
@@ -257,7 +280,7 @@ impl RadioStation {
         info!("Streaming at {}kbps ({} bytes/second)", bitrate / 1000, bytes_per_second as u32);
 
         // Stream the track with accurate bitrate-based timing
-        let start_time = Instant::now();
+        let _start_time = Instant::now();
         let mut last_log = Instant::now();
 
         // Find all MP3 frame boundaries for accurate streaming
@@ -297,16 +320,16 @@ impl RadioStation {
         // Calculate frame duration based on actual bitrate
         let total_audio_bytes: usize = frames.iter().map(|(_, size)| size).sum();
         let duration_seconds = total_audio_bytes as f64 / bytes_per_second;
-        let ms_per_frame = (duration_seconds * 1000.0) / frames.len() as f64;
+        let _ms_per_frame = (duration_seconds * 1000.0) / frames.len() as f64;
 
-        // Mobile-optimized streaming approach
-        // Smaller chunks and closer to target rate for mobile stability
-        const STREAM_RATE_KBPS: f64 = 195.0;  // Closer to target rate for mobile
-        const CHUNK_SIZE_MS: f64 = 250.0;     // 250ms chunks for mobile compatibility
+        // iOS-optimized streaming approach
+        // Much smaller chunks for iOS Safari compatibility
+        const STREAM_RATE_KBPS: f64 = 192.0;  // Exact target rate
+        const CHUNK_SIZE_MS: f64 = 100.0;     // 100ms chunks for iOS compatibility
 
         let stream_bytes_per_second = (STREAM_RATE_KBPS * 1000.0) / 8.0;
         let chunk_size_bytes = ((stream_bytes_per_second * CHUNK_SIZE_MS) / 1000.0) as usize;
-        let chunk_interval = Duration::from_millis(CHUNK_SIZE_MS as u64);
+        let _chunk_interval = Duration::from_millis(CHUNK_SIZE_MS as u64);
 
         info!("Streaming at {:.0}kbps ({} byte chunks every {}ms)",
             STREAM_RATE_KBPS, chunk_size_bytes, CHUNK_SIZE_MS);
@@ -321,11 +344,32 @@ impl RadioStation {
                 break;
             }
 
-            // Calculate when to send next chunk
-            let target_time = stream_start + Duration::from_millis((chunks_sent * CHUNK_SIZE_MS as u64));
+            // Precise real-time clock synchronization with microsecond precision
+            let target_time = stream_start + Duration::from_millis(chunks_sent * CHUNK_SIZE_MS as u64);
             let now = Instant::now();
+
             if target_time > now {
-                sleep(target_time - now).await;
+                // We're ahead of schedule - sleep precisely
+                let sleep_duration = target_time - now;
+
+                // For very short sleeps, use spin-waiting for sub-millisecond precision
+                if sleep_duration < Duration::from_micros(500) {
+                    // Spin-wait for microsecond precision
+                    while Instant::now() < target_time {
+                        // Yield to prevent 100% CPU usage
+                        tokio::task::yield_now().await;
+                    }
+                } else {
+                    // Use sleep for longer durations
+                    sleep(sleep_duration).await;
+                }
+            } else {
+                // We're behind schedule - check how much
+                let drift = now - target_time;
+                if drift > Duration::from_millis(5) {
+                    warn!("Streaming drift: {}ms behind schedule", drift.as_millis());
+                }
+                // Don't sleep if we're behind - catch up by sending immediately
             }
 
             // Prepare chunk
@@ -337,8 +381,28 @@ impl RadioStation {
                 self.total_bytes_sent.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                 self.current_position.store(data_index as u64, Ordering::Relaxed);
 
-                let tx = self.broadcast_tx.read().await;
-                let _ = tx.send(chunk);
+                // Use try_read to avoid blocking - critical fix for streaming gaps
+                match self.broadcast_tx.try_read() {
+                    Ok(tx) => {
+                        if let Err(_) = tx.send(chunk) {
+                            // No active listeners - not an error, just debug info
+                            debug!("No active listeners for chunk");
+                        } else {
+                            // Record successful chunk send for health monitoring
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            self.last_chunk_sent.store(now_ms, Ordering::Relaxed);
+                        }
+                    }
+                    Err(_) => {
+                        // Channel locked - don't block streaming, just warn and count gap
+                        warn!("Broadcast channel locked, continuing stream");
+                        self.stream_gaps_detected.fetch_add(1, Ordering::Relaxed);
+                        // Continue to maintain timing - don't break the stream
+                    }
+                }
             }
 
             data_index = chunk_end;
@@ -361,7 +425,42 @@ impl RadioStation {
         );
         Ok(())
     }
-    
+
+    async fn stream_track_with_recovery(&self, track: &Track) -> Result<()> {
+        let mut attempt = 0;
+        const MAX_ATTEMPTS: u32 = 3;
+
+        while attempt < MAX_ATTEMPTS {
+            attempt += 1;
+
+            match self.stream_track(track).await {
+                Ok(_) => {
+                    // Success - reset recovery counter if we had previous attempts
+                    if attempt > 1 {
+                        info!("Stream recovered successfully on attempt {}", attempt);
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.recovery_attempts.fetch_add(1, Ordering::Relaxed);
+
+                    if attempt < MAX_ATTEMPTS {
+                        warn!("Stream attempt {}/{} failed: {}. Retrying...", attempt, MAX_ATTEMPTS, e);
+
+                        // Progressive backoff: 250ms, 500ms, 750ms
+                        let delay_ms = 250 * attempt as u64;
+                        sleep(Duration::from_millis(delay_ms)).await;
+                    } else {
+                        error!("All {} stream attempts failed for track: {}", MAX_ATTEMPTS, track.title);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        Err(std::io::Error::new(std::io::ErrorKind::Other, "Maximum recovery attempts exceeded").into())
+    }
+
     pub async fn create_audio_stream(&self) -> Result<impl Stream<Item = Result<Bytes>>> {
         let listener_id = uuid::Uuid::new_v4().to_string();
         let mut receiver = self.broadcast_tx.read().await.subscribe();
@@ -381,7 +480,7 @@ impl RadioStation {
             // Build up initial buffer for smooth startup
             let mut initial_buffer = Vec::new();
             let mut buffered_bytes = 0;
-            const TARGET_BUFFER: usize = 20 * 1024; // 20KB buffer for mobile startup
+            const TARGET_BUFFER: usize = 12 * 1024; // 12KB buffer for iOS
 
             // Collect initial data with longer timeout for chunk-based streaming
             while buffered_bytes < TARGET_BUFFER {
@@ -399,7 +498,7 @@ impl RadioStation {
                     }
                     Err(_) => {
                         // Timeout - start if we have reasonable data
-                        if buffered_bytes >= 8 * 1024 { // At least 8KB
+                        if buffered_bytes >= 4 * 1024 { // At least 4KB
                             break;
                         }
                     }
