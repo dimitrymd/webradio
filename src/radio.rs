@@ -130,7 +130,9 @@ impl RadioStation {
             config.minimum_buffer_kb,
             config.minimum_buffer_kb as f64 / 24.0);
         info!("  - Chunk interval: {}ms", config.chunk_interval_ms);
-        info!("  - Burst multiplier: {}x", config.burst_multiplier);
+        info!("  - Stream rate: {:.0}% of bitrate (builds {:.0}% buffer/sec)",
+            config.stream_rate_multiplier * 100.0,
+            (config.stream_rate_multiplier - 1.0) * 100.0);
         info!("  - Broadcast capacity: {} messages", config.broadcast_channel_capacity);
 
         Ok(Self {
@@ -331,19 +333,25 @@ impl RadioStation {
         let duration_seconds = total_audio_bytes as f64 / bytes_per_second;
         let _ms_per_frame = (duration_seconds * 1000.0) / frames.len() as f64;
 
-        // Optimized streaming approach
-        const STREAM_RATE_KBPS: f64 = 192.0;  // Exact target rate
+        // CRITICAL: Stream FASTER than bitrate to build client buffers!
+        // Streaming at exact bitrate = zero headroom = buffering on any delay
+        // Stream at configurable rate (default 110%) so clients build up buffer reserves
+        let stream_rate_multiplier = self.config.stream_rate_multiplier;
+        let base_bitrate_kbps = bitrate as f64 / 1000.0;
+        let stream_rate_kbps = base_bitrate_kbps * stream_rate_multiplier;
         let chunk_size_ms = self.config.chunk_interval_ms as f64;
 
-        let stream_bytes_per_second = (STREAM_RATE_KBPS * 1000.0) / 8.0;
+        let stream_bytes_per_second = (stream_rate_kbps * 1000.0) / 8.0;
         let chunk_size_bytes = ((stream_bytes_per_second * chunk_size_ms) / 1000.0) as usize;
 
-        info!("Streaming at {:.0}kbps ({} byte chunks every {:.0}ms)",
-            STREAM_RATE_KBPS, chunk_size_bytes, chunk_size_ms);
-
-        // CRITICAL FIX: Lock broadcast channel ONCE at the start to prevent lock contention
-        // This eliminates dropped chunks that cause audio gaps
-        let tx = self.broadcast_tx.read().await;
+        info!("Streaming at {:.0}kbps ({}% of {}kbps bitrate) - {} byte chunks every {:.0}ms",
+            stream_rate_kbps,
+            (stream_rate_multiplier * 100.0) as u32,
+            base_bitrate_kbps,
+            chunk_size_bytes,
+            chunk_size_ms);
+        info!("This allows client buffer to grow by ~{:.1}% per second",
+            (stream_rate_multiplier - 1.0) * 100.0);
 
         let mut data_index = 0;
         let data_len = file_data.len();
@@ -381,7 +389,9 @@ impl RadioStation {
                 self.total_bytes_sent.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                 self.current_position.store(data_index as u64, Ordering::Relaxed);
 
-                // CRITICAL FIX: Use pre-locked tx - no more dropped chunks!
+                // Get lock just for sending - don't hold it for entire track!
+                // This allows new listeners to subscribe anytime
+                let tx = self.broadcast_tx.read().await;
                 if let Err(_) = tx.send(chunk) {
                     // No active listeners - not an error, just debug info
                     debug!("No active listeners for chunk");
@@ -393,6 +403,7 @@ impl RadioStation {
                         .as_millis() as u64;
                     self.last_chunk_sent.store(now_ms, Ordering::Relaxed);
                 }
+                // Lock released here automatically
             }
 
             data_index = chunk_end;
@@ -710,7 +721,9 @@ impl RadioStation {
                 "minimum_buffer_kb": self.config.minimum_buffer_kb,
                 "minimum_buffer_seconds": self.config.minimum_buffer_kb as f64 / 24.0,
                 "chunk_interval_ms": self.config.chunk_interval_ms,
-                "burst_multiplier": self.config.burst_multiplier,
+                "stream_rate_multiplier": self.config.stream_rate_multiplier,
+                "stream_rate_percent": self.config.stream_rate_multiplier * 100.0,
+                "buffer_growth_percent_per_sec": (self.config.stream_rate_multiplier - 1.0) * 100.0,
                 "broadcast_channel_capacity": self.config.broadcast_channel_capacity,
             },
         })
