@@ -358,10 +358,19 @@ impl RadioStation {
         let stream_start = Instant::now();
         let mut chunks_sent = 0;
 
+        // Pre-lock the broadcast channel to avoid timing interference
+        // RwLock allows multiple readers, so this doesn't block other operations
+        let tx = self.broadcast_tx.read().await;
+
         while data_index < data_len {
             if !self.is_broadcasting.load(Ordering::Relaxed) {
                 break;
             }
+
+            // Prepare chunk BEFORE timing check for maximum precision
+            let chunk_end = (data_index + chunk_size_bytes).min(data_len);
+            let chunk_data = file_data[data_index..chunk_end].to_vec();
+            let chunk = Bytes::from(chunk_data);
 
             // Real-time clock synchronization (millisecond precision is sufficient for audio)
             let target_time = stream_start + Duration::from_millis((chunks_sent as f64 * chunk_size_ms) as u64);
@@ -380,18 +389,11 @@ impl RadioStation {
                 // Don't sleep if we're behind - catch up by sending immediately
             }
 
-            // Prepare chunk
-            let chunk_end = (data_index + chunk_size_bytes).min(data_len);
-            let chunk_data = file_data[data_index..chunk_end].to_vec();
-
-            if !chunk_data.is_empty() {
-                let chunk = Bytes::from(chunk_data);
+            if !chunk.is_empty() {
                 self.total_bytes_sent.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                 self.current_position.store(data_index as u64, Ordering::Relaxed);
 
-                // Get lock just for sending - don't hold it for entire track!
-                // This allows new listeners to subscribe anytime
-                let tx = self.broadcast_tx.read().await;
+                // Send immediately - no lock acquisition delay!
                 if let Err(_) = tx.send(chunk) {
                     // No active listeners - not an error, just debug info
                     debug!("No active listeners for chunk");
@@ -403,7 +405,6 @@ impl RadioStation {
                         .as_millis() as u64;
                     self.last_chunk_sent.store(now_ms, Ordering::Relaxed);
                 }
-                // Lock released here automatically
             }
 
             data_index = chunk_end;
