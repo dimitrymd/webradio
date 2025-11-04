@@ -10,7 +10,6 @@ pub struct Config {
     pub initial_buffer_kb: usize,      // Initial buffer size for new listeners (KB)
     pub minimum_buffer_kb: usize,      // Minimum buffer before starting playback (KB)
     pub chunk_interval_ms: u64,        // Interval between chunks (milliseconds)
-    pub burst_multiplier: f64,         // Burst speed multiplier for initial buffering (deprecated - now instant)
     pub stream_rate_multiplier: f64,   // Stream faster than bitrate to build client buffers (1.10 = 10% faster)
     pub initial_buffer_timeout_ms: u64, // Timeout for initial buffer collection
     pub broadcast_channel_capacity: usize, // Capacity of broadcast channel
@@ -43,11 +42,6 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100),  // 100ms chunks (iOS compatible)
-
-            burst_multiplier: std::env::var("BURST_MULTIPLIER")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2.0),  // Deprecated - now instant burst
 
             stream_rate_multiplier: std::env::var("STREAM_RATE_MULTIPLIER")
                 .ok()
