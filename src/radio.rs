@@ -482,6 +482,7 @@ impl RadioStation {
         let target_buffer = self.config.initial_buffer_kb * 1024;
         let minimum_buffer = self.config.minimum_buffer_kb * 1024;
         let buffer_timeout = Duration::from_millis(self.config.initial_buffer_timeout_ms);
+        let chunk_interval = Duration::from_millis(self.config.chunk_interval_ms);
 
         Ok(async_stream::stream! {
             // Phase 1: Build up initial buffer for smooth startup
@@ -546,8 +547,9 @@ impl RadioStation {
             info!("Listener {} burst complete, entering sustain phase", &listener_id[..8]);
 
             // Phase 3: SUSTAIN - Normal streaming with gap detection
-            // Use timeout to detect server-side gaps quickly (2x chunk interval)
-            let chunk_timeout = Duration::from_millis(buffer_timeout.as_millis() as u64 / 3); // Use 1/3 of buffer timeout
+            // Use timeout of 5x chunk interval to detect gaps quickly but avoid false positives
+            // 100ms chunks * 5 = 500ms timeout (much better than the old 2000ms!)
+            let chunk_timeout = chunk_interval * 5;
 
             loop {
                 // Wait for chunk with timeout to detect gaps quickly
