@@ -77,14 +77,14 @@ fn calculate_mp3_frame_size(header: u32) -> Option<usize> {
 }
 
 pub struct RadioStation {
-    _config: Config,
+    config: Config,  // Changed from _config to config (used now)
     playlist: Arc<RwLock<Playlist>>,
     current_track: Arc<ArcSwap<Option<Track>>>,
-    
+
     // Broadcasting
     broadcast_tx: Arc<RwLock<broadcast::Sender<Bytes>>>,
     is_broadcasting: Arc<AtomicBool>,
-    
+
     // Statistics
     listeners: Arc<DashMap<String, ListenerInfo>>,
     total_bytes_sent: Arc<AtomicU64>,
@@ -117,15 +117,24 @@ impl RadioStation {
         // Load playlist
         let playlist = Playlist::load_or_scan(&config.music_dir).await?;
         info!("Loaded {} tracks", playlist.tracks.len());
-        
-        // Create broadcast channel with much larger capacity to handle timing variations
-        // At 192kbps, we send ~24KB/s. With 240-byte chunks, that's 100 messages/second
-        // 5 minutes = 300 seconds = 30,000 messages. Use 32K to be safe.
-        let (broadcast_tx, _) = broadcast::channel(32768);
+
+        // Create broadcast channel with configurable capacity
+        let (broadcast_tx, _) = broadcast::channel(config.broadcast_channel_capacity);
         let (shutdown_tx, _) = broadcast::channel(1);
-        
+
+        info!("Streaming configuration:");
+        info!("  - Initial buffer: {}KB (~{:.1}s at 192kbps)",
+            config.initial_buffer_kb,
+            config.initial_buffer_kb as f64 / 24.0);
+        info!("  - Minimum buffer: {}KB (~{:.1}s at 192kbps)",
+            config.minimum_buffer_kb,
+            config.minimum_buffer_kb as f64 / 24.0);
+        info!("  - Chunk interval: {}ms", config.chunk_interval_ms);
+        info!("  - Burst multiplier: {}x", config.burst_multiplier);
+        info!("  - Broadcast capacity: {} messages", config.broadcast_channel_capacity);
+
         Ok(Self {
-            _config: config,
+            config,  // Store config for use in streaming
             playlist: Arc::new(RwLock::new(playlist)),
             current_track: Arc::new(ArcSwap::from_pointee(None)),
             broadcast_tx: Arc::new(RwLock::new(broadcast_tx)),
@@ -322,17 +331,19 @@ impl RadioStation {
         let duration_seconds = total_audio_bytes as f64 / bytes_per_second;
         let _ms_per_frame = (duration_seconds * 1000.0) / frames.len() as f64;
 
-        // iOS-optimized streaming approach
-        // Much smaller chunks for iOS Safari compatibility
+        // Optimized streaming approach
         const STREAM_RATE_KBPS: f64 = 192.0;  // Exact target rate
-        const CHUNK_SIZE_MS: f64 = 100.0;     // 100ms chunks for iOS compatibility
+        let chunk_size_ms = self.config.chunk_interval_ms as f64;
 
         let stream_bytes_per_second = (STREAM_RATE_KBPS * 1000.0) / 8.0;
-        let chunk_size_bytes = ((stream_bytes_per_second * CHUNK_SIZE_MS) / 1000.0) as usize;
-        let _chunk_interval = Duration::from_millis(CHUNK_SIZE_MS as u64);
+        let chunk_size_bytes = ((stream_bytes_per_second * chunk_size_ms) / 1000.0) as usize;
 
-        info!("Streaming at {:.0}kbps ({} byte chunks every {}ms)",
-            STREAM_RATE_KBPS, chunk_size_bytes, CHUNK_SIZE_MS);
+        info!("Streaming at {:.0}kbps ({} byte chunks every {:.0}ms)",
+            STREAM_RATE_KBPS, chunk_size_bytes, chunk_size_ms);
+
+        // CRITICAL FIX: Lock broadcast channel ONCE at the start to prevent lock contention
+        // This eliminates dropped chunks that cause audio gaps
+        let tx = self.broadcast_tx.read().await;
 
         let mut data_index = 0;
         let data_len = file_data.len();
@@ -344,25 +355,14 @@ impl RadioStation {
                 break;
             }
 
-            // Precise real-time clock synchronization with microsecond precision
-            let target_time = stream_start + Duration::from_millis(chunks_sent * CHUNK_SIZE_MS as u64);
+            // Real-time clock synchronization (millisecond precision is sufficient for audio)
+            let target_time = stream_start + Duration::from_millis((chunks_sent as f64 * chunk_size_ms) as u64);
             let now = Instant::now();
 
             if target_time > now {
-                // We're ahead of schedule - sleep precisely
+                // We're ahead of schedule - sleep until target time
                 let sleep_duration = target_time - now;
-
-                // For very short sleeps, use spin-waiting for sub-millisecond precision
-                if sleep_duration < Duration::from_micros(500) {
-                    // Spin-wait for microsecond precision
-                    while Instant::now() < target_time {
-                        // Yield to prevent 100% CPU usage
-                        tokio::task::yield_now().await;
-                    }
-                } else {
-                    // Use sleep for longer durations
-                    sleep(sleep_duration).await;
-                }
+                sleep(sleep_duration).await;
             } else {
                 // We're behind schedule - check how much
                 let drift = now - target_time;
@@ -381,27 +381,17 @@ impl RadioStation {
                 self.total_bytes_sent.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                 self.current_position.store(data_index as u64, Ordering::Relaxed);
 
-                // Use try_read to avoid blocking - critical fix for streaming gaps
-                match self.broadcast_tx.try_read() {
-                    Ok(tx) => {
-                        if let Err(_) = tx.send(chunk) {
-                            // No active listeners - not an error, just debug info
-                            debug!("No active listeners for chunk");
-                        } else {
-                            // Record successful chunk send for health monitoring
-                            let now_ms = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as u64;
-                            self.last_chunk_sent.store(now_ms, Ordering::Relaxed);
-                        }
-                    }
-                    Err(_) => {
-                        // Channel locked - don't block streaming, just warn and count gap
-                        warn!("Broadcast channel locked, continuing stream");
-                        self.stream_gaps_detected.fetch_add(1, Ordering::Relaxed);
-                        // Continue to maintain timing - don't break the stream
-                    }
+                // CRITICAL FIX: Use pre-locked tx - no more dropped chunks!
+                if let Err(_) = tx.send(chunk) {
+                    // No active listeners - not an error, just debug info
+                    debug!("No active listeners for chunk");
+                } else {
+                    // Record successful chunk send for health monitoring
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    self.last_chunk_sent.store(now_ms, Ordering::Relaxed);
                 }
             }
 
@@ -476,15 +466,26 @@ impl RadioStation {
 
         info!("New audio listener connected: {} (total: {})", &listener_id[..8], current_count);
 
+        // Clone config values for use in the stream
+        let target_buffer = self.config.initial_buffer_kb * 1024;
+        let minimum_buffer = self.config.minimum_buffer_kb * 1024;
+        let buffer_timeout = Duration::from_millis(self.config.initial_buffer_timeout_ms);
+        let burst_multiplier = self.config.burst_multiplier;
+
         Ok(async_stream::stream! {
-            // Build up initial buffer for smooth startup
+            // Phase 1: Build up initial buffer for smooth startup
             let mut initial_buffer = Vec::new();
             let mut buffered_bytes = 0;
-            const TARGET_BUFFER: usize = 12 * 1024; // 12KB buffer for iOS
 
-            // Collect initial data with longer timeout for chunk-based streaming
-            while buffered_bytes < TARGET_BUFFER {
-                match tokio::time::timeout(Duration::from_millis(600), receiver.recv()).await {
+            info!("Listener {} collecting {}KB buffer (minimum: {}KB, timeout: {}ms)",
+                &listener_id[..8],
+                target_buffer / 1024,
+                minimum_buffer / 1024,
+                buffer_timeout.as_millis());
+
+            // Collect initial data with configurable timeout
+            while buffered_bytes < target_buffer {
+                match tokio::time::timeout(buffer_timeout, receiver.recv()).await {
                     Ok(Ok(chunk)) => {
                         buffered_bytes += chunk.len();
                         initial_buffer.push(chunk);
@@ -497,25 +498,55 @@ impl RadioStation {
                         break;
                     }
                     Err(_) => {
-                        // Timeout - start if we have reasonable data
-                        if buffered_bytes >= 4 * 1024 { // At least 4KB
+                        // Timeout - start if we have minimum required data
+                        if buffered_bytes >= minimum_buffer {
+                            info!("Buffer timeout reached, starting with {}KB (minimum met)",
+                                buffered_bytes / 1024);
                             break;
+                        } else {
+                            warn!("Buffer timeout with only {}KB (minimum {}KB not met), collecting more...",
+                                buffered_bytes / 1024,
+                                minimum_buffer / 1024);
+                            // Continue collecting - we need the minimum
                         }
                     }
                 }
             }
 
-            info!("Listener {} starting with {} KB buffer", &listener_id[..8], buffered_bytes / 1024);
+            info!("Listener {} starting playback with {} KB buffer ({} chunks)",
+                &listener_id[..8],
+                buffered_bytes / 1024,
+                initial_buffer.len());
 
-            // Send buffered chunks
-            for chunk in initial_buffer {
+            // Phase 2: BURST - Send initial buffer at accelerated rate
+            // This quickly fills the client's audio buffer
+            let burst_count = (initial_buffer.len() as f64 * 0.5) as usize; // Burst first 50%
+            let burst_delay = if burst_multiplier > 1.0 {
+                // Calculate delay for burst speed (e.g., 2x = half the normal delay)
+                // Assuming 100ms normal interval
+                Duration::from_millis((100.0 / burst_multiplier) as u64)
+            } else {
+                Duration::from_millis(0) // No delay if burst disabled
+            };
+
+            info!("Listener {} bursting first {} chunks at {}x speed",
+                &listener_id[..8], burst_count, burst_multiplier);
+
+            for (idx, chunk) in initial_buffer.iter().enumerate() {
                 if let Some(mut info) = listeners.get_mut(&listener_id) {
                     info.bytes_received += chunk.len() as u64;
                 }
-                yield Ok(chunk);
+                yield Ok(chunk.clone());
+
+                // Add delay for burst phase
+                if idx < burst_count && burst_delay > Duration::from_millis(0) {
+                    tokio::time::sleep(burst_delay).await;
+                }
             }
 
-            // Continue with normal streaming
+            info!("Listener {} burst complete, entering sustain phase", &listener_id[..8]);
+
+            // Phase 3: SUSTAIN - Normal streaming with recovery
             loop {
                 match receiver.recv().await {
                     Ok(chunk) => {
@@ -526,9 +557,26 @@ impl RadioStation {
                         yield Ok(chunk);
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!("Listener {} lagged by {} messages, catching up", &listener_id[..8], skipped);
-                        // Just continue - the lagged messages are already skipped
-                        continue;
+                        warn!("Listener {} lagged by {} messages, attempting recovery",
+                            &listener_id[..8], skipped);
+
+                        // Attempt to recover by getting fresh data
+                        match tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await {
+                            Ok(Ok(chunk)) => {
+                                if let Some(mut info) = listeners.get_mut(&listener_id) {
+                                    info.bytes_received += chunk.len() as u64;
+                                }
+                                yield Ok(chunk);
+                            }
+                            Ok(Err(_)) => {
+                                warn!("Listener {} recovery failed, disconnecting", &listener_id[..8]);
+                                break;
+                            }
+                            Err(_) => {
+                                warn!("Listener {} recovery timeout, disconnecting", &listener_id[..8]);
+                                break;
+                            }
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         info!("Broadcast closed for listener {}", &listener_id[..8]);
@@ -612,13 +660,44 @@ impl RadioStation {
                 })
             })
             .collect();
-        
+
+        // Calculate time since last chunk sent
+        let last_chunk_ms = self.last_chunk_sent.load(Ordering::Relaxed);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let ms_since_last_chunk = if last_chunk_ms > 0 {
+            now_ms.saturating_sub(last_chunk_ms)
+        } else {
+            0
+        };
+
         serde_json::json!({
             "uptime_seconds": self.uptime_seconds(),
             "total_mb_sent": total_mb,
             "current_listeners": self.listener_count(),
             "is_broadcasting": self.is_broadcasting.load(Ordering::Relaxed),
             "listeners": listeners,
+
+            // Stream health metrics
+            "stream_health": {
+                "gaps_detected": self.stream_gaps_detected.load(Ordering::Relaxed),
+                "recovery_attempts": self.recovery_attempts.load(Ordering::Relaxed),
+                "ms_since_last_chunk": ms_since_last_chunk,
+                "is_streaming": ms_since_last_chunk < 500, // Healthy if chunk sent in last 500ms
+            },
+
+            // Buffer configuration
+            "buffer_config": {
+                "initial_buffer_kb": self.config.initial_buffer_kb,
+                "initial_buffer_seconds": self.config.initial_buffer_kb as f64 / 24.0,
+                "minimum_buffer_kb": self.config.minimum_buffer_kb,
+                "minimum_buffer_seconds": self.config.minimum_buffer_kb as f64 / 24.0,
+                "chunk_interval_ms": self.config.chunk_interval_ms,
+                "burst_multiplier": self.config.burst_multiplier,
+                "broadcast_channel_capacity": self.config.broadcast_channel_capacity,
+            },
         })
     }
     
