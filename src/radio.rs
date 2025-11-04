@@ -470,7 +470,6 @@ impl RadioStation {
         let target_buffer = self.config.initial_buffer_kb * 1024;
         let minimum_buffer = self.config.minimum_buffer_kb * 1024;
         let buffer_timeout = Duration::from_millis(self.config.initial_buffer_timeout_ms);
-        let burst_multiplier = self.config.burst_multiplier;
 
         Ok(async_stream::stream! {
             // Phase 1: Build up initial buffer for smooth startup
@@ -518,69 +517,85 @@ impl RadioStation {
                 buffered_bytes / 1024,
                 initial_buffer.len());
 
-            // Phase 2: BURST - Send initial buffer at accelerated rate
-            // This quickly fills the client's audio buffer
-            let burst_count = (initial_buffer.len() as f64 * 0.5) as usize; // Burst first 50%
-            let burst_delay = if burst_multiplier > 1.0 {
-                // Calculate delay for burst speed (e.g., 2x = half the normal delay)
-                // Assuming 100ms normal interval
-                Duration::from_millis((100.0 / burst_multiplier) as u64)
-            } else {
-                Duration::from_millis(0) // No delay if burst disabled
-            };
+            // Phase 2: BURST - Send ALL initial buffer immediately (no delays!)
+            // The "burst" happens naturally by sending all buffered chunks at once
+            // The client's TCP buffer and audio decoder handle the rapid delivery
+            info!("Listener {} bursting {} chunks immediately (no delays)",
+                &listener_id[..8], initial_buffer.len());
 
-            info!("Listener {} bursting first {} chunks at {}x speed",
-                &listener_id[..8], burst_count, burst_multiplier);
-
-            for (idx, chunk) in initial_buffer.iter().enumerate() {
+            for chunk in initial_buffer {
                 if let Some(mut info) = listeners.get_mut(&listener_id) {
                     info.bytes_received += chunk.len() as u64;
                 }
-                yield Ok(chunk.clone());
-
-                // Add delay for burst phase
-                if idx < burst_count && burst_delay > Duration::from_millis(0) {
-                    tokio::time::sleep(burst_delay).await;
-                }
+                yield Ok(chunk);
+                // NO DELAYS - send all buffered data immediately!
             }
 
             info!("Listener {} burst complete, entering sustain phase", &listener_id[..8]);
 
-            // Phase 3: SUSTAIN - Normal streaming with recovery
+            // Phase 3: SUSTAIN - Normal streaming with gap detection
+            // Use timeout to detect server-side gaps quickly (2x chunk interval)
+            let chunk_timeout = Duration::from_millis(buffer_timeout.as_millis() as u64 / 3); // Use 1/3 of buffer timeout
+
             loop {
-                match receiver.recv().await {
-                    Ok(chunk) => {
-                        // Update listener stats
+                // Wait for chunk with timeout to detect gaps quickly
+                match tokio::time::timeout(chunk_timeout, receiver.recv()).await {
+                    Ok(Ok(chunk)) => {
+                        // Normal chunk received
                         if let Some(mut info) = listeners.get_mut(&listener_id) {
                             info.bytes_received += chunk.len() as u64;
                         }
                         yield Ok(chunk);
                     }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
                         warn!("Listener {} lagged by {} messages, attempting recovery",
                             &listener_id[..8], skipped);
 
-                        // Attempt to recover by getting fresh data
-                        match tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await {
+                        // Attempt immediate recovery by getting fresh data
+                        match tokio::time::timeout(Duration::from_millis(500), receiver.recv()).await {
                             Ok(Ok(chunk)) => {
+                                info!("Listener {} recovered successfully", &listener_id[..8]);
                                 if let Some(mut info) = listeners.get_mut(&listener_id) {
                                     info.bytes_received += chunk.len() as u64;
                                 }
                                 yield Ok(chunk);
+                                continue; // Continue normal streaming
                             }
                             Ok(Err(_)) => {
-                                warn!("Listener {} recovery failed, disconnecting", &listener_id[..8]);
+                                error!("Listener {} recovery failed - broadcast closed", &listener_id[..8]);
                                 break;
                             }
                             Err(_) => {
-                                warn!("Listener {} recovery timeout, disconnecting", &listener_id[..8]);
+                                error!("Listener {} recovery timeout - no data available", &listener_id[..8]);
                                 break;
                             }
                         }
                     }
-                    Err(broadcast::error::RecvError::Closed) => {
+                    Ok(Err(broadcast::error::RecvError::Closed)) => {
                         info!("Broadcast closed for listener {}", &listener_id[..8]);
                         break;
+                    }
+                    Err(_) => {
+                        // Timeout - no chunk received in expected time
+                        error!("Listener {} detected gap - no chunk for {}ms!",
+                            &listener_id[..8],
+                            chunk_timeout.as_millis());
+
+                        // Try one more time before giving up
+                        match tokio::time::timeout(Duration::from_secs(1), receiver.recv()).await {
+                            Ok(Ok(chunk)) => {
+                                warn!("Listener {} gap recovered", &listener_id[..8]);
+                                if let Some(mut info) = listeners.get_mut(&listener_id) {
+                                    info.bytes_received += chunk.len() as u64;
+                                }
+                                yield Ok(chunk);
+                                continue;
+                            }
+                            _ => {
+                                error!("Listener {} giving up after prolonged gap", &listener_id[..8]);
+                                break;
+                            }
+                        }
                     }
                 }
             }
