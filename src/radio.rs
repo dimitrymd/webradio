@@ -96,10 +96,6 @@ pub struct RadioStation {
     stream_gaps_detected: Arc<AtomicU32>,
     recovery_attempts: Arc<AtomicU32>,
 
-    // Track Preloading (prevent transition gaps)
-    next_track_data: Arc<RwLock<Option<Vec<u8>>>>,
-    next_track_info: Arc<RwLock<Option<Track>>>,
-
     // Control
     shutdown_tx: broadcast::Sender<()>,
 }
@@ -150,10 +146,6 @@ impl RadioStation {
             last_chunk_sent: Arc::new(AtomicU64::new(0)),
             stream_gaps_detected: Arc::new(AtomicU32::new(0)),
             recovery_attempts: Arc::new(AtomicU32::new(0)),
-
-            // Initialize track preloading
-            next_track_data: Arc::new(RwLock::new(None)),
-            next_track_info: Arc::new(RwLock::new(None)),
 
             shutdown_tx,
         })
