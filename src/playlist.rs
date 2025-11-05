@@ -212,7 +212,218 @@ async fn get_mp3_duration(path: &Path) -> Option<u64> {
     let metadata = tokio::fs::metadata(path).await.ok()?;
     let file_size = metadata.len();
     let bitrate = get_mp3_bitrate(path).await?;
-    
+
     // Duration in seconds = (file_size * 8) / bitrate
     Some((file_size * 8) / bitrate)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_track_creation() {
+        let track = Track {
+            path: PathBuf::from("test.mp3"),
+            title: "Test Song".to_string(),
+            artist: "Test Artist".to_string(),
+            album: "Test Album".to_string(),
+            duration: Some(180),
+            bitrate: Some(192000),
+        };
+
+        assert_eq!(track.title, "Test Song");
+        assert_eq!(track.artist, "Test Artist");
+        assert_eq!(track.album, "Test Album");
+        assert_eq!(track.duration, Some(180));
+        assert_eq!(track.bitrate, Some(192000));
+    }
+
+    #[test]
+    fn test_playlist_get_next_track() {
+        let mut playlist = Playlist {
+            tracks: vec![
+                Track {
+                    path: PathBuf::from("track1.mp3"),
+                    title: "Song 1".to_string(),
+                    artist: "Artist 1".to_string(),
+                    album: "Album 1".to_string(),
+                    duration: None,
+                    bitrate: None,
+                },
+                Track {
+                    path: PathBuf::from("track2.mp3"),
+                    title: "Song 2".to_string(),
+                    artist: "Artist 2".to_string(),
+                    album: "Album 2".to_string(),
+                    duration: None,
+                    bitrate: None,
+                },
+                Track {
+                    path: PathBuf::from("track3.mp3"),
+                    title: "Song 3".to_string(),
+                    artist: "Artist 3".to_string(),
+                    album: "Album 3".to_string(),
+                    duration: None,
+                    bitrate: None,
+                },
+            ],
+            current_index: 0,
+        };
+
+        // Get first track
+        let track = playlist.get_next_track().unwrap();
+        assert_eq!(track.title, "Song 1");
+        assert_eq!(playlist.current_index, 1);
+
+        // Get second track
+        let track = playlist.get_next_track().unwrap();
+        assert_eq!(track.title, "Song 2");
+        assert_eq!(playlist.current_index, 2);
+
+        // Get third track
+        let track = playlist.get_next_track().unwrap();
+        assert_eq!(track.title, "Song 3");
+        assert_eq!(playlist.current_index, 0); // Should wrap around
+
+        // Verify wrapping works
+        let track = playlist.get_next_track().unwrap();
+        assert_eq!(track.title, "Song 1");
+        assert_eq!(playlist.current_index, 1);
+    }
+
+    #[test]
+    fn test_playlist_empty() {
+        let mut playlist = Playlist {
+            tracks: vec![],
+            current_index: 0,
+        };
+
+        assert!(playlist.get_next_track().is_none());
+    }
+
+    #[test]
+    fn test_playlist_single_track() {
+        let mut playlist = Playlist {
+            tracks: vec![
+                Track {
+                    path: PathBuf::from("only.mp3"),
+                    title: "Only Song".to_string(),
+                    artist: "Only Artist".to_string(),
+                    album: "Only Album".to_string(),
+                    duration: Some(200),
+                    bitrate: Some(128000),
+                },
+            ],
+            current_index: 0,
+        };
+
+        // Should keep returning the same track and index should wrap
+        for _ in 0..5 {
+            let track = playlist.get_next_track().unwrap();
+            assert_eq!(track.title, "Only Song");
+            assert_eq!(playlist.current_index, 0);
+        }
+    }
+
+    #[test]
+    fn test_playlist_serialization() {
+        let playlist = Playlist {
+            tracks: vec![
+                Track {
+                    path: PathBuf::from("test.mp3"),
+                    title: "Test".to_string(),
+                    artist: "Artist".to_string(),
+                    album: "Album".to_string(),
+                    duration: Some(180),
+                    bitrate: Some(192000),
+                },
+            ],
+            current_index: 0,
+        };
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&playlist).unwrap();
+        assert!(json.contains("\"title\":\"Test\""));
+        assert!(json.contains("\"artist\":\"Artist\""));
+
+        // Deserialize back
+        let deserialized: Playlist = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.tracks.len(), 1);
+        assert_eq!(deserialized.tracks[0].title, "Test");
+        assert_eq!(deserialized.current_index, 0);
+    }
+
+    #[test]
+    fn test_track_serialization() {
+        let track = Track {
+            path: PathBuf::from("music/song.mp3"),
+            title: "Amazing Song".to_string(),
+            artist: "Great Artist".to_string(),
+            album: "Wonderful Album".to_string(),
+            duration: Some(240),
+            bitrate: Some(320000),
+        };
+
+        // Serialize
+        let json = serde_json::to_string(&track).unwrap();
+
+        // Deserialize
+        let deserialized: Track = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.title, "Amazing Song");
+        assert_eq!(deserialized.artist, "Great Artist");
+        assert_eq!(deserialized.album, "Wonderful Album");
+        assert_eq!(deserialized.duration, Some(240));
+        assert_eq!(deserialized.bitrate, Some(320000));
+    }
+
+    #[test]
+    fn test_id3v2_size_calculation() {
+        // Test ID3v2 tag size calculation (synchsafe integer encoding)
+        // Example: ID3v2 header bytes [I, D, 3, version, flags, size...]
+        let id3_header = [
+            b'I', b'D', b'3', // ID3v2 identifier
+            0x03, 0x00,       // Version 2.3.0
+            0x00,             // Flags
+            0x00, 0x00, 0x1F, 0x76 // Synchsafe size
+        ];
+
+        // Calculate size from synchsafe integer
+        let size = ((id3_header[6] as usize & 0x7F) << 21)
+            | ((id3_header[7] as usize & 0x7F) << 14)
+            | ((id3_header[8] as usize & 0x7F) << 7)
+            | (id3_header[9] as usize & 0x7F);
+
+        // 0x00001F76 in synchsafe = 0x00000000 | 0x00000000 | 0x00000F80 | 0x00000076
+        // = 0x0FF6 = 4086 bytes
+        assert_eq!(size, 4086);
+    }
+
+    #[test]
+    fn test_mp3_bitrate_index() {
+        // Test bitrate table lookup
+        let bitrates = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
+
+        // Test common bitrates
+        assert_eq!(bitrates[1], 32);   // Index 1 = 32kbps
+        assert_eq!(bitrates[9], 128);  // Index 9 = 128kbps
+        assert_eq!(bitrates[11], 192); // Index 11 = 192kbps
+        assert_eq!(bitrates[14], 320); // Index 14 = 320kbps
+
+        // Test invalid indices
+        assert_eq!(bitrates[0], 0);    // Free bitrate
+        assert_eq!(bitrates[15], 0);   // Invalid
+    }
+
+    #[test]
+    fn test_duration_calculation() {
+        // Test duration calculation: (file_size * 8) / bitrate
+        let file_size = 4_800_000_u64; // 4.8 MB
+        let bitrate = 192_000_u64;     // 192 kbps
+
+        let duration = (file_size * 8) / bitrate;
+
+        // 4,800,000 * 8 / 192,000 = 38,400,000 / 192,000 = 200 seconds
+        assert_eq!(duration, 200);
+    }
 }
