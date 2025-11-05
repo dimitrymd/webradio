@@ -394,17 +394,36 @@
                 playBtn.textContent = 'Play';
                 playBtn.classList.remove('playing');
             } else {
-                // Start playing with mobile-optimized settings
-                audioPlayer.preload = 'none';  // Don't preload, stream directly
+                // Start playing with optimized settings
+                const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+                const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
 
-                // Mobile-specific optimizations
-                if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
+                // iOS-specific optimizations - allow buffering ahead
+                if (isIOS) {
+                    audioPlayer.preload = 'auto';  // Allow iOS to buffer ahead
                     audioPlayer.crossOrigin = 'anonymous';
-                    // Ensure mobile browsers don't pause on background
                     audioPlayer.setAttribute('playsinline', 'true');
+                    audioPlayer.setAttribute('x-webkit-airplay', 'allow');
+
+                    // Request persistent audio session for iOS
+                    if ('mediaSession' in navigator) {
+                        navigator.mediaSession.metadata = new MediaMetadata({
+                            title: 'WebRadio Stream',
+                            artist: 'ChillOut Radio',
+                            artwork: []
+                        });
+                    }
+                } else if (isMobile) {
+                    audioPlayer.preload = 'auto';
+                    audioPlayer.crossOrigin = 'anonymous';
+                    audioPlayer.setAttribute('playsinline', 'true');
+                } else {
+                    audioPlayer.preload = 'auto';  // Desktop: allow buffering
                 }
 
-                audioPlayer.src = '/stream?t=' + Date.now() + '&client=' + Math.random().toString(36).substr(2, 9);
+                // Add mobile indicator to stream URL for server-side optimization
+                const clientType = isIOS ? 'ios' : (isMobile ? 'mobile' : 'desktop');
+                audioPlayer.src = '/stream?t=' + Date.now() + '&client=' + Math.random().toString(36).substr(2, 9) + '&type=' + clientType;
 
                 const playPromise = audioPlayer.play();
                 if (playPromise !== undefined) {

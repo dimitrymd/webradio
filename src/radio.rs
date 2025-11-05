@@ -455,7 +455,7 @@ impl RadioStation {
         Err(std::io::Error::new(std::io::ErrorKind::Other, "Maximum recovery attempts exceeded").into())
     }
 
-    pub async fn create_audio_stream(&self) -> Result<impl Stream<Item = Result<Bytes>>> {
+    pub async fn create_audio_stream(&self, is_ios: bool) -> Result<impl Stream<Item = Result<Bytes>>> {
         let listener_id = uuid::Uuid::new_v4().to_string();
         let mut receiver = self.broadcast_tx.read().await.subscribe();
 
@@ -468,12 +468,28 @@ impl RadioStation {
         let listeners = self.listeners.clone();
         let current_count = self.listener_count();
 
-        info!("New audio listener connected: {} (total: {})", &listener_id[..8], current_count);
+        info!("New audio listener connected: {} (total: {}, iOS: {})", &listener_id[..8], current_count, is_ios);
 
         // Clone config values for use in the stream
-        let target_buffer = self.config.initial_buffer_kb * 1024;
-        let minimum_buffer = self.config.minimum_buffer_kb * 1024;
-        let buffer_timeout = Duration::from_millis(self.config.initial_buffer_timeout_ms);
+        // iOS devices need larger buffers due to aggressive power management
+        let target_buffer = if is_ios {
+            self.config.initial_buffer_kb * 1024 * 2  // Double buffer for iOS (240KB = ~10 seconds)
+        } else {
+            self.config.initial_buffer_kb * 1024
+        };
+
+        let minimum_buffer = if is_ios {
+            self.config.minimum_buffer_kb * 1024 * 2  // Double minimum for iOS (160KB = ~6.6 seconds)
+        } else {
+            self.config.minimum_buffer_kb * 1024
+        };
+
+        let buffer_timeout = if is_ios {
+            Duration::from_millis(self.config.initial_buffer_timeout_ms * 2)  // 12 seconds for iOS
+        } else {
+            Duration::from_millis(self.config.initial_buffer_timeout_ms)
+        };
+
         let chunk_interval = Duration::from_millis(self.config.chunk_interval_ms);
 
         Ok(async_stream::stream! {
