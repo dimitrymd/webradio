@@ -246,6 +246,7 @@ async fn index() -> Html<&'static str> {
 async fn audio_stream(
     State(station): State<AppState>,
     headers: axum::http::HeaderMap,
+    query: axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response, AppError> {
     // Log request details to debug multiple connections
     let user_agent = headers.get("user-agent")
@@ -254,11 +255,15 @@ async fn audio_stream(
     let range = headers.get("range")
         .and_then(|v| v.to_str().ok());
 
+    // Check client type from query parameter
+    let client_type = query.get("type").map(|s| s.as_str()).unwrap_or("unknown");
+    let is_ios = client_type == "ios" || user_agent.contains("iPhone") || user_agent.contains("iPad");
+
     // Check if this is Safari doing its probe
     let is_safari = user_agent.contains("Safari") && !user_agent.contains("Chrome");
 
-    info!("New audio stream request from: {} (range: {:?}, safari: {})",
-        user_agent, range, is_safari);
+    info!("New audio stream request from: {} (type: {}, range: {:?}, safari: {}, ios: {})",
+        user_agent, client_type, range, is_safari, is_ios);
 
     // For range requests from Safari, we need to handle them specially
     // Safari won't play the stream unless we respond to its range probe
@@ -278,7 +283,7 @@ async fn audio_stream(
         info!("Converting range request to normal stream");
     }
 
-    let stream = station.create_audio_stream().await?;
+    let stream = station.create_audio_stream(is_ios).await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
