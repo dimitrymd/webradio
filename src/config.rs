@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+/// Configuration for the WebRadio server
+/// Can be loaded from environment variables using `Config::from_env()`
 #[derive(Debug, Clone)]
 pub struct Config {
     pub host: String,
