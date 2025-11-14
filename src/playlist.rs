@@ -1,8 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::fs::File;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tracing::{info, warn};
-use id3::TagLike;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
+use symphonia::core::formats::FormatOptions;
 
 use crate::error::Result;
 
@@ -104,32 +108,23 @@ impl Playlist {
         
         async fn create_track_from_file(path: &Path, base_dir: &Path) -> Option<Track> {
             let relative_path = path.strip_prefix(base_dir).ok()?;
-            
-            // Extract metadata if possible
-            let (title, artist, album) = match id3::Tag::read_from_path(path) {
-                Ok(tag) => (
-                    tag.title().unwrap_or("Unknown").to_string(),
-                    tag.artist().unwrap_or("Unknown").to_string(),
-                    tag.album().unwrap_or("Unknown").to_string(),
-                ),
-                Err(_) => {
+
+            // Use symphonia to extract all metadata efficiently in one pass
+            let (title, artist, album, duration, bitrate) = match extract_metadata_with_symphonia(path) {
+                Some(metadata) => metadata,
+                None => {
+                    // Fallback: use filename as title
                     let title = path.file_stem()?.to_string_lossy().to_string();
-                    ("Unknown".to_string(), "Unknown".to_string(), title)
+                    (title, "Unknown".to_string(), "Unknown".to_string(), None, None)
                 }
             };
-            
-            // Get actual bitrate from MP3 file
-            let bitrate = get_mp3_bitrate(path).await;
-            
-            // Get duration if possible
-            let duration = get_mp3_duration(path).await;
-            
-            info!("Track: {} - Bitrate: {}kbps, Duration: {}s", 
-                relative_path.display(), 
+
+            info!("Track: {} - Bitrate: {}kbps, Duration: {}s",
+                relative_path.display(),
                 bitrate.unwrap_or(0) / 1000,
                 duration.unwrap_or(0)
             );
-            
+
             Some(Track {
                 path: relative_path.to_path_buf(),
                 title,
@@ -161,60 +156,83 @@ impl Playlist {
     }
 }
 
-// Helper function to get MP3 bitrate
-async fn get_mp3_bitrate(path: &Path) -> Option<u64> {
-    use tokio::io::AsyncReadExt;
-    
-    let mut file = tokio::fs::File::open(path).await.ok()?;
-    let mut buffer = vec![0u8; 4096]; // Read first 4KB
-    let bytes_read = file.read(&mut buffer).await.ok()?;
-    buffer.truncate(bytes_read);
-    
-    // Skip ID3v2 tag if present
-    let mut offset = 0;
-    if buffer.len() > 10 && &buffer[..3] == b"ID3" {
-        let size = ((buffer[6] as usize & 0x7F) << 21)
-            | ((buffer[7] as usize & 0x7F) << 14)
-            | ((buffer[8] as usize & 0x7F) << 7)
-            | (buffer[9] as usize & 0x7F);
-        offset = 10 + size;
+// Extract all metadata efficiently using symphonia in one pass
+// Returns: (title, artist, album, duration_secs, bitrate_bps)
+fn extract_metadata_with_symphonia(path: &Path) -> Option<(String, String, String, Option<u64>, Option<u64>)> {
+    // Get file size for bitrate calculation
+    let file_size = std::fs::metadata(path).ok()?.len();
+
+    // Open the file
+    let file = File::open(path).ok()?;
+    let media_source = MediaSourceStream::new(Box::new(file), Default::default());
+
+    // Create a hint to help the probe guess the format
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
     }
-    
-    // Find first MP3 frame
-    while offset + 4 <= buffer.len() {
-        if buffer[offset] == 0xFF && (buffer[offset + 1] & 0xE0) == 0xE0 {
-            // Parse MP3 header
-            let header = ((buffer[offset] as u32) << 24)
-                | ((buffer[offset + 1] as u32) << 16)
-                | ((buffer[offset + 2] as u32) << 8)
-                | (buffer[offset + 3] as u32);
-            
-            // Extract bitrate
-            let version = (header >> 19) & 3;
-            let layer = (header >> 17) & 3;
-            let bitrate_index = (header >> 12) & 0xF;
-            
-            if version != 1 && layer == 1 && bitrate_index > 0 && bitrate_index < 15 {
-                // MPEG1 Layer III (MP3) bitrates
-                let bitrates = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
-                return Some(bitrates[bitrate_index as usize] as u64 * 1000);
+
+    // Probe the media source
+    let format_opts = FormatOptions::default();
+    let metadata_opts = MetadataOptions::default();
+
+    let probed = symphonia::default::get_probe()
+        .format(&hint, media_source, &format_opts, &metadata_opts)
+        .ok()?;
+
+    let mut format = probed.format;
+
+    // Extract metadata from tags
+    let mut title = String::from("Unknown");
+    let mut artist = String::from("Unknown");
+    let mut album = String::from("Unknown");
+
+    // Check for metadata in the format reader
+    if let Some(metadata_rev) = format.metadata().current() {
+        for tag in metadata_rev.tags() {
+            match tag.std_key {
+                Some(symphonia::core::meta::StandardTagKey::TrackTitle) => {
+                    title = tag.value.to_string();
+                }
+                Some(symphonia::core::meta::StandardTagKey::Artist) => {
+                    artist = tag.value.to_string();
+                }
+                Some(symphonia::core::meta::StandardTagKey::Album) => {
+                    album = tag.value.to_string();
+                }
+                _ => {}
             }
         }
-        offset += 1;
     }
-    
-    None
-}
 
-// Helper function to get MP3 duration
-async fn get_mp3_duration(path: &Path) -> Option<u64> {
-    // For now, we'll estimate based on file size and bitrate
-    let metadata = tokio::fs::metadata(path).await.ok()?;
-    let file_size = metadata.len();
-    let bitrate = get_mp3_bitrate(path).await?;
+    // Get the default audio track
+    let track = format.default_track()?;
 
-    // Duration in seconds = (file_size * 8) / bitrate
-    Some((file_size * 8) / bitrate)
+    // Extract duration
+    let duration = if let Some(time_base) = track.codec_params.time_base {
+        if let Some(n_frames) = track.codec_params.n_frames {
+            let seconds = time_base.calc_time(n_frames).seconds;
+            Some(seconds)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Calculate bitrate from file size and duration
+    // bitrate (bits/sec) = (file_size * 8) / duration_seconds
+    let bitrate = if let Some(dur) = duration {
+        if dur > 0 {
+            Some((file_size * 8) / dur)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Some((title, artist, album, duration, bitrate))
 }
 
 #[cfg(test)]
@@ -377,53 +395,4 @@ mod tests {
         assert_eq!(deserialized.bitrate, Some(320000));
     }
 
-    #[test]
-    fn test_id3v2_size_calculation() {
-        // Test ID3v2 tag size calculation (synchsafe integer encoding)
-        // Example: ID3v2 header bytes [I, D, 3, version, flags, size...]
-        let id3_header = [
-            b'I', b'D', b'3', // ID3v2 identifier
-            0x03, 0x00,       // Version 2.3.0
-            0x00,             // Flags
-            0x00, 0x00, 0x1F, 0x76 // Synchsafe size
-        ];
-
-        // Calculate size from synchsafe integer
-        let size = ((id3_header[6] as usize & 0x7F) << 21)
-            | ((id3_header[7] as usize & 0x7F) << 14)
-            | ((id3_header[8] as usize & 0x7F) << 7)
-            | (id3_header[9] as usize & 0x7F);
-
-        // 0x00001F76 in synchsafe = 0x00000000 | 0x00000000 | 0x00000F80 | 0x00000076
-        // = 0x0FF6 = 4086 bytes
-        assert_eq!(size, 4086);
-    }
-
-    #[test]
-    fn test_mp3_bitrate_index() {
-        // Test bitrate table lookup
-        let bitrates = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
-
-        // Test common bitrates
-        assert_eq!(bitrates[1], 32);   // Index 1 = 32kbps
-        assert_eq!(bitrates[9], 128);  // Index 9 = 128kbps
-        assert_eq!(bitrates[11], 192); // Index 11 = 192kbps
-        assert_eq!(bitrates[14], 320); // Index 14 = 320kbps
-
-        // Test invalid indices
-        assert_eq!(bitrates[0], 0);    // Free bitrate
-        assert_eq!(bitrates[15], 0);   // Invalid
-    }
-
-    #[test]
-    fn test_duration_calculation() {
-        // Test duration calculation: (file_size * 8) / bitrate
-        let file_size = 4_800_000_u64; // 4.8 MB
-        let bitrate = 192_000_u64;     // 192 kbps
-
-        let duration = (file_size * 8) / bitrate;
-
-        // 4,800,000 * 8 / 192,000 = 38,400,000 / 192,000 = 200 seconds
-        assert_eq!(duration, 200);
-    }
 }

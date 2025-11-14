@@ -25,10 +25,10 @@ use crate::{
     config::Config,
 };
 
-// MP3 frame size calculation
+// MP3 frame size calculation - supports MPEG1, MPEG2, and MPEG2.5
 fn calculate_mp3_frame_size(header: u32) -> Option<usize> {
     // Extract MPEG version (bits 19-20)
-    let _version = match (header >> 19) & 0b11 {
+    let version = match (header >> 19) & 0b11 {
         0b11 => 1, // MPEG 1
         0b10 => 2, // MPEG 2
         0b00 => 3, // MPEG 2.5
@@ -51,17 +51,39 @@ fn calculate_mp3_frame_size(header: u32) -> Option<usize> {
     // Extract bitrate index (bits 12-15)
     let bitrate_index = ((header >> 12) & 0xF) as usize;
 
-    // Bitrate tables for MPEG1 Layer III
-    let bitrates = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
-    if bitrate_index == 0 || bitrate_index == 15 {
-        return None;
-    }
-    let bitrate = bitrates[bitrate_index] * 1000;
+    // Bitrate tables - different for MPEG1 vs MPEG2/2.5
+    let bitrate = if version == 1 {
+        // MPEG1 Layer III bitrates (in kbps)
+        let bitrates = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
+        if bitrate_index == 0 || bitrate_index == 15 {
+            return None;
+        }
+        bitrates[bitrate_index] * 1000
+    } else {
+        // MPEG2/MPEG2.5 Layer III bitrates (in kbps)
+        let bitrates = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0];
+        if bitrate_index == 0 || bitrate_index == 15 {
+            return None;
+        }
+        bitrates[bitrate_index] * 1000
+    };
 
     // Extract sample rate index (bits 10-11)
     let samplerate_index = ((header >> 10) & 0b11) as usize;
-    let samplerates = [44100, 48000, 32000, 0];
-    let samplerate = samplerates[samplerate_index];
+    let samplerate = if version == 1 {
+        // MPEG1 sample rates
+        let samplerates = [44100, 48000, 32000, 0];
+        samplerates[samplerate_index]
+    } else if version == 2 {
+        // MPEG2 sample rates (half of MPEG1)
+        let samplerates = [22050, 24000, 16000, 0];
+        samplerates[samplerate_index]
+    } else {
+        // MPEG2.5 sample rates (quarter of MPEG1)
+        let samplerates = [11025, 12000, 8000, 0];
+        samplerates[samplerate_index]
+    };
+
     if samplerate == 0 {
         return None;
     }
@@ -69,9 +91,14 @@ fn calculate_mp3_frame_size(header: u32) -> Option<usize> {
     // Extract padding bit (bit 9)
     let padding = ((header >> 9) & 1) as usize;
 
-    // Calculate frame size for MPEG1 Layer III
-    // Frame size = (144 * bitrate) / samplerate + padding
-    let frame_size = (144 * bitrate) / samplerate + padding;
+    // Calculate frame size
+    // MPEG1: frame_size = (144 * bitrate) / samplerate + padding
+    // MPEG2/2.5: frame_size = (72 * bitrate) / samplerate + padding
+    let frame_size = if version == 1 {
+        (144 * bitrate) / samplerate + padding
+    } else {
+        (72 * bitrate) / samplerate + padding
+    };
 
     Some(frame_size)
 }
@@ -345,70 +372,95 @@ impl RadioStation {
         info!("This allows client buffer to grow by ~{:.1}% per second",
             (stream_rate_multiplier - 1.0) * 100.0);
 
-        let mut data_index = 0;
-        let data_len = file_data.len();
+        // Group frames into chunks that are approximately target_chunk_bytes
+        // This ensures we always send complete MP3 frames (no mid-frame cuts)
+        let target_chunk_bytes = chunk_size_bytes;
+        let mut frame_chunks: Vec<Vec<(usize, usize)>> = Vec::new();
+        let mut current_chunk = Vec::new();
+        let mut current_chunk_size = 0;
+
+        for &frame in &frames {
+            current_chunk.push(frame);
+            current_chunk_size += frame.1;
+
+            // When we've accumulated enough frames for a chunk, start a new chunk
+            if current_chunk_size >= target_chunk_bytes {
+                frame_chunks.push(current_chunk);
+                current_chunk = Vec::new();
+                current_chunk_size = 0;
+            }
+        }
+
+        // Add any remaining frames as the last chunk
+        if !current_chunk.is_empty() {
+            frame_chunks.push(current_chunk);
+        }
+
+        let total_chunks = frame_chunks.len();
+        info!("Grouped {} frames into {} frame-aligned chunks (avg {}KB/chunk)",
+            frames.len(), total_chunks, target_chunk_bytes / 1024);
+
+        // Stream frame-aligned chunks with precise timing
         let stream_start = Instant::now();
         let mut chunks_sent = 0;
 
         // Pre-lock the broadcast channel to avoid timing interference
-        // RwLock allows multiple readers, so this doesn't block other operations
         let tx = self.broadcast_tx.read().await;
 
-        while data_index < data_len {
+        for chunk_frames in frame_chunks {
             if !self.is_broadcasting.load(Ordering::Relaxed) {
                 break;
             }
 
-            // Prepare chunk BEFORE timing check for maximum precision
-            let chunk_end = (data_index + chunk_size_bytes).min(data_len);
-            let chunk_data = file_data[data_index..chunk_end].to_vec();
+            // Build chunk from complete MP3 frames
+            let first_frame_pos = chunk_frames[0].0;
+            let last_frame = chunk_frames.last().unwrap();
+            let chunk_end = last_frame.0 + last_frame.1;
+            let chunk_data = file_data[first_frame_pos..chunk_end].to_vec();
             let chunk = Bytes::from(chunk_data);
 
-            // Real-time clock synchronization (millisecond precision is sufficient for audio)
+            // Real-time clock synchronization
             let target_time = stream_start + Duration::from_millis((chunks_sent as f64 * chunk_size_ms) as u64);
             let now = Instant::now();
 
             if target_time > now {
                 // We're ahead of schedule - sleep until target time
-                let sleep_duration = target_time - now;
-                sleep(sleep_duration).await;
+                sleep(target_time - now).await;
             } else {
-                // We're behind schedule - check how much
+                // We're behind schedule
                 let drift = now - target_time;
-                if drift > Duration::from_millis(5) {
+                if drift > Duration::from_millis(10) {
                     warn!("Streaming drift: {}ms behind schedule", drift.as_millis());
                 }
-                // Don't sleep if we're behind - catch up by sending immediately
             }
 
-            if !chunk.is_empty() {
-                self.total_bytes_sent.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-                self.current_position.store(data_index as u64, Ordering::Relaxed);
+            // Send the chunk
+            let chunk_len = chunk.len();
+            self.total_bytes_sent.fetch_add(chunk_len as u64, Ordering::Relaxed);
+            self.current_position.store(first_frame_pos as u64, Ordering::Relaxed);
 
-                // Send immediately - no lock acquisition delay!
-                if let Err(_) = tx.send(chunk) {
-                    // No active listeners - not an error, just debug info
-                    debug!("No active listeners for chunk");
-                } else {
-                    // Record successful chunk send for health monitoring
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    self.last_chunk_sent.store(now_ms, Ordering::Relaxed);
-                }
+            if let Err(_) = tx.send(chunk) {
+                debug!("No active listeners for chunk");
+            } else {
+                // Record successful chunk send
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                self.last_chunk_sent.store(now_ms, Ordering::Relaxed);
             }
 
-            data_index = chunk_end;
             chunks_sent += 1;
 
             // Log progress occasionally
             if last_log.elapsed() > Duration::from_secs(5) {
-                let progress = (data_index as f64 / data_len as f64) * 100.0;
+                let progress = (chunks_sent as f64 / total_chunks as f64) * 100.0;
                 let elapsed = stream_start.elapsed();
-                let rate_kbps = (data_index as f64 * 8.0) / (elapsed.as_secs_f64() * 1000.0);
+                let total_sent = self.total_bytes_sent.load(Ordering::Relaxed);
+                let rate_kbps = (total_sent as f64 * 8.0) / (elapsed.as_secs_f64() * 1000.0);
 
-                info!("Streaming: {:.1}% complete, rate: {:.0}kbps", progress, rate_kbps);
+                info!("Streaming: {:.1}% complete ({}/{} chunks), actual rate: {:.0}kbps",
+                    progress, chunks_sent, total_chunks, rate_kbps);
                 last_log = Instant::now();
             }
         }
