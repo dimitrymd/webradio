@@ -12,8 +12,8 @@ A high-performance, multi-user web radio server built with Rust and the Axum fra
 - **Automatic Playlist**: Scans and plays MP3 files continuously in a loop
 - **Live Statistics**: Real-time listener count and track information via SSE
 - **Safari Compatible**: Handles range requests for iOS/Safari compatibility
-- **Symphonia Integration**: Efficient metadata extraction and accurate MP3 parsing
-- **Frame-Aligned Streaming**: Streams at 110% of bitrate with MP3 frame boundaries
+- **Symphonia Integration**: Efficient metadata extraction and accurate audio parsing
+- **Duration-Based Streaming**: Streams frame-aligned packets bundled by duration at 110% of bitrate
 
 ## Requirements
 
@@ -36,8 +36,8 @@ The server uses a single-producer, multiple-consumer pattern with optimized stre
          ▼
 ┌─────────────────┐          ┌──────────────────────┐
 │  RadioStation   │  Sends   │  Broadcast Channel   │
-│  (Single Loop)  │────────▶ │  (32K buffer)        │
-│  110% bitrate   │          │  100ms chunks        │
+│  (Single Loop)  │────────▶ │  (32K msg buffer)    │
+│  110% bitrate   │          │  ~100ms chunks       │
 └─────────────────┘          └──────────┬───────────┘
                                         │
                                         │ Subscribe & receive
@@ -55,11 +55,12 @@ The server uses a single-producer, multiple-consumer pattern with optimized stre
 ```
 
 Key components:
-- **RadioStation**: Reads MP3 files, manages playlist, controls optimized streaming
+- **RadioStation**: Reads audio files, manages playlist, controls optimized streaming
 - **Broadcast Channel**: Tokio broadcast channel with 32K message buffer
 - **Axum Server**: HTTP server handling `/stream` endpoints and web interface
 - **Memory Streaming**: Entire track loaded into RAM for smooth playback
-- **Frame-Aligned Chunks**: 100ms MP3 frame-aligned chunks at 110% bitrate with 120KB initial buffers
+- **Duration-Based Chunks**: ~100ms duration-aligned chunks at 110% bitrate with 120KB initial buffers
+- **Symphonia**: Handles all metadata extraction and audio frame parsing
 
 ## Quick Start
 
@@ -432,7 +433,7 @@ Based on the architecture and testing:
   - 8GB RAM: ~5,000 listeners
 - **Latency**: < 1 second from server to client
 
-The server loads entire tracks into memory to eliminate disk I/O during streaming, and uses frame-aligned chunk delivery (100ms intervals at 110% of bitrate) to ensure smooth playback without buffering or pauses.
+The server loads entire tracks into memory to eliminate disk I/O during streaming, and uses duration-based packet bundling (~100ms duration at 110% of bitrate) to ensure smooth playback without buffering or pauses.
 
 ## Streaming Technology
 
@@ -441,10 +442,11 @@ The server loads entire tracks into memory to eliminate disk I/O during streamin
 The application uses advanced streaming techniques to eliminate audio buffering:
 
 - **Adaptive Rate Streaming**: Data sent at 110% of track bitrate (default) to build client buffers
-- **Frame-Aligned Chunks**: 100ms chunks with complete MP3 frames (no mid-frame cuts)
+- **Duration-Based Bundling**: Packets bundled by duration (~100ms chunks) for accurate timing
+- **Frame-Aligned Packets**: Symphonia provides frame-aligned packets (no mid-frame cuts)
 - **Smart Initial Buffering**: 120KB initial buffer per client for smooth startup (240KB for iOS)
 - **Memory-Based Streaming**: Full tracks loaded in RAM to eliminate I/O delays
-- **MPEG Support**: Full support for MPEG1, MPEG2, and MPEG2.5 Layer III (MP3) formats
+- **Symphonia Audio Engine**: Full support for MP3, FLAC, AAC, and other formats
 
 ### Why This Works
 
@@ -456,9 +458,9 @@ Traditional internet radio often suffers from buffering because:
 Our solution:
 1. **Embrace browser buffering** instead of fighting it
 2. **Adaptive overflow rate** (110% default) maintains healthy buffer levels
-3. **Frame-aligned delivery** ensures valid MP3 data at all chunk boundaries
+3. **Duration-based bundling** ensures accurate timing with frame-aligned packets
 4. **Memory streaming** eliminates server-side I/O delays
-5. **Efficient metadata** using Symphonia for accurate parsing
+5. **Symphonia audio engine** provides accurate metadata and frame-aligned packets
 
 ## Monitoring
 
