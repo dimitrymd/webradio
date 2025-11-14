@@ -7,8 +7,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    fs::File,
-    io::AsyncReadExt,
     sync::{broadcast, RwLock},
     time::{interval, sleep},
 };
@@ -18,90 +16,16 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use arc_swap::ArcSwap;
 use tracing::{info, warn, error, debug};
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::probe::Hint;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::meta::MetadataOptions;
 
 use crate::{
     error::Result,
     playlist::{Playlist, Track},
     config::Config,
 };
-
-// MP3 frame size calculation - supports MPEG1, MPEG2, and MPEG2.5
-fn calculate_mp3_frame_size(header: u32) -> Option<usize> {
-    // Extract MPEG version (bits 19-20)
-    let version = match (header >> 19) & 0b11 {
-        0b11 => 1, // MPEG 1
-        0b10 => 2, // MPEG 2
-        0b00 => 3, // MPEG 2.5
-        _ => return None,
-    };
-
-    // Extract layer (bits 17-18)
-    let layer = match (header >> 17) & 0b11 {
-        0b01 => 3, // Layer III
-        0b10 => 2, // Layer II
-        0b11 => 1, // Layer I
-        _ => return None,
-    };
-
-    // Only handle Layer III (MP3)
-    if layer != 3 {
-        return None;
-    }
-
-    // Extract bitrate index (bits 12-15)
-    let bitrate_index = ((header >> 12) & 0xF) as usize;
-
-    // Bitrate tables - different for MPEG1 vs MPEG2/2.5
-    let bitrate = if version == 1 {
-        // MPEG1 Layer III bitrates (in kbps)
-        let bitrates = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
-        if bitrate_index == 0 || bitrate_index == 15 {
-            return None;
-        }
-        bitrates[bitrate_index] * 1000
-    } else {
-        // MPEG2/MPEG2.5 Layer III bitrates (in kbps)
-        let bitrates = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0];
-        if bitrate_index == 0 || bitrate_index == 15 {
-            return None;
-        }
-        bitrates[bitrate_index] * 1000
-    };
-
-    // Extract sample rate index (bits 10-11)
-    let samplerate_index = ((header >> 10) & 0b11) as usize;
-    let samplerate = if version == 1 {
-        // MPEG1 sample rates
-        let samplerates = [44100, 48000, 32000, 0];
-        samplerates[samplerate_index]
-    } else if version == 2 {
-        // MPEG2 sample rates (half of MPEG1)
-        let samplerates = [22050, 24000, 16000, 0];
-        samplerates[samplerate_index]
-    } else {
-        // MPEG2.5 sample rates (quarter of MPEG1)
-        let samplerates = [11025, 12000, 8000, 0];
-        samplerates[samplerate_index]
-    };
-
-    if samplerate == 0 {
-        return None;
-    }
-
-    // Extract padding bit (bit 9)
-    let padding = ((header >> 9) & 1) as usize;
-
-    // Calculate frame size
-    // MPEG1: frame_size = (144 * bitrate) / samplerate + padding
-    // MPEG2/2.5: frame_size = (72 * bitrate) / samplerate + padding
-    let frame_size = if version == 1 {
-        (144 * bitrate) / samplerate + padding
-    } else {
-        (72 * bitrate) / samplerate + padding
-    };
-
-    Some(frame_size)
-}
 
 pub struct RadioStation {
     config: Config,  // Changed from _config to config (used now)
@@ -279,195 +203,166 @@ impl RadioStation {
 
         info!("Streaming track: {} at {}kbps", path.display(), track.bitrate.unwrap_or(192000) / 1000);
 
-        // Read entire file into memory for smooth streaming
-        let mut file = File::open(&path).await?;
-        let metadata = file.metadata().await?;
-        let file_size = metadata.len();
+        // Open the file with symphonia
+        let file = std::fs::File::open(&path)?;
+        let media_source = MediaSourceStream::new(Box::new(file), Default::default());
 
-        let mut file_data = Vec::with_capacity(file_size as usize);
-        file.read_to_end(&mut file_data).await?;
-        drop(file); // Close file immediately
-
-        info!("Loaded {} KB of audio data into memory", file_data.len() / 1024);
-
-        // Skip ID3v2 tag if present
-        let mut position = 0usize;
-        if file_data.len() > 10 && &file_data[..3] == b"ID3" {
-            // Calculate ID3v2 tag size
-            let size = ((file_data[6] as u32 & 0x7F) << 21)
-                | ((file_data[7] as u32 & 0x7F) << 14)
-                | ((file_data[8] as u32 & 0x7F) << 7)
-                | (file_data[9] as u32 & 0x7F);
-
-            position = 10 + size as usize;
-            info!("Skipped ID3v2 tag of {} bytes", position);
+        // Create a hint to help the probe guess the format
+        let mut hint = Hint::new();
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            hint.with_extension(ext);
         }
 
-        // Get bitrate for timing
+        // Probe the media source
+        let format_opts = FormatOptions::default();
+        let metadata_opts = MetadataOptions::default();
+
+        let probed = symphonia::default::get_probe()
+            .format(&hint, media_source, &format_opts, &metadata_opts)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to probe file: {}", e)))?;
+
+        let mut format = probed.format;
+
+        // Get the default audio track
+        let track_info = format.default_track()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "No audio track found"))?;
+        let track_id = track_info.id;
+
+        // Get bitrate for timing calculations
         let bitrate = track.bitrate.unwrap_or(192000);
-        let bytes_per_second = bitrate as f64 / 8.0;
-
-        info!("Streaming at {}kbps ({} bytes/second)", bitrate / 1000, bytes_per_second as u32);
-
-        // Stream the track with accurate bitrate-based timing
-        let _start_time = Instant::now();
-        let mut last_log = Instant::now();
-
-        // Find all MP3 frame boundaries for accurate streaming
-        let mut frames = Vec::new();
-        let mut scan_pos = position;
-
-        while scan_pos < file_data.len() - 4 {
-            // Look for MP3 frame sync (11 bits set)
-            if file_data[scan_pos] == 0xFF && (file_data[scan_pos + 1] & 0xE0) == 0xE0 {
-                // Valid frame header found
-                let header = u32::from_be_bytes([
-                    file_data[scan_pos],
-                    file_data[scan_pos + 1],
-                    file_data[scan_pos + 2],
-                    file_data[scan_pos + 3],
-                ]);
-
-                // Calculate frame size
-                if let Some(frame_size) = calculate_mp3_frame_size(header) {
-                    frames.push((scan_pos, frame_size));
-                    scan_pos += frame_size;
-                } else {
-                    scan_pos += 1;
-                }
-            } else {
-                scan_pos += 1;
-            }
-        }
-
-        info!("Found {} MP3 frames in track", frames.len());
-
-        if frames.is_empty() {
-            warn!("No valid MP3 frames found, falling back to raw streaming");
-            return Ok(());
-        }
-
-        // Calculate frame duration based on actual bitrate
-        let total_audio_bytes: usize = frames.iter().map(|(_, size)| size).sum();
-        let duration_seconds = total_audio_bytes as f64 / bytes_per_second;
-        let _ms_per_frame = (duration_seconds * 1000.0) / frames.len() as f64;
-
-        // CRITICAL: Stream FASTER than bitrate to build client buffers!
-        // Streaming at exact bitrate = zero headroom = buffering on any delay
-        // Stream at configurable rate (default 110%) so clients build up buffer reserves
         let stream_rate_multiplier = self.config.stream_rate_multiplier;
         let base_bitrate_kbps = bitrate as f64 / 1000.0;
         let stream_rate_kbps = base_bitrate_kbps * stream_rate_multiplier;
-        let chunk_size_ms = self.config.chunk_interval_ms as f64;
+        let chunk_interval_ms = self.config.chunk_interval_ms as f64;
 
-        let stream_bytes_per_second = (stream_rate_kbps * 1000.0) / 8.0;
-        let chunk_size_bytes = ((stream_bytes_per_second * chunk_size_ms) / 1000.0) as usize;
-
-        info!("Streaming at {:.0}kbps ({}% of {}kbps bitrate) - {} byte chunks every {:.0}ms",
+        info!("Streaming at {:.0}kbps ({}% of {}kbps bitrate)",
             stream_rate_kbps,
             (stream_rate_multiplier * 100.0) as u32,
-            base_bitrate_kbps,
-            chunk_size_bytes,
-            chunk_size_ms);
+            base_bitrate_kbps);
         info!("This allows client buffer to grow by ~{:.1}% per second",
             (stream_rate_multiplier - 1.0) * 100.0);
 
-        // Group frames into chunks that are approximately target_chunk_bytes
-        // This ensures we always send complete MP3 frames (no mid-frame cuts)
-        let target_chunk_bytes = chunk_size_bytes;
-        let mut frame_chunks: Vec<Vec<(usize, usize)>> = Vec::new();
-        let mut current_chunk = Vec::new();
-        let mut current_chunk_size = 0;
+        // Calculate target chunk duration in time base units
+        let target_chunk_duration_ms = chunk_interval_ms;
 
-        for &frame in &frames {
-            current_chunk.push(frame);
-            current_chunk_size += frame.1;
-
-            // When we've accumulated enough frames for a chunk, start a new chunk
-            if current_chunk_size >= target_chunk_bytes {
-                frame_chunks.push(current_chunk);
-                current_chunk = Vec::new();
-                current_chunk_size = 0;
-            }
-        }
-
-        // Add any remaining frames as the last chunk
-        if !current_chunk.is_empty() {
-            frame_chunks.push(current_chunk);
-        }
-
-        let total_chunks = frame_chunks.len();
-        info!("Grouped {} frames into {} frame-aligned chunks (avg {}KB/chunk)",
-            frames.len(), total_chunks, target_chunk_bytes / 1024);
-
-        // Stream frame-aligned chunks with precise timing
+        // Stream packets from symphonia and bundle them into time-based chunks
+        let mut current_chunk_data = Vec::new();
         let stream_start = Instant::now();
         let mut chunks_sent = 0;
+        let mut last_log = Instant::now();
+        let mut total_packets = 0;
 
         // Pre-lock the broadcast channel to avoid timing interference
         let tx = self.broadcast_tx.read().await;
 
-        for chunk_frames in frame_chunks {
+        // Calculate approximate bytes per chunk at the stream rate
+        let stream_bytes_per_second = (stream_rate_kbps * 1000.0) / 8.0;
+        let target_chunk_bytes = ((stream_bytes_per_second * target_chunk_duration_ms) / 1000.0) as usize;
+
+        info!("Target chunk size: {} bytes (~{}ms at {}kbps)",
+            target_chunk_bytes,
+            target_chunk_duration_ms,
+            stream_rate_kbps);
+
+        loop {
             if !self.is_broadcasting.load(Ordering::Relaxed) {
                 break;
             }
 
-            // Build chunk from complete MP3 frames
-            let first_frame_pos = chunk_frames[0].0;
-            let last_frame = chunk_frames.last().unwrap();
-            let chunk_end = last_frame.0 + last_frame.1;
-            let chunk_data = file_data[first_frame_pos..chunk_end].to_vec();
-            let chunk = Bytes::from(chunk_data);
+            // Read next packet
+            let packet = match format.next_packet() {
+                Ok(packet) => packet,
+                Err(symphonia::core::errors::Error::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    // End of file - send any remaining data
+                    if !current_chunk_data.is_empty() {
+                        let chunk = Bytes::from(current_chunk_data);
+                        let chunk_len = chunk.len();
+                        self.total_bytes_sent.fetch_add(chunk_len as u64, Ordering::Relaxed);
 
-            // Real-time clock synchronization
-            let target_time = stream_start + Duration::from_millis((chunks_sent as f64 * chunk_size_ms) as u64);
-            let now = Instant::now();
-
-            if target_time > now {
-                // We're ahead of schedule - sleep until target time
-                sleep(target_time - now).await;
-            } else {
-                // We're behind schedule
-                let drift = now - target_time;
-                if drift > Duration::from_millis(10) {
-                    warn!("Streaming drift: {}ms behind schedule", drift.as_millis());
+                        if let Err(_) = tx.send(chunk) {
+                            debug!("No active listeners for final chunk");
+                        } else {
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            self.last_chunk_sent.store(now_ms, Ordering::Relaxed);
+                        }
+                        chunks_sent += 1;
+                    }
+                    break;
                 }
+                Err(e) => {
+                    warn!("Error reading packet: {}", e);
+                    break;
+                }
+            };
+
+            // Only process packets from our audio track
+            if packet.track_id() != track_id {
+                continue;
             }
 
-            // Send the chunk
-            let chunk_len = chunk.len();
-            self.total_bytes_sent.fetch_add(chunk_len as u64, Ordering::Relaxed);
-            self.current_position.store(first_frame_pos as u64, Ordering::Relaxed);
+            total_packets += 1;
 
-            if let Err(_) = tx.send(chunk) {
-                debug!("No active listeners for chunk");
-            } else {
-                // Record successful chunk send
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                self.last_chunk_sent.store(now_ms, Ordering::Relaxed);
-            }
+            // Add packet data to current chunk
+            current_chunk_data.extend_from_slice(packet.buf());
 
-            chunks_sent += 1;
+            // Check if we should send this chunk
+            // Send when we've accumulated approximately target_chunk_bytes
+            if current_chunk_data.len() >= target_chunk_bytes {
+                // Calculate timing for smooth delivery at stream rate
+                let target_time = stream_start + Duration::from_millis((chunks_sent as f64 * chunk_interval_ms) as u64);
+                let now = Instant::now();
 
-            // Log progress occasionally
-            if last_log.elapsed() > Duration::from_secs(5) {
-                let progress = (chunks_sent as f64 / total_chunks as f64) * 100.0;
-                let elapsed = stream_start.elapsed();
-                let total_sent = self.total_bytes_sent.load(Ordering::Relaxed);
-                let rate_kbps = (total_sent as f64 * 8.0) / (elapsed.as_secs_f64() * 1000.0);
+                if target_time > now {
+                    // We're ahead of schedule - sleep until target time
+                    sleep(target_time - now).await;
+                } else {
+                    // We're behind schedule
+                    let drift = now - target_time;
+                    if drift > Duration::from_millis(10) {
+                        warn!("Streaming drift: {}ms behind schedule", drift.as_millis());
+                    }
+                }
 
-                info!("Streaming: {:.1}% complete ({}/{} chunks), actual rate: {:.0}kbps",
-                    progress, chunks_sent, total_chunks, rate_kbps);
-                last_log = Instant::now();
+                // Send the chunk
+                let chunk = Bytes::from(current_chunk_data.clone());
+                let chunk_len = chunk.len();
+                self.total_bytes_sent.fetch_add(chunk_len as u64, Ordering::Relaxed);
+                self.current_position.fetch_add(chunk_len as u64, Ordering::Relaxed);
+
+                if let Err(_) = tx.send(chunk) {
+                    debug!("No active listeners for chunk");
+                } else {
+                    // Record successful chunk send
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    self.last_chunk_sent.store(now_ms, Ordering::Relaxed);
+                }
+
+                chunks_sent += 1;
+                current_chunk_data.clear();
+
+                // Log progress occasionally
+                if last_log.elapsed() > Duration::from_secs(5) {
+                    let elapsed = stream_start.elapsed();
+                    let total_sent = self.total_bytes_sent.load(Ordering::Relaxed);
+                    let rate_kbps = (total_sent as f64 * 8.0) / (elapsed.as_secs_f64() * 1000.0);
+
+                    info!("Streaming: sent {} chunks ({} packets), actual rate: {:.0}kbps",
+                        chunks_sent, total_packets, rate_kbps);
+                    last_log = Instant::now();
+                }
             }
         }
 
-        info!("Finished streaming track: {} (sent {} chunks)",
+        info!("Finished streaming track: {} (sent {} chunks from {} packets)",
             track.title,
-            chunks_sent
+            chunks_sent,
+            total_packets
         );
         Ok(())
     }
@@ -812,80 +707,6 @@ impl Drop for RadioStation {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_mp3_frame_size_calculation() {
-        // Valid MPEG1 Layer III frame header at 128kbps, 44.1kHz, no padding
-        // Format: 0xFFF (sync) + version + layer + protection + bitrate + samplerate + padding + private + channel + etc
-        // 0xFFFB 9000 = 11111111 11111011 10010000 00000000
-        let header: u32 = 0xFFFB9000;
-        let frame_size = calculate_mp3_frame_size(header);
-
-        // 128kbps at 44.1kHz = (144 * 128000) / 44100 = 417 bytes
-        assert_eq!(frame_size, Some(417));
-    }
-
-    #[test]
-    fn test_mp3_frame_size_with_padding() {
-        // Same as above but with padding bit set (bit 9)
-        // 0xFFFB 9200 has padding bit set
-        let header: u32 = 0xFFFB9200;
-        let frame_size = calculate_mp3_frame_size(header);
-
-        // With padding, should be 417 + 1 = 418
-        assert_eq!(frame_size, Some(418));
-    }
-
-    #[test]
-    fn test_mp3_frame_size_different_bitrate() {
-        // 192kbps at 44.1kHz
-        // Bitrate index 0xB (192kbps for MPEG1 Layer III)
-        let header: u32 = 0xFFFBB000;
-        let frame_size = calculate_mp3_frame_size(header);
-
-        // (144 * 192000) / 44100 = 626 bytes
-        assert_eq!(frame_size, Some(626));
-    }
-
-    #[test]
-    fn test_mp3_frame_size_invalid_sync() {
-        // Invalid sync word (should start with 0xFFF)
-        let header: u32 = 0xAABB9000;
-        let frame_size = calculate_mp3_frame_size(header);
-
-        // Should return None for invalid sync
-        // Note: The function checks for 0xFF and 0xE0 mask on second byte
-        assert!(frame_size.is_none() || frame_size.is_some());
-        // This test would fail with current implementation, but documents expected behavior
-    }
-
-    #[test]
-    fn test_mp3_frame_size_free_bitrate() {
-        // Bitrate index 0x0 (free bitrate) should be invalid
-        let header: u32 = 0xFFFB0000;
-        let frame_size = calculate_mp3_frame_size(header);
-
-        assert_eq!(frame_size, None);
-    }
-
-    #[test]
-    fn test_mp3_frame_size_bad_bitrate() {
-        // Bitrate index 0xF (bad/reserved) should be invalid
-        let header: u32 = 0xFFFBF000;
-        let frame_size = calculate_mp3_frame_size(header);
-
-        assert_eq!(frame_size, None);
-    }
-
-    #[test]
-    fn test_mp3_frame_size_reserved_samplerate() {
-        // Sample rate index 0x3 (reserved) should be invalid
-        // Bits 10-11 set to 11
-        let header: u32 = 0xFFFB9C00;
-        let frame_size = calculate_mp3_frame_size(header);
-
-        assert_eq!(frame_size, None);
-    }
 
     #[tokio::test]
     async fn test_radio_station_creation() {
