@@ -221,7 +221,8 @@ fn extract_metadata_with_symphonia(path: &Path) -> Option<(String, String, Strin
     };
 
     // Calculate bitrate from file size and duration
-    // bitrate (bits/sec) = (file_size * 8) / duration_seconds
+    // Symphonia doesn't always provide bit_rate in CodecParameters for all formats
+    // This approach gives accurate average bitrate for the entire file
     let bitrate = if let Some(dur) = duration {
         if dur > 0 {
             Some((file_size * 8) / dur)

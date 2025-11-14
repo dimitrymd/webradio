@@ -228,12 +228,16 @@ impl RadioStation {
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "No audio track found"))?;
         let track_id = track_info.id;
 
-        // Get bitrate for timing calculations
+        // Get timebase for duration calculations
+        let time_base = track_info.codec_params.time_base
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "No timebase available"))?;
+
+        // Get bitrate for logging
         let bitrate = track.bitrate.unwrap_or(192000);
         let stream_rate_multiplier = self.config.stream_rate_multiplier;
         let base_bitrate_kbps = bitrate as f64 / 1000.0;
         let stream_rate_kbps = base_bitrate_kbps * stream_rate_multiplier;
-        let chunk_interval_ms = self.config.chunk_interval_ms as f64;
+        let chunk_interval_ms = self.config.chunk_interval_ms;
 
         info!("Streaming at {:.0}kbps ({}% of {}kbps bitrate)",
             stream_rate_kbps,
@@ -242,11 +246,12 @@ impl RadioStation {
         info!("This allows client buffer to grow by ~{:.1}% per second",
             (stream_rate_multiplier - 1.0) * 100.0);
 
-        // Calculate target chunk duration in time base units
-        let target_chunk_duration_ms = chunk_interval_ms;
+        // Calculate target chunk duration in milliseconds
+        let target_chunk_duration_ms = chunk_interval_ms as f64;
 
-        // Stream packets from symphonia and bundle them into time-based chunks
+        // Stream packets from symphonia and bundle them by duration
         let mut current_chunk_data = Vec::new();
+        let mut current_chunk_duration_tb: u64 = 0; // Duration in timebase units
         let stream_start = Instant::now();
         let mut chunks_sent = 0;
         let mut last_log = Instant::now();
@@ -255,14 +260,8 @@ impl RadioStation {
         // Pre-lock the broadcast channel to avoid timing interference
         let tx = self.broadcast_tx.read().await;
 
-        // Calculate approximate bytes per chunk at the stream rate
-        let stream_bytes_per_second = (stream_rate_kbps * 1000.0) / 8.0;
-        let target_chunk_bytes = ((stream_bytes_per_second * target_chunk_duration_ms) / 1000.0) as usize;
-
-        info!("Target chunk size: {} bytes (~{}ms at {}kbps)",
-            target_chunk_bytes,
-            target_chunk_duration_ms,
-            stream_rate_kbps);
+        info!("Bundling packets by duration: ~{}ms chunks using timebase calculations",
+            target_chunk_duration_ms);
 
         loop {
             if !self.is_broadcasting.load(Ordering::Relaxed) {
@@ -277,6 +276,10 @@ impl RadioStation {
                     if !current_chunk_data.is_empty() {
                         let chunk = Bytes::from(current_chunk_data);
                         let chunk_len = chunk.len();
+                        let final_duration_ms = time_base.calc_time(current_chunk_duration_tb).seconds as f64 * 1000.0;
+
+                        info!("Sending final chunk: {} bytes, {:.1}ms duration", chunk_len, final_duration_ms);
+
                         self.total_bytes_sent.fetch_add(chunk_len as u64, Ordering::Relaxed);
 
                         if let Err(_) = tx.send(chunk) {
@@ -308,11 +311,17 @@ impl RadioStation {
             // Add packet data to current chunk
             current_chunk_data.extend_from_slice(packet.buf());
 
-            // Check if we should send this chunk
-            // Send when we've accumulated approximately target_chunk_bytes
-            if current_chunk_data.len() >= target_chunk_bytes {
+            // Add packet duration to accumulated duration (in timebase units)
+            current_chunk_duration_tb += packet.dur();
+
+            // Calculate current chunk duration in milliseconds
+            let chunk_duration_ms = time_base.calc_time(current_chunk_duration_tb).seconds as f64 * 1000.0;
+
+            // Check if we should send this chunk based on duration
+            // Send when accumulated duration >= target_chunk_duration_ms
+            if chunk_duration_ms >= target_chunk_duration_ms {
                 // Calculate timing for smooth delivery at stream rate
-                let target_time = stream_start + Duration::from_millis((chunks_sent as f64 * chunk_interval_ms) as u64);
+                let target_time = stream_start + Duration::from_millis((chunks_sent as f64 * target_chunk_duration_ms) as u64);
                 let now = Instant::now();
 
                 if target_time > now {
@@ -345,6 +354,7 @@ impl RadioStation {
 
                 chunks_sent += 1;
                 current_chunk_data.clear();
+                current_chunk_duration_tb = 0; // Reset duration counter
 
                 // Log progress occasionally
                 if last_log.elapsed() > Duration::from_secs(5) {
