@@ -12,8 +12,8 @@ A high-performance, multi-user web radio server built with Rust and the Axum fra
 - **Automatic Playlist**: Scans and plays MP3 files continuously in a loop
 - **Live Statistics**: Real-time listener count and track information via SSE
 - **Safari Compatible**: Handles range requests for iOS/Safari compatibility
-- **ID3 Support**: Displays track metadata from ID3 tags
-- **Consistent Bitrate**: Streams at 205kbps (13% overhead) for optimal browser buffering
+- **Symphonia Integration**: Efficient metadata extraction and accurate MP3 parsing
+- **Frame-Aligned Streaming**: Streams at 110% of bitrate with MP3 frame boundaries
 
 ## Requirements
 
@@ -37,14 +37,14 @@ The server uses a single-producer, multiple-consumer pattern with optimized stre
 ┌─────────────────┐          ┌──────────────────────┐
 │  RadioStation   │  Sends   │  Broadcast Channel   │
 │  (Single Loop)  │────────▶ │  (32K buffer)        │
-│  205kbps stream │          │  500ms chunks        │
+│  110% bitrate   │          │  100ms chunks        │
 └─────────────────┘          └──────────┬───────────┘
                                         │
                                         │ Subscribe & receive
                                         ▼
           ┌──────────────────────────────────────────┐
           │         HTTP/Axum Server                 │
-          │   (64KB initial buffer per listener)     │
+          │   (120KB initial buffer per listener)    │
           └─┬──────────────┬──────────────────────┬──┘
             │              │                      │
             ▼              ▼                      ▼
@@ -59,7 +59,7 @@ Key components:
 - **Broadcast Channel**: Tokio broadcast channel with 32K message buffer
 - **Axum Server**: HTTP server handling `/stream` endpoints and web interface
 - **Memory Streaming**: Entire track loaded into RAM for smooth playback
-- **Chunk Delivery**: 500ms chunks at 205kbps rate with 64KB initial client buffers
+- **Frame-Aligned Chunks**: 100ms MP3 frame-aligned chunks at 110% bitrate with 120KB initial buffers
 
 ## Quick Start
 
@@ -100,6 +100,12 @@ Environment variables (optional):
 - `HOST`: Bind address (default: "0.0.0.0")
 - `PORT`: Port number (default: 8000)
 - `MUSIC_DIR`: Music directory path (default: "music")
+- `INITIAL_BUFFER_KB`: Initial buffer size (default: 120KB = ~5s at 192kbps)
+- `MINIMUM_BUFFER_KB`: Minimum buffer before playback (default: 80KB = ~3.3s)
+- `CHUNK_INTERVAL_MS`: Chunk interval in milliseconds (default: 100ms)
+- `STREAM_RATE_MULTIPLIER`: Stream rate multiplier (default: 1.10 = 10% faster)
+- `INITIAL_BUFFER_TIMEOUT_MS`: Buffer timeout (default: 6000ms)
+- `BROADCAST_CHANNEL_CAPACITY`: Broadcast capacity (default: 32768)
 
 Example:
 ```bash
@@ -418,15 +424,15 @@ Based on the architecture and testing:
 
 - **Memory Usage**: ~50MB base + 5MB per MP3 file loaded
 - **CPU Usage**: < 5% for streaming to 100+ listeners
-- **Network Bandwidth**: 26KB/s per listener at 205kbps streaming rate
-- **Streaming Quality**: Buffer-free playback with optimized chunk delivery
+- **Network Bandwidth**: ~27KB/s per listener at 110% of 192kbps
+- **Streaming Quality**: Buffer-free playback with frame-aligned chunk delivery
 - **Concurrent Listeners**:
   - 1GB RAM: ~500 listeners
   - 4GB RAM: ~2,000 listeners
   - 8GB RAM: ~5,000 listeners
 - **Latency**: < 1 second from server to client
 
-The server loads entire tracks into memory to eliminate disk I/O during streaming, and uses optimized chunk delivery (500ms intervals at 205kbps) to ensure smooth playback without buffering or pauses.
+The server loads entire tracks into memory to eliminate disk I/O during streaming, and uses frame-aligned chunk delivery (100ms intervals at 110% of bitrate) to ensure smooth playback without buffering or pauses.
 
 ## Streaming Technology
 
@@ -434,11 +440,11 @@ The server loads entire tracks into memory to eliminate disk I/O during streamin
 
 The application uses advanced streaming techniques to eliminate audio buffering:
 
-- **Consistent Rate Streaming**: Data sent at 205kbps (13% faster than 192kbps content)
-- **Chunked Delivery**: 500ms audio chunks (~12KB) for optimal browser handling
-- **Smart Initial Buffering**: 64KB initial buffer per client for smooth startup
+- **Adaptive Rate Streaming**: Data sent at 110% of track bitrate (default) to build client buffers
+- **Frame-Aligned Chunks**: 100ms chunks with complete MP3 frames (no mid-frame cuts)
+- **Smart Initial Buffering**: 120KB initial buffer per client for smooth startup (240KB for iOS)
 - **Memory-Based Streaming**: Full tracks loaded in RAM to eliminate I/O delays
-- **No Frame Timing**: Simplified approach that works with browser buffering behavior
+- **MPEG Support**: Full support for MPEG1, MPEG2, and MPEG2.5 Layer III (MP3) formats
 
 ### Why This Works
 
@@ -449,9 +455,10 @@ Traditional internet radio often suffers from buffering because:
 
 Our solution:
 1. **Embrace browser buffering** instead of fighting it
-2. **Consistent slight overflow** maintains healthy buffer levels
-3. **Chunked delivery** provides predictable data flow
-4. **Memory streaming** eliminates server-side delays
+2. **Adaptive overflow rate** (110% default) maintains healthy buffer levels
+3. **Frame-aligned delivery** ensures valid MP3 data at all chunk boundaries
+4. **Memory streaming** eliminates server-side I/O delays
+5. **Efficient metadata** using Symphonia for accurate parsing
 
 ## Monitoring
 
@@ -474,7 +481,7 @@ tail -f /var/log/syslog | grep webradio
 curl -s http://localhost:8000/api/stats | jq
 curl -s http://localhost:8000/api/listeners
 
-# Check streaming rate in logs (should be ~206kbps)
+# Check streaming rate in logs (should be ~211kbps for 192kbps content)
 sudo journalctl -u webradio -f | grep "rate:"
 ```
 
@@ -511,10 +518,10 @@ sudo journalctl -u webradio -f | grep "rate:"
    - Monitor with: `ps aux | grep webradio`
 
 5. **Audio pauses or stutters**:
-   - Should be eliminated with v5.0+ optimized streaming
+   - Should be eliminated with v5.0+ frame-aligned streaming
    - Check network connectivity if issues persist
    - Verify server CPU usage: `top`
-   - Check streaming rate in logs (should be consistent ~206kbps)
+   - Check streaming rate in logs (should be ~110% of track bitrate)
 
 6. **Cannot connect from network**:
    ```bash
