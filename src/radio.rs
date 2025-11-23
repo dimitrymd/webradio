@@ -796,4 +796,88 @@ mod tests {
         assert!(gap_timeout_ms > chunk_interval_ms, "Gap timeout should be larger than chunk interval");
         assert!(gap_timeout_ms < 1000, "Gap timeout should be under 1 second for quick detection");
     }
+
+    #[test]
+    fn test_duration_based_bundling_logic() {
+        // Test the duration-based bundling concept
+        // Simulates how packets are bundled by duration rather than byte count
+
+        // Typical MP3 packet duration at 44.1kHz: 1152 samples = ~26ms
+        let sample_rate = 44100;
+        let samples_per_frame = 1152;
+        let frame_duration_ms = (samples_per_frame as f64 / sample_rate as f64) * 1000.0;
+
+        assert!((frame_duration_ms - 26.12).abs() < 0.1, "MP3 frame should be ~26ms");
+
+        // Target chunk duration: 100ms
+        let target_chunk_ms = 100.0;
+
+        // Simulate accumulating packets until we reach target duration
+        let mut accumulated_duration_ms = 0.0;
+        let mut packet_count = 0;
+
+        while accumulated_duration_ms < target_chunk_ms {
+            accumulated_duration_ms += frame_duration_ms;
+            packet_count += 1;
+        }
+
+        // Should need ~4 packets to reach 100ms (4 * 26.12ms = 104.48ms)
+        assert_eq!(packet_count, 4, "Should bundle ~4 MP3 frames to reach 100ms");
+        assert!(accumulated_duration_ms >= target_chunk_ms, "Accumulated duration should meet target");
+        assert!(accumulated_duration_ms < target_chunk_ms + frame_duration_ms,
+            "Should not overshoot by more than one frame");
+    }
+
+    #[test]
+    fn test_timebase_duration_calculation() {
+        // Test timebase-based duration calculations (used in stream_track)
+        // Typical MP3 timebase for 44.1kHz audio
+
+        // Simulate timebase: For MP3 at 44.1kHz, timebase is typically 1/44100
+        let timebase_num = 1;
+        let timebase_den = 44100;
+
+        // Duration of 1152 samples (one MP3 frame) in timebase units
+        let frame_duration_tb = 1152_u64;
+
+        // Convert to seconds: (duration_tb * timebase_num) / timebase_den
+        let duration_seconds = (frame_duration_tb as f64 * timebase_num as f64) / timebase_den as f64;
+        let duration_ms = duration_seconds * 1000.0;
+
+        assert!((duration_ms - 26.12).abs() < 0.1, "Timebase calculation should give ~26ms per frame");
+
+        // Simulate bundling 4 frames
+        let bundled_duration_tb = frame_duration_tb * 4;
+        let bundled_ms = (bundled_duration_tb as f64 * timebase_num as f64) / timebase_den as f64 * 1000.0;
+
+        assert!((bundled_ms - 104.49).abs() < 0.1, "4 frames should be ~104ms");
+        assert!(bundled_ms >= 100.0, "Should meet 100ms target");
+    }
+
+    #[test]
+    fn test_duration_vs_byte_bundling_comparison() {
+        // Compare duration-based vs byte-based bundling
+
+        // At 192kbps MP3, 100ms should be ~2400 bytes
+        let bitrate_bps = 192000;
+        let chunk_interval_ms = 100.0;
+        let expected_bytes = (bitrate_bps as f64 / 8.0 * chunk_interval_ms / 1000.0) as usize;
+
+        assert_eq!(expected_bytes, 2400, "100ms at 192kbps = 2400 bytes");
+
+        // However, with VBR (variable bitrate), byte count varies
+        // Duration-based bundling ensures consistent timing regardless of bitrate variation
+
+        // Example: VBR file with varying frame sizes
+        let frame_sizes = vec![417, 626, 835, 417]; // Different byte sizes
+        let total_bytes: usize = frame_sizes.iter().sum();
+
+        // Byte-based: Would send when reaching ~2400 bytes
+        // Duration-based: Would send after 4 frames (~104ms) regardless of byte count
+
+        // With duration-based, we get consistent ~100ms chunks
+        // With byte-based, chunk duration varies with bitrate changes
+        assert_ne!(total_bytes, expected_bytes, "VBR frames don't sum to exact byte target");
+        assert!(total_bytes > 2000 && total_bytes < 3000, "But total bytes should be in reasonable range");
+    }
 }
